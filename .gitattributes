@@ -1,0 +1,2 @@
+scripts/setup-private-relay.sh text eol=lf
+scripts/generate-relay-test-tone.py text eol=lf
