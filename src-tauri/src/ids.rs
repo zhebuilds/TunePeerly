@@ -33,6 +33,11 @@ pub fn cert_id_display(cert_der: &[u8]) -> String {
     format_device_id(&cert_id_bytes(cert_der))
 }
 
+/// The Syncthing-style text form of a relay certificate id, for the ids the relay reports back.
+pub fn cert_id_text(id: &[u8; 32]) -> String {
+    format_device_id(id)
+}
+
 pub fn parse_cert_id(text: &str) -> Option<[u8; 32]> {
     let mut id = text.trim().to_string();
     if id.is_empty() {

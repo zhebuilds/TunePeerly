@@ -2201,8 +2201,17 @@ async fn maybe_relay_fallback(
     let parts = material.clone_parts();
     let provider = provider.clone();
     let events = events.clone();
+    let failed_id = peer.device_id.clone();
     tokio::task::spawn_local(async move {
-        let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, request_relay_session(host, port, expected, target, parts, provider, events)).await;
+        let inner = request_relay_session(host, port, expected, target, parts, provider, events.clone());
+        // The relay refused, or never answered: say so instead of leaving the device pending forever.
+        let reason = match tokio::time::timeout(HANDSHAKE_TIMEOUT, inner).await {
+            Ok(Ok(())) => return,
+            Ok(Err(err)) => err,
+            Err(_) => "the relay did not answer in time".to_string(),
+        };
+        eprintln!("relay session failed for {}: {reason}", short_id(&failed_id));
+        let _ = events.send(NetEvent::DialFailed { device_id: Some(failed_id), target: None });
     });
 }
 
@@ -2226,11 +2235,16 @@ async fn request_relay_session(
         .map_err(|err| err.to_string())?;
     relay::write_message(&mut tls, 5, &relay::connect_request(&target)).await.map_err(|err| err.to_string())?;
     let (kind, body) = relay::read_message(&mut tls).await.map_err(|err| err.to_string())?;
-    if kind == 6 {
-        if let Ok(invitation) = relay::parse_invitation(&body) {
-            let _ = events.send(NetEvent::Invitation(invitation));
-        }
+    if kind != 6 {
+        // The relay answered with a refusal (the target is not connected to it, for instance).
+        return Err(match relay::parse_response(&body) {
+            Ok((code, message)) if !message.is_empty() => format!("relay refused the session ({code}): {message}"),
+            Ok((code, _)) => format!("relay refused the session ({code})"),
+            Err(_) => format!("relay answered with kind {kind}"),
+        });
     }
+    let invitation = relay::parse_invitation(&body).map_err(|err| format!("relay invitation: {err}"))?;
+    let _ = events.send(NetEvent::Invitation(invitation));
     Ok(())
 }
 
@@ -2241,6 +2255,29 @@ async fn join_invited(
     events: &mpsc::UnboundedSender<NetEvent>,
     invitation: relay::Invitation,
 ) {
+    // The invitation names the device that asked for us by its relay certificate id.
+    let inviter = <[u8; 32]>::try_from(invitation.from.as_slice())
+        .ok()
+        .map(|id| ids::cert_id_text(&id));
+    let session = invited_session(db, material, provider, events, invitation);
+    let reason = match tokio::time::timeout(HANDSHAKE_TIMEOUT, session).await {
+        Ok(Ok(())) => return,
+        Ok(Err(err)) => err,
+        Err(_) => "the relay did not answer in time".to_string(),
+    };
+    eprintln!("relay session failed: {reason}");
+    if let Some(device_id) = inviter {
+        let _ = events.send(NetEvent::DialFailed { device_id: Some(device_id), target: None });
+    }
+}
+
+async fn invited_session(
+    db: &Arc<Mutex<Db>>,
+    material: &IdentityMaterial,
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+    events: &mpsc::UnboundedSender<NetEvent>,
+    invitation: relay::Invitation,
+) -> Result<(), String> {
     let (host, port) = {
         let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
         (
@@ -2248,51 +2285,49 @@ async fn join_invited(
             relay_port(&guard),
         )
     };
-    let Ok(fallback) = resolve_v4(&host, port).await else { return };
+    let fallback = resolve_v4(&host, port).await?;
     if invitation.from.is_empty() {
-        return;
+        return Err("relay invitation without a sender".into());
     }
-    let Ok(target) = relay::invitation_target(&invitation, match fallback.ip() {
+    let target = relay::invitation_target(&invitation, match fallback.ip() {
         std::net::IpAddr::V4(ip) => ip,
-        _ => return,
-    }, fallback.port()) else { return };
+        _ => return Err("relay invitation without an address".into()),
+    }, fallback.port()).map_err(|err| err.to_string())?;
     let parts = material.clone_parts();
     let provider = provider.clone();
     let events = events.clone();
     let db = db.clone();
-    let session = async move {
-        let Ok(mut stream) = TcpStream::connect(target).await else { return };
-        if relay::write_message(&mut stream, 3, &relay::join_session(&invitation.key)).await.is_err() {
-            return;
-        }
-        let Ok((kind, body)) = relay::read_message(&mut stream).await else { return };
-        if kind != 4 {
-            return;
-        }
-        let Ok((code, _)) = relay::parse_response(&body) else { return };
-        if code != 0 {
-            return;
-        }
-        let expected = None;
-        let verifier = Arc::new(tls::IdentityVerifier::peer(provider.clone(), expected));
-        // The TLS client counts as the dialer on both sides; empty means "the other device".
-        let dialed_by = if invitation.server_socket { String::new() } else { parts.device_id.clone() };
-        if invitation.server_socket {
-            let Ok(config) = tls::server_config(provider, &parts.cert_der, &parts.cert_key, verifier) else { return };
-            let Ok(tls) = tokio_rustls::TlsAcceptor::from(Arc::new(config)).accept(stream).await else { return };
-            let certs = tls.get_ref().1.peer_certificates().map(|certs| certs.to_vec()).unwrap_or_default();
-            let _ = finish_handshake(tls, certs, db.clone(), parts, events, "relay".into(), dialed_by, false, None).await;
+    let mut stream = TcpStream::connect(target).await.map_err(|err| err.to_string())?;
+    relay::write_message(&mut stream, 3, &relay::join_session(&invitation.key)).await.map_err(|err| err.to_string())?;
+    let (kind, body) = relay::read_message(&mut stream).await.map_err(|err| err.to_string())?;
+    if kind != 4 {
+        return Err(format!("relay session answered with kind {kind}"));
+    }
+    let (code, message) = relay::parse_response(&body).map_err(|err| err.to_string())?;
+    if code != 0 {
+        return Err(if message.is_empty() {
+            format!("relay refused the session ({code})")
         } else {
-            let Ok(config) = tls::client_config(provider, &parts.cert_der, &parts.cert_key, verifier, None) else { return };
-            let Ok(name) = rustls::pki_types::ServerName::try_from(crate::identity::TLS_DNS_NAME) else { return };
-            let Ok(tls) = TlsConnector::from(Arc::new(config)).connect(name, stream).await else { return };
-            let certs = tls.get_ref().1.peer_certificates().map(|certs| certs.to_vec()).unwrap_or_default();
-            let _ = finish_handshake(tls, certs, db, parts, events, "relay".into(), dialed_by, false, None).await;
-        }
-    };
-    tokio::task::spawn_local(async move {
-        let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, session).await;
-    });
+            format!("relay refused the session ({code}): {message}")
+        });
+    }
+    let expected = None;
+    let verifier = Arc::new(tls::IdentityVerifier::peer(provider.clone(), expected));
+    // The TLS client counts as the dialer on both sides; empty means "the other device".
+    let dialed_by = if invitation.server_socket { String::new() } else { parts.device_id.clone() };
+    if invitation.server_socket {
+        let config = tls::server_config(provider, &parts.cert_der, &parts.cert_key, verifier).map_err(|err| err.to_string())?;
+        let tls = tokio_rustls::TlsAcceptor::from(Arc::new(config)).accept(stream).await.map_err(|err| err.to_string())?;
+        let certs = tls.get_ref().1.peer_certificates().map(|certs| certs.to_vec()).unwrap_or_default();
+        finish_handshake(tls, certs, db, parts, events, "relay".into(), dialed_by, false, None).await.map_err(|err| err.to_string())?;
+    } else {
+        let config = tls::client_config(provider, &parts.cert_der, &parts.cert_key, verifier, None).map_err(|err| err.to_string())?;
+        let name = rustls::pki_types::ServerName::try_from(crate::identity::TLS_DNS_NAME).map_err(|err| err.to_string())?;
+        let tls = TlsConnector::from(Arc::new(config)).connect(name, stream).await.map_err(|err| err.to_string())?;
+        let certs = tls.get_ref().1.peer_certificates().map(|certs| certs.to_vec()).unwrap_or_default();
+        finish_handshake(tls, certs, db, parts, events, "relay".into(), dialed_by, false, None).await.map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 async fn handle_frame(

@@ -145,11 +145,22 @@ fn read_string(input: &[u8]) -> io::Result<(String, &[u8])> {
 
 #[cfg(test)]
 mod tests {
-    use super::{invitation_target, Invitation};
+    use super::{
+        invitation_target, join_relay, join_session, parse_invitation, parse_response, read_message,
+        write_message, Invitation,
+    };
     use std::net::{Ipv4Addr, SocketAddr};
 
     fn invitation(address: Vec<u8>, port: u16) -> Invitation {
         Invitation { from: vec![1], key: vec![2], address, port, server_socket: false }
+    }
+
+    fn xdr(bytes: &[u8]) -> Vec<u8> {
+        let pad = (4 - (bytes.len() % 4)) % 4;
+        let mut out = (bytes.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(bytes);
+        out.extend(std::iter::repeat(0).take(pad));
+        out
     }
 
     #[test]
@@ -163,5 +174,97 @@ mod tests {
         assert_eq!(invitation_target(&invitation(v6, 0), relay, 22067).unwrap(), "203.0.113.9:22067".parse::<SocketAddr>().unwrap());
         assert_eq!(invitation_target(&invitation(vec![10, 0, 0, 2], 5000), relay, 22067).unwrap(), "10.0.0.2:5000".parse::<SocketAddr>().unwrap());
         assert!(invitation_target(&invitation(vec![1, 2, 3], 5000), relay, 22067).is_err());
+    }
+
+    #[test]
+    fn unspecified_invitation_addresses_fall_back_to_the_relay() {
+        let relay = Ipv4Addr::new(203, 0, 113, 9);
+        let unspecified = vec![0, 0, 0, 0];
+        assert_eq!(invitation_target(&invitation(unspecified.clone(), 443), relay, 22067).unwrap(), "203.0.113.9:443".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            invitation_target(&invitation(unspecified, 0), relay, 22067).unwrap(),
+            "203.0.113.9:22067".parse::<SocketAddr>().unwrap(),
+            "an empty port falls back to the configured relay port"
+        );
+    }
+
+    #[tokio::test]
+    async fn frames_round_trip_without_the_padding_leaking_into_the_body() {
+        let token = "abcdefg"; // 7 bytes: one byte of XDR padding
+        let body = join_relay(token);
+        assert_eq!(body.len(), 12, "length prefix, token, padding");
+        assert_eq!(body, xdr(token.as_bytes()));
+        let mut wire = Vec::new();
+        write_message(&mut wire, 2, &body).await.unwrap();
+        assert_eq!(wire.len(), 12 + body.len());
+        assert_eq!(&wire[0..4], &super::MAGIC.to_be_bytes());
+        let mut reader: &[u8] = &wire;
+        let (kind, read) = read_message(&mut reader).await.unwrap();
+        assert_eq!(kind, 2);
+        assert_eq!(read, body);
+        assert!(reader.is_empty(), "the whole frame is consumed");
+
+        // A session key is a 32-byte blob that needs no padding.
+        assert_eq!(join_session(&[7u8; 32]).len(), 36);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_frame_is_an_error_rather_than_a_short_body() {
+        let mut wire = Vec::new();
+        write_message(&mut wire, 2, &join_relay("token")).await.unwrap();
+        let cut = wire.len() - 2;
+        let mut reader: &[u8] = &wire[..cut];
+        assert!(read_message(&mut reader).await.is_err());
+
+        let mut bad_magic = wire.clone();
+        bad_magic[0] ^= 0xff;
+        let mut reader: &[u8] = &bad_magic;
+        assert!(read_message(&mut reader).await.is_err(), "wrong magic is rejected");
+
+        let mut too_long = wire.clone();
+        too_long[8..12].copy_from_slice(&(2 * 1024 * 1024i32).to_be_bytes());
+        let mut reader: &[u8] = &too_long;
+        assert!(read_message(&mut reader).await.is_err(), "an oversized body is rejected");
+    }
+
+    #[test]
+    fn responses_carry_a_code_and_a_message() {
+        let mut body = 1i32.to_be_bytes().to_vec();
+        body.extend_from_slice(&xdr(b"device not found"));
+        assert_eq!(parse_response(&body).unwrap(), (1, "device not found".to_string()));
+
+        let mut ok = 0i32.to_be_bytes().to_vec();
+        ok.extend_from_slice(&xdr(b"OK"));
+        assert_eq!(parse_response(&ok).unwrap(), (0, "OK".to_string()));
+
+        assert!(parse_response(&body[..3]).is_err(), "a truncated response is rejected");
+        assert!(parse_response(&[0u8; 8]).is_err(), "a response without a message is rejected");
+    }
+
+    #[test]
+    fn invitations_carry_the_session_port_and_which_side_serves() {
+        let from = [3u8; 32];
+        let key = [4u8; 32];
+        let mut body = xdr(&from);
+        body.extend_from_slice(&xdr(&key));
+        body.extend_from_slice(&xdr(&[0, 0, 0, 0]));
+        // Two unused bytes, the port, then the serverSocket flag (see strelaysrv).
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&22068u16.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+
+        let parsed = parse_invitation(&body).unwrap();
+        assert_eq!(parsed.from, from);
+        assert_eq!(parsed.key, key);
+        assert!(parsed.address.is_empty());
+        assert_eq!(parsed.port, 22068);
+        assert!(parsed.server_socket);
+        assert_eq!(
+            invitation_target(&parsed, Ipv4Addr::new(203, 0, 113, 9), 22067).unwrap(),
+            "203.0.113.9:22068".parse::<SocketAddr>().unwrap(),
+            "the relay's session port wins over the join port"
+        );
+
+        assert!(parse_invitation(&body[..body.len() - 1]).is_err(), "a short invitation is rejected");
     }
 }
