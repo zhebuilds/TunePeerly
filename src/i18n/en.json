@@ -439,7 +439,17 @@
     "connecting": "Connecting to relay…",
     "registered": "Relay connected",
     "badId": "The relay device ID is not valid",
-    "failed": "Relay unavailable: {{reason}}"
+    "failed": "Relay unavailable: {{reason}}",
+    "pausedIncognito": "Relay paused: incognito mode is on",
+    "fail": {
+      "need_ipv4": "The relay address has to be an IPv4 address, or a name that resolves to one",
+      "dns": "The relay address does not resolve",
+      "io": "The connection to the relay dropped",
+      "tls": "The relay certificate could not be verified",
+      "missing_cert": "The relay did not present a certificate",
+      "cert_mismatch": "The relay certificate does not match the device ID",
+      "unexpected": "The relay sent an unexpected reply"
+    }
   },
   "offer": {
     "title": "Pair with this device?",

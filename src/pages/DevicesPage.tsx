@@ -11,12 +11,17 @@ function ipv4(text: string): boolean {
   return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
 }
 
+const RELAY_FAILURES = ["need_ipv4", "dns", "io", "tls", "missing_cert", "cert_mismatch", "unexpected"];
+
 export function relayLabel(relay: string, t: (key: string, options?: Record<string, unknown>) => string): { text: string; tone: string } {
   if (!relay) return { text: t("relay.off"), tone: "offline" };
   if (relay === "registered") return { text: t("relay.registered"), tone: "online" };
   if (relay === "connecting") return { text: t("relay.connecting"), tone: "pending" };
   if (relay === "badId") return { text: t("relay.badId"), tone: "failed" };
-  return { text: t("relay.failed", { reason: relay.replace(/^failed:/, "") }), tone: "failed" };
+  if (relay === "paused:incognito") return { text: t("relay.pausedIncognito"), tone: "pending" };
+  const reason = relay.replace(/^failed:/, "");
+  if (RELAY_FAILURES.includes(reason)) return { text: t(`relay.fail.${reason}`), tone: "failed" };
+  return { text: t("relay.failed", { reason }), tone: "failed" };
 }
 
 export function DevicesPage() {

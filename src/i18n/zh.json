@@ -435,7 +435,17 @@
     "connecting": "正在连接中继…",
     "registered": "中继已连接",
     "badId": "中继设备标识无效",
-    "failed": "中继不可用：{{reason}}"
+    "failed": "中继不可用：{{reason}}",
+    "pausedIncognito": "无痕模式开启中，中继已暂停",
+    "fail": {
+      "need_ipv4": "中继地址必须是 IPv4 地址，或是能解析出 IPv4 的域名",
+      "dns": "无法解析中继地址",
+      "io": "与中继的连接中断了",
+      "tls": "无法验证中继的证书",
+      "missing_cert": "中继没有提供证书",
+      "cert_mismatch": "中继证书与设备标识不一致",
+      "unexpected": "中继返回了意外的响应"
+    }
   },
   "offer": {
     "title": "与这台设备配对？",

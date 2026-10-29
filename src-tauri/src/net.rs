@@ -737,15 +737,19 @@ fn switches(db: &Db) -> (bool, bool, bool, bool) {
     (incognito, discovery, true, true)
 }
 
+fn relay_configured(db: &Db) -> bool {
+    let host = db.setting_string("relayHost").unwrap_or_default();
+    let id = db.setting_string("relayDeviceId").unwrap_or_default();
+    let token = db.setting_string("relayToken").unwrap_or_default();
+    !host.is_empty() && !id.is_empty() && !token.is_empty()
+}
+
 fn relay_ready(db: &Db) -> bool {
     let (incognito, _, sync, audio) = switches(db);
     if incognito || (!sync && !audio) {
         return false;
     }
-    let host = db.setting_string("relayHost").unwrap_or_default();
-    let id = db.setting_string("relayDeviceId").unwrap_or_default();
-    let token = db.setting_string("relayToken").unwrap_or_default();
-    !host.is_empty() && !id.is_empty() && !token.is_empty()
+    relay_configured(db)
 }
 
 async fn restart_listener(
@@ -1859,7 +1863,12 @@ async fn restart_relay(
     }
     let guard = db.lock().expect("db");
     if !relay_ready(&guard) {
-        set_relay(live, "");
+        // An empty state means "nothing configured". A relay that is set up but held
+        // back by incognito mode is a different situation: saying "not set up" there
+        // sends the user looking for a configuration problem that does not exist.
+        let (incognito, ..) = switches(&guard);
+        let state = if incognito && relay_configured(&guard) { "paused:incognito" } else { "" };
+        set_relay(live, state);
         return;
     }
     let host = guard.setting_string("relayHost").unwrap_or_default();
@@ -1904,25 +1913,27 @@ async fn relay_session(
     provider: Arc<rustls::crypto::CryptoProvider>,
     events: mpsc::UnboundedSender<NetEvent>,
 ) -> Result<(), String> {
+    // Errors travel to the UI as codes, not as English sentences: the window has two
+    // languages and the sentence used to leak into the translated one verbatim.
     let addr = resolve_v4(&host, port).await?;
-    let stream = TcpStream::connect(addr).await.map_err(|err| err.to_string())?;
+    let stream = TcpStream::connect(addr).await.map_err(|_| "io".to_string())?;
     let verifier = Arc::new(tls::IdentityVerifier::relay(provider.clone(), expected));
     let config = tls::client_config(provider, &parts.cert_der, &parts.cert_key, verifier, Some(b"bep-relay"))
-        .map_err(|err| err.to_string())?;
+        .map_err(|_| "tls".to_string())?;
     let connector = TlsConnector::from(Arc::new(config));
-    let name = rustls::pki_types::ServerName::try_from("relay.local").map_err(|err| err.to_string())?;
-    let mut tls = connector.connect(name, stream).await.map_err(|err| err.to_string())?;
+    let name = rustls::pki_types::ServerName::try_from("relay.local").map_err(|_| "tls".to_string())?;
+    let mut tls = connector.connect(name, stream).await.map_err(|_| "tls".to_string())?;
     let peer_certs = tls.get_ref().1.peer_certificates().map(|certs| certs.to_vec()).unwrap_or_default();
-    let cert = peer_certs.first().ok_or("missing relay certificate")?;
+    let cert = peer_certs.first().ok_or("missing_cert")?;
     if !ids::same_cert_id(&relay_id, cert.as_ref()) || ids::cert_id_bytes(cert.as_ref()) != expected {
-        return Err("relay certificate id does not match".into());
+        return Err("cert_mismatch".into());
     }
-    relay::write_message(&mut tls, 2, &relay::join_relay(&token)).await.map_err(|err| err.to_string())?;
-    let (kind, body) = relay::read_message(&mut tls).await.map_err(|err| err.to_string())?;
+    relay::write_message(&mut tls, 2, &relay::join_relay(&token)).await.map_err(|_| "io".to_string())?;
+    let (kind, body) = relay::read_message(&mut tls).await.map_err(|_| "io".to_string())?;
     if kind != 4 {
-        return Err("unexpected relay response".into());
+        return Err("unexpected".into());
     }
-    let (code, message) = relay::parse_response(&body).map_err(|err| err.to_string())?;
+    let (code, message) = relay::parse_response(&body).map_err(|_| "unexpected".to_string())?;
     if code != 0 && code != 2 {
         return Err(message);
     }
@@ -1953,10 +1964,10 @@ async fn resolve_v4(host: &str, port: u16) -> Result<SocketAddr, String> {
         return Ok(SocketAddr::from((ip, port)));
     }
     if host.parse::<std::net::Ipv6Addr>().is_ok() {
-        return Err("Connection failed".into());
+        return Err("need_ipv4".into());
     }
-    let mut addrs = tokio::net::lookup_host((host, port)).await.map_err(|err| err.to_string())?;
-    addrs.find(|addr| addr.is_ipv4()).ok_or_else(|| "Connection failed".into())
+    let mut addrs = tokio::net::lookup_host((host, port)).await.map_err(|_| "dns".to_string())?;
+    addrs.find(|addr| addr.is_ipv4()).ok_or_else(|| "need_ipv4".into())
 }
 
 async fn maybe_relay_fallback(
