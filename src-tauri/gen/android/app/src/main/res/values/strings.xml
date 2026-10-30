@@ -1,0 +1,7 @@
+﻿<resources>
+    <string name="app_name">"TunePeerly"</string>
+    <string name="main_activity_title">"TunePeerly"</string>
+    <string name="import_no_picker">"This device has no folder picker"</string>
+    <string name="import_failed">"Could not read that folder"</string>
+    <string name="import_nothing_new">"Nothing new to import"</string>
+</resources>

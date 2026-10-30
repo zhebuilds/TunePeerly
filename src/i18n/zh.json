@@ -330,6 +330,7 @@
     "removedFrom": "已从 {{name}} 移除",
     "imported_other": "已添加 {{count}} 首歌",
     "importedNone": "曲库已是最新",
+    "importFailed": "导入失败，没能读取这个文件夹",
     "rescanning": "正在扫描音乐文件夹…",
     "rescanned": "音乐文件夹已扫描",
     "exposed": "已配对设备现在可以播放这些歌曲",

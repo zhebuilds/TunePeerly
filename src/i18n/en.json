@@ -334,6 +334,7 @@
     "imported_one": "Added {{count}} song",
     "imported_other": "Added {{count}} songs",
     "importedNone": "Library is up to date",
+    "importFailed": "Could not import that folder",
     "rescanning": "Scanning music folders…",
     "rescanned": "Music folders scanned",
     "exposed": "Paired devices can now play these songs",

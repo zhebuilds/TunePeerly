@@ -140,6 +140,7 @@ export type DesktopTrack = {
 export const api = {
   bootstrap: () => invoke<Bootstrap>("bootstrap"),
   importPaths: (paths: string[], kind: "directory" | "file" | "auto") => invoke<ImportSummary[]>("import_paths", { paths, kind }),
+  mobilePickFolder: () => invoke("mobile_pick_folder"),
   rescan: () => invoke("rescan"),
   removeGrant: (id: number) => invoke("remove_grant", { id }),
   library: () => invoke<Track[]>("library"),
@@ -184,6 +185,11 @@ export const api = {
 export async function pickFolder(): Promise<string | null> {
   const selected = await open({ directory: true, multiple: false });
   return typeof selected === "string" ? selected : null;
+}
+
+/** Android hands out `content://` trees instead of paths, so the picker copies them in first. */
+export function isAndroidApp(): boolean {
+  return /Android/i.test(navigator.userAgent);
 }
 
 export async function pickFiles(): Promise<string[]> {

@@ -1,0 +1,5 @@
+﻿<resources>
+    <string name="import_no_picker">"这个设备没有文件夹选择器"</string>
+    <string name="import_failed">"读不了这个文件夹"</string>
+    <string name="import_nothing_new">"没有可导入的新文件"</string>
+</resources>

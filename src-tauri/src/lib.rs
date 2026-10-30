@@ -1,4 +1,8 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
+#[cfg(desktop)]
+mod desktop;
+#[cfg(not(desktop))]
+#[path = "desktop_mobile.rs"]
 mod desktop;
 mod catalog;
 mod media;
@@ -617,15 +621,18 @@ fn set_tray_menu(app: AppHandle, show: String, quit: String, name: String) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            desktop::show_main(app);
-        }))
+    #[cfg(desktop)]
+    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        desktop::show_main(app);
+    }));
+    #[cfg(not(desktop))]
+    let builder = tauri::Builder::default();
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data = app.path().data_dir().unwrap_or_else(|err| fatal(&format!("data folder: {err}")));
-            let cache = config::cache_dir();
+            let cache = cache_root(app.handle());
             let app_dir = config::app_dir(&data);
             let database = config::database_path(&app_dir);
             let db = Db::open(&database, app_dir.clone(), cache.clone())
@@ -652,11 +659,16 @@ pub fn run() {
             app.manage(AppState { db, net, material });
             desktop::install(app.handle());
             desktop::sync_mini(app.handle(), on_minimize, in_tray);
+            // Only the phone keeps imported music in a folder of its own; on desktop the user's
+            // own folders are the library, and a stray `%APPDATA%/music` must not be swept up.
+            #[cfg(target_os = "android")]
+            import_mobile_music(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             import_paths,
+            mobile_pick_folder,
             rescan,
             remove_grant,
             library,
@@ -694,6 +706,117 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| fatal(&format!("{err}")));
+}
+
+/// Windows keeps covers under `%LOCALAPPDATA%`; Android and iOS have no such variable, so ask Tauri.
+fn cache_root(app: &AppHandle) -> std::path::PathBuf {
+    #[cfg(desktop)]
+    {
+        let _ = app;
+        config::cache_dir()
+    }
+    #[cfg(not(desktop))]
+    {
+        app.path().app_cache_dir().unwrap_or_else(|_| std::env::temp_dir())
+    }
+}
+
+/// Android only: where the folder picker copies what the user picked. The activity copies into
+/// `Context.getDataDir()/music`, which is what `data_dir()` resolves to on Android, so both sides
+/// always look at the same folder.
+#[cfg(target_os = "android")]
+fn mobile_music_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path().data_dir().ok().map(|dir| dir.join("music"))
+}
+
+/// The activity writes this once the picked tree is copied: the number of new files, `-1` when the
+/// copy failed, `-2` when the user cancelled the picker. Rust deletes it before opening the picker,
+/// so a stale value can never be mistaken for a fresh one.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+const MOBILE_IMPORT_MARKER: &str = ".import-done";
+
+/// Imports what already sits in the private music folder, e.g. after a restart.
+#[cfg(target_os = "android")]
+fn import_mobile_music(app: &AppHandle) {
+    let Some(dir) = mobile_music_dir(app) else { return };
+    if !dir.is_dir() {
+        return;
+    }
+    let db = app.state::<AppState>().db.clone();
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let _ = scan::import_path(&db, &dir, "auto");
+        let _ = handle.emit("library-updated", json!({}));
+    });
+}
+
+/// Android only: shows the system folder picker, which copies the chosen tree into app storage
+/// because Rust cannot read `content://` URIs. Returns at once; the import happens afterwards and
+/// is reported through `mobile-import-finished`, including when the user backs out.
+#[tauri::command(async)]
+fn mobile_pick_folder(app: AppHandle) -> AppResult<()> {
+    #[cfg(target_os = "android")]
+    {
+        let dir = mobile_music_dir(&app).ok_or_else(|| AppError::Message("file.unreadable".into()))?;
+        std::fs::create_dir_all(&dir).map_err(|err| AppError::Message(format!("music folder: {err}")))?;
+        let marker = dir.join(MOBILE_IMPORT_MARKER);
+        let _ = std::fs::remove_file(&marker);
+        open_folder_picker().map_err(AppError::Message)?;
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            // The copy runs on the activity side, so the marker is the only completion signal.
+            for _ in 0..1_200 {
+                if let Ok(text) = std::fs::read_to_string(&marker) {
+                    let _ = std::fs::remove_file(&marker);
+                    let status = match text.trim().parse::<i64>() {
+                        Ok(-2) => "cancelled",
+                        Ok(-1) => "failed",
+                        Ok(_) => "ok",
+                        Err(_) => "failed",
+                    };
+                    let added = if status == "ok" {
+                        handle
+                            .try_state::<AppState>()
+                            .and_then(|state| scan::import_path(&state.db, &dir, "auto").ok())
+                            .map(|summary| summary.added)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if status == "ok" {
+                        let _ = handle.emit("library-updated", json!({}));
+                    }
+                    let _ = handle.emit(
+                        "mobile-import-finished",
+                        json!({ "added": added, "status": status }),
+                    );
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            // Never leave the player waiting forever if the activity never reports back.
+            let _ = handle.emit("mobile-import-finished", json!({ "added": 0, "status": "timeout" }));
+        });
+        Ok(())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Err(AppError::Message("file.unreadable".into()))
+    }
+}
+
+/// The activity owns the picker: Android's UI thread has to present it, so Rust only asks over JNI.
+#[cfg(target_os = "android")]
+fn open_folder_picker() -> Result<(), String> {
+    use jni::objects::JObject;
+    let context = ndk_context::android_context();
+    let vm = unsafe { jni::JavaVM::from_raw(context.vm().cast()) }.map_err(|err| format!("vm: {err}"))?;
+    let mut env = vm.attach_current_thread().map_err(|err| format!("thread: {err}"))?;
+    let activity = unsafe { JObject::from_raw(context.context().cast()) };
+    env.call_method(&activity, "openMusicFolderPicker", "()V", &[])
+        .map_err(|err| format!("picker: {err}"))?;
+    Ok(())
 }
 
 /// Release builds have no console and abort on panic, so a startup failure would just vanish.
