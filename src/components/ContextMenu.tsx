@@ -1,5 +1,5 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
-import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { useApp } from "../app/model";
@@ -138,8 +138,45 @@ async function exposeTracks(ids: string[], expose: boolean) {
 }
 
 function Layer({ children, onClose }: { children: ReactNode; onClose: () => void }) {
+  const layer = useRef<HTMLDivElement>(null);
+  // A row is right-clicked, not focused, so the focus stays on the row and the arrow keys keep
+  // moving the selection behind the open menu. Take the focus into the menu, and give it back when
+  // the menu closes.
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    navigable(layer.current)[0]?.focus();
+    return () => previous?.focus?.();
+  }, []);
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.stopPropagation();
+      onClose();
+      return;
+    }
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Home" && event.key !== "End") return;
+    const items = navigable(layer.current);
+    if (items.length === 0) return;
+    const index = items.indexOf(document.activeElement as HTMLElement);
+    const last = items.length - 1;
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? last
+          : event.key === "ArrowDown"
+            ? index < 0 || index === last
+              ? 0
+              : index + 1
+            : index <= 0
+              ? last
+              : index - 1;
+    event.preventDefault();
+    event.stopPropagation();
+    items[next].focus();
+  };
   return (
     <div
+      ref={layer}
       className="menu-layer"
       onPointerDown={(event) => {
         if (event.target === event.currentTarget) onClose();
@@ -148,13 +185,16 @@ function Layer({ children, onClose }: { children: ReactNode; onClose: () => void
         event.preventDefault();
         if (event.target === event.currentTarget) onClose();
       }}
-      onKeyDown={(event) => {
-        if (event.key === "Escape") onClose();
-      }}
+      onKeyDown={onKeyDown}
     >
       {children}
     </div>
   );
+}
+
+// Menu items that can currently be reached: enabled, and rendered (a closed submenu stays hidden).
+function navigable(layer: HTMLDivElement | null) {
+  return Array.from(layer?.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])') ?? []).filter((item) => item.getClientRects().length > 0);
 }
 
 function Item({ icon, label, onClick, disabled, danger }: { icon: ReactNode; label: string; onClick: () => void; disabled?: boolean; danger?: boolean }) {
