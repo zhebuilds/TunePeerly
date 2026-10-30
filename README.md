@@ -58,6 +58,21 @@ net stop winnat
 net start winnat
 ```
 
+### Android
+
+The Android app is in `src-tauri/gen/android` and is still in development. It needs the Android SDK, the Android NDK, and JDK 17 on top of the requirements above; see the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/). The project has already been generated, so do not run `tauri android init` again.
+
+```powershell
+npm run tauri android dev
+npm run tauri android build -- --apk
+```
+
+`android dev` runs the app on a connected phone and loads the frontend from `build.devUrl`, which is `http://localhost:1420`, so the dev server has to stay running for as long as you use that build.
+
+Do not hand out an APK built with Gradle directly. `gradlew assembleDebug` produces the development variant, which reads the frontend from `devUrl` instead of embedding `frontendDist`, so on its own it opens to `Failed to request http://localhost:1420/` and never shows the interface. An APK that should run without a computer has to come from `tauri android build --apk`, which embeds `frontendDist` and needs a signing configuration in `src-tauri/gen/android/keystore.properties`, as described in [Android signing](https://v2.tauri.app/distribute/sign/android/).
+
+The quickest way to tell the two apart is to install the build on a phone with the computer out of reach: a build that embeds the frontend opens, and a development variant stays on that error screen.
+
 ## Installer
 
 Run these from the repository root. Build the release program first, then compile [installer/TunePeerly.iss](installer/TunePeerly.iss). The script takes `src-tauri\target\release\TunePeerly.exe`. [Inno Setup 7](https://jrsoftware.org/isinfo.php) must be installed.

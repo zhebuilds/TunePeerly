@@ -58,6 +58,21 @@ net stop winnat
 net start winnat
 ```
 
+### Android
+
+安卓版在 `src-tauri/gen/android`，还在开发中。除了上面的环境，还需要 Android SDK、Android NDK 和 JDK 17，可参考 [Tauri 的前置要求](https://v2.tauri.app/start/prerequisites/)。工程已经生成过，不要再执行 `tauri android init`。
+
+```powershell
+npm run tauri android dev
+npm run tauri android build -- --apk
+```
+
+`android dev` 会把应用跑在连着的手机上，界面从 `build.devUrl` 也就是 `http://localhost:1420` 取，所以用这类包的时候，开发服务器要一直开着。
+
+不要直接把用 Gradle 打出来的包交给别人。`gradlew assembleDebug` 打的是开发版，界面从 `devUrl` 取，而不是把 `frontendDist` 打进包里，单独装到手机上只会停在 `Failed to request http://localhost:1420/`，一直看不到界面。要脱离电脑运行，就得用 `tauri android build --apk`，它会把 `frontendDist` 打进包，并且需要 `src-tauri/gen/android/keystore.properties` 里的签名配置，见 [Android 签名](https://v2.tauri.app/distribute/sign/android/)。
+
+最简单的区分办法：把包装到手机上，电脑不在旁边时能打开界面的是正式构建，停在报错页的是开发版。
+
 ## 安装包
 
 在仓库根目录执行。先生成发布版程序，再编译 [installer/TunePeerly.iss](installer/TunePeerly.iss)。脚本从 `src-tauri\target\release\TunePeerly.exe` 取文件，需要已安装的 [Inno Setup 7](https://jrsoftware.org/isinfo.php)。
