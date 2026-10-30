@@ -2,7 +2,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type MemberRef, type OverwriteAsk, type Settings, type Track } from "../api";
+import { api, errorText, isAndroidApp, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type MemberRef, type OverwriteAsk, type Settings, type Track } from "../api";
 import i18n from "../i18n";
 import { albumParts, filterText, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
 import {
@@ -771,12 +771,46 @@ function useModel() {
 
   const addMusic = useCallback(async (kind: "directory" | "file") => {
     try {
+      if (isAndroidApp()) {
+        // The system picker copies the chosen tree into app storage in the background; Rust
+        // rescans when the copy finishes and tells us here, so nothing polls on this side.
+        let unlisten: (() => void) | undefined;
+        const done = new Promise<{ added: number; status: string }>((resolve) => {
+          const timer = window.setTimeout(() => resolve({ added: 0, status: "timeout" }), 15 * 60 * 1000);
+          listen<{ added: number; status: string }>("mobile-import-finished", (event) => {
+            window.clearTimeout(timer);
+            resolve({ added: event.payload.added, status: event.payload.status });
+          })
+            .then((stop) => {
+              unlisten = stop;
+            })
+            .catch(() => resolve({ added: 0, status: "failed" }));
+        });
+        try {
+          await api.mobilePickFolder();
+          const result = await done;
+          if (result.status === "cancelled") return;
+          if (result.status !== "ok") {
+            // A failed or timed-out import used to look exactly like "nothing happened".
+            toast(t("toast.importFailed"));
+            return;
+          }
+          if (result.added > 0) {
+            toast(t("toast.imported", { count: result.added }));
+            reloadLyrics();
+            await refresh();
+          }
+        } finally {
+          unlisten?.();
+        }
+        return;
+      }
       const paths = kind === "directory" ? [await pickFolder()].filter((item): item is string => Boolean(item)) : await pickFiles();
       await importPaths(paths, kind);
     } catch (error) {
       say(error);
     }
-  }, [importPaths, say]);
+  }, [importPaths, refresh, reloadLyrics, say, t, toast]);
 
   const like = useCallback(async (track: Track) => {
     const key = trackKey(track);

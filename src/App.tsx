@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { setDropHandler } from "./app/drag";
 import { AppProvider, useApp, type Route } from "./app/model";
+import { useMobilePlayback } from "./app/mobile-playback";
 import { ScrollContext } from "./app/scroll";
 import { ContextMenu } from "./components/ContextMenu";
 import { Tooltip } from "./components/Tooltip";
@@ -69,6 +70,7 @@ function typing(target: EventTarget | null): boolean {
 function Shell() {
   const { t } = useTranslation();
   const app = useApp();
+  useMobilePlayback(app);
   const scroll = useRef<HTMLDivElement>(null);
   const [sidebar, setSidebar] = useSidebarWidth();
   const [dropping, setDropping] = useState(false);
