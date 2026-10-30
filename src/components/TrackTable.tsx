@@ -132,7 +132,34 @@ export function TrackTable({ tracks, contextId, sort, onSort, defaultSort, playl
 
   return (
     <div className="track-table" role="grid" aria-rowcount={tracks.length} onKeyDown={(event) => {
-      if (event.key === "Escape") setSelected(new Set());
+      if (event.key === "Escape") {
+        setSelected(new Set());
+        return;
+      }
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+      // the global shortcuts (Ctrl+arrows for the volume, Ctrl+Left/Right for the track) stay untouched
+      if (event.ctrlKey || event.altKey || event.shiftKey) return;
+      const row = (event.target as HTMLElement).closest<HTMLElement>(".track-row");
+      const at = Number(row?.dataset.rowIndex);
+      if (!row || !Number.isFinite(at)) return;
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      const next = at + step;
+      if (next < 0 || next >= tracks.length) return;
+      event.preventDefault();
+      const rows = Array.from(body.current?.querySelectorAll<HTMLElement>(".track-row") ?? []);
+      const target = rows[rows.indexOf(row) + step];
+      if (target) {
+        target.focus({ preventScroll: true });
+        target.scrollIntoView({ block: "nearest" });
+        return;
+      }
+      // Rows are virtualised: scroll by one row and pick the row up once it has rendered.
+      scroller.current?.scrollBy({ top: step * ROW });
+      requestAnimationFrame(() => {
+        const el = body.current?.querySelector<HTMLElement>(`[data-row-index="${next}"]`);
+        el?.focus({ preventScroll: true });
+        el?.scrollIntoView({ block: "nearest" });
+      });
     }}>
       <div className={`track-head ${gridClass}`} role="row">
         {sort && onSort && cols.number === "index" ? (
@@ -229,6 +256,7 @@ const TrackRow = memo(function TrackRow({ track, index, top, number, gridClass, 
       style={{ transform: `translateY(${top}px)` }}
       role="row"
       tabIndex={0}
+      data-row-index={index}
       data-drop={dropId}
       title={reason || undefined}
       onPointerDown={(event) => onDrag(event, index)}

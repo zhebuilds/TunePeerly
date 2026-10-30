@@ -194,6 +194,8 @@ function Shell() {
       const onSlider = element?.tagName === "INPUT";
       // widgets that own the arrow keys themselves (the sidebar splitter) must not seek
       const onWidget = !!element?.closest("[role='separator'], [role='slider']");
+      // inside the song list the arrows move the focus between rows (TrackTable), not the playhead
+      const inGrid = !!element?.closest("[role='grid']");
       if (event.key === " " || event.code === "Space") {
         if ((event.target as HTMLElement | null)?.closest("button, [role='button']")) return;
         event.preventDefault();
@@ -210,7 +212,7 @@ function Shell() {
       } else if (ctrl && event.key === "ArrowDown") {
         event.preventDefault();
         model.setVolume(model.volume - 0.05);
-      } else if (!ctrl && !event.shiftKey && !onSlider && !onWidget && (event.key === "ArrowLeft" || event.key === "ArrowRight") && model.current) {
+      } else if (!ctrl && !event.shiftKey && !onSlider && !onWidget && !inGrid && (event.key === "ArrowLeft" || event.key === "ArrowRight") && model.current) {
         event.preventDefault();
         model.engine.skip(event.key === "ArrowRight" ? 5 : -5);
       }
