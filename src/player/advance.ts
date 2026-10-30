@@ -223,6 +223,17 @@ export function moveInQueue(state: QueueState, from: number, to: number): QueueS
   return { ...state, future };
 }
 
+/**
+ * Finds the entry a queue action was started on. The queue can move under an
+ * open menu or a drag (the current song ends), so trust the position only when
+ * it still holds the same song; otherwise fall back to the entry's new spot.
+ * Returns -1 when the song is no longer queued.
+ */
+export function queuedIndex(future: TrackRef[], at: number, key: string): number {
+  if (future[at]?.key === key) return at;
+  return future.findIndex((ref) => ref.key === key);
+}
+
 /** Jumps to a queued entry; everything before it moves to `past`. */
 export function jumpTo(state: QueueState, index: number): QueueState {
   if (index < 0 || index >= state.future.length) return state;

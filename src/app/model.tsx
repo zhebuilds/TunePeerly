@@ -1,4 +1,4 @@
-// Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
+﻿// Original work 漏 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
 import { listen } from "@tauri-apps/api/event";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
@@ -17,6 +17,7 @@ import {
   playFromList,
   playNext,
   previous as previousState,
+  queuedIndex,
   removeAt,
   startLibraryRandom,
   startShuffled,
@@ -281,7 +282,7 @@ function useModel() {
     document.documentElement.dataset.theme = theme === "light" ? "light" : "dark";
     const lang = language === "zh" ? "zh" : "en";
     document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
-    document.title = lang === "zh" ? "声渡" : "TunePeerly";
+    document.title = lang === "zh" ? "澹版浮" : "TunePeerly";
     if (i18n.language !== lang) void i18n.changeLanguage(lang);
     if ("__TAURI_INTERNALS__" in window) {
       const title = document.title;
@@ -600,8 +601,10 @@ function useModel() {
     engine.toggle();
   }, [engine, library, next, playAll]);
 
-  const jump = useCallback((at: number) => {
-    const target = jumpTo(queueRef.current, at);
+  const jump = useCallback((at: number, expected?: Track | null) => {
+    const index = expected ? queuedIndex(queueRef.current.future, at, refOf(expected).key) : at;
+    if (index < 0) return;
+    const target = jumpTo(queueRef.current, index);
     commit(target, 0);
     startCurrent(target);
   }, [commit, startCurrent]);
@@ -621,8 +624,16 @@ function useModel() {
       commit({ ...state, future: [...state.future.slice(0, position), ...items.map(refOf), ...state.future.slice(position)] });
       toast(items.length === 1 ? t("toast.queued") : t("toast.queuedMany", { count: items.length }));
     },
-    remove: (at: number) => commit(removeAt(queueRef.current, at)),
-    move: (from: number, to: number) => commit(moveInQueue(queueRef.current, from, to)),
+    remove: (at: number, expected?: Track | null) => {
+      const index = expected ? queuedIndex(queueRef.current.future, at, refOf(expected).key) : at;
+      if (index < 0) return;
+      commit(removeAt(queueRef.current, index));
+    },
+    move: (from: number, to: number, expected?: Track | null) => {
+      const index = expected ? queuedIndex(queueRef.current.future, from, refOf(expected).key) : from;
+      if (index < 0) return;
+      commit(moveInQueue(queueRef.current, index, to));
+    },
     clear: () => commit({ ...queueRef.current, future: [] }),
     jump,
   }), [commit, jump, t, toast]);

@@ -62,7 +62,7 @@ export function ContextMenu() {
             label={t("menu.play")}
             disabled={!one.playable}
             onClick={run(() => {
-              if (menu.queueIndex !== undefined) app.queueActions.jump(menu.queueIndex);
+              if (menu.queueIndex !== undefined) app.queueActions.jump(menu.queueIndex, one);
               else if (menu.play) menu.play();
               else app.playList([one], 0, app.queue.contextId);
             })}
@@ -70,7 +70,7 @@ export function ContextMenu() {
         )}
         <Item icon={<Icons.next />} label={t("menu.playNext")} onClick={run(() => app.queueActions.playNext(tracks))} />
         <Item icon={<Icons.queue />} label={t("menu.addToQueue")} onClick={run(() => app.queueActions.add(tracks))} />
-        {menu.queueIndex !== undefined && <Item icon={<Icons.close />} label={t("queue.remove")} onClick={run(() => app.queueActions.remove(menu.queueIndex!))} />}
+        {menu.queueIndex !== undefined && <Item icon={<Icons.close />} label={t("queue.remove")} onClick={run(() => app.queueActions.remove(menu.queueIndex!, one))} />}
         <hr />
         <div className="menu-sub" onMouseEnter={() => setSub(true)} onMouseLeave={() => setSub(false)}>
           <button type="button" role="menuitem" className="menu-item" aria-haspopup="menu" aria-expanded={sub} onClick={() => setSub((value) => !value)}>

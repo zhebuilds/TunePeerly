@@ -16,6 +16,7 @@ import {
   startShuffled,
   toggleShuffle,
   previous,
+  queuedIndex,
   removeAt,
   selectSource,
   shouldIncrementGeneration,
@@ -199,4 +200,13 @@ test("a lan and relay path switch does not increment generation", () => {
   assert.equal(shouldIncrementGeneration("path"), false);
   assert.equal(shouldIncrementGeneration("device"), true);
   assert.equal(shouldIncrementGeneration("repeat"), true);
+});
+
+test("a stale queue action resolves to the song it was started on", () => {
+  const future = [track("b"), track("c"), track("d")];
+  assert.equal(queuedIndex(future, 1, "c"), 1);
+  assert.equal(queuedIndex(future, 0, "c"), 1);
+  assert.equal(queuedIndex(future, 2, "b"), 0);
+  assert.equal(queuedIndex(future, 0, "gone"), -1);
+  assert.equal(queuedIndex([], 0, "b"), -1);
 });

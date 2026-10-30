@@ -128,7 +128,7 @@ function Shell() {
         for (const track of fresh) void model.like(track);
         if (fresh.length === 0) model.toast(t("toast.alreadyLiked"));
       } else if (target.type === "queue") {
-        if (source.type === "queue") model.queueActions.move(source.index, target.index > source.index ? target.index - 1 : target.index);
+        if (source.type === "queue") model.queueActions.move(source.index, target.index > source.index ? target.index - 1 : target.index, source.tracks[0]);
         else model.queueActions.insert(target.index, source.tracks);
       } else if (target.type === "member" && source.type === "member") {
         const to = target.index > source.index ? target.index - 1 : target.index;
