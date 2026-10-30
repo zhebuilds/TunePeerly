@@ -1,4 +1,8 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
+#[cfg(desktop)]
+mod desktop;
+#[cfg(not(desktop))]
+#[path = "desktop_mobile.rs"]
 mod desktop;
 mod catalog;
 mod media;
@@ -617,15 +621,18 @@ fn set_tray_menu(app: AppHandle, show: String, quit: String, name: String) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            desktop::show_main(app);
-        }))
+    #[cfg(desktop)]
+    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        desktop::show_main(app);
+    }));
+    #[cfg(not(desktop))]
+    let builder = tauri::Builder::default();
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data = app.path().data_dir().unwrap_or_else(|err| fatal(&format!("data folder: {err}")));
-            let cache = config::cache_dir();
+            let cache = cache_root(app.handle());
             let app_dir = config::app_dir(&data);
             let database = config::database_path(&app_dir);
             let db = Db::open(&database, app_dir.clone(), cache.clone())
@@ -694,6 +701,19 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| fatal(&format!("{err}")));
+}
+
+/// Windows keeps covers under `%LOCALAPPDATA%`; Android and iOS have no such variable, so ask Tauri.
+fn cache_root(app: &AppHandle) -> std::path::PathBuf {
+    #[cfg(desktop)]
+    {
+        let _ = app;
+        config::cache_dir()
+    }
+    #[cfg(not(desktop))]
+    {
+        app.path().app_cache_dir().unwrap_or_else(|_| std::env::temp_dir())
+    }
 }
 
 /// Release builds have no console and abort on panic, so a startup failure would just vanish.
