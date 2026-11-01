@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, pickFolder, type Feature, type Grant } from "../api";
 import { useApp } from "../app/model";
-import { CommitInput, Revise, Row, Segmented, Select, Switch } from "../components/controls";
+import { CommitInput, Row, Segmented, Select, Switch } from "../components/controls";
 import { SyncButton } from "../components/SyncButton";
 import { problemGroups } from "../lib/library";
 import { isAndroid } from "../lib/platform";
@@ -176,7 +176,7 @@ export function SettingsPage() {
       </section>
 
       <section className="panel" ref={(node) => { refs.current.sync = node; }}>
-        <h2>{t("settings.sync")}<Revise /></h2>
+        <h2>{t("settings.sync")}</h2>
         <p className="setting-help">{t("settings.syncHelp")}</p>
         <p className="setting-help">{t("settings.overwritePolicyHelp")}</p>
         {FEATURES.map((feature) => {

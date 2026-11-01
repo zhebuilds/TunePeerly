@@ -533,8 +533,6 @@
     "historyCap": "最近播放保留条数",
     "historyCapHelp": "超出的旧记录会被删除，范围 1 到 10000。",
     "historyCapInvalid": "请输入 1 到 10000 之间的数字。",
-    "revise": "待修改",
-    "notImplemented": "待完善且未测试",
     "historyPause": "暂停记录",
     "historyPauseHelp": "这台电脑的最近播放不再记录播放完成的歌曲。",
     "incognito": "无痕模式",

@@ -3,7 +3,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, type Link } from "../api";
 import { useApp } from "../app/model";
-import { CommitInput, NotImplemented, Row, Select, Switch } from "../components/controls";
+import { CommitInput, Row, Select, Switch } from "../components/controls";
 import { unpairedNearby } from "../lib/devices";
 import { Icons } from "../ui/icons";
 
@@ -183,7 +183,7 @@ export function DevicesPage() {
       </section>
 
       <section className="panel">
-        <h2><span className="setting-title-line">{t("relay.server")}<NotImplemented /></span></h2>
+        <h2>{t("relay.server")}</h2>
         {settings.incognito && (
           <div className="banner warn">
             <Icons.incognito /> <span>{t("settings.networkIncognito")}</span>

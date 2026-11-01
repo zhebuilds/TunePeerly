@@ -539,8 +539,6 @@
     "historyCap": "Songs kept in Recently Played",
     "historyCapHelp": "Older entries are dropped. Between 1 and 10000.",
     "historyCapInvalid": "Enter a number between 1 and 10000.",
-    "revise": "To be revised",
-    "notImplemented": "Not completed yet, not tested",
     "historyPause": "Pause recording",
     "historyPauseHelp": "Recently Played on this computer does not record songs that finish.",
     "incognito": "Incognito",
