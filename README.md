@@ -9,7 +9,7 @@
   <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-TunePeerly plays the music already on this computer and shares it with paired devices. There is no account. Paired devices on the same local network find each other directly. A relay you run yourself can be used for connections outside that network.
+TunePeerly plays the music already on this computer and shares it with paired devices. There is no account. Paired devices on the same local network find each other directly. A relay you run yourself can be used for connections outside that network. Pairing happens only on the local network; the relay only carries data between devices that are already paired, and never pairs.
 
 > **Note:** The current release is an alpha test. The program is not guaranteed to match the [user guide](docs/guide.md).
 
@@ -26,7 +26,8 @@ TunePeerly plays the music already on this computer and shares it with paired de
 ## Security and privacy
 
 - Devices talk only over TLS 1.3, and both sides prove who they are. Each device has its own key pair, and its device ID is the SHA-256 hash of its public key. After pairing, each device keeps the other's public key and accepts no other key for that device.
-- The encryption runs end to end between your devices. A relay only passes the data along and cannot read it.
+- The encryption runs end to end between your devices. A relay only passes the data along and cannot read it. It does see each device's relay ID, public IP, when it is online, and who connects to whom and how much data. See [SECURITY.md](SECURITY.md).
+- A relay connection is accepted only from a paired device. When using a relay, set both devices to **Full trust** for each other.
 - The library database is encrypted with SQLCipher. Its random key is kept in `db.key` next to the database. On Windows that file is sealed with DPAPI, so it opens only under your Windows account. On other systems the file can be read only by its owner (mode 0600).
 - Pairing uses a 6-digit code shown on one computer and typed on the other. The code is checked with SPAKE2, so it never crosses the network and a device in the middle cannot pair in your place. A code works once, for 90 seconds. After 3 wrong codes, pairing pauses for 1 minute.
 - Removing a device unpairs both sides. This computer deletes the device's key and tells the device, which removes this computer from its own list. A device that is offline is told the next time the two connect. Your other devices are not changed. To use the two together again, pair them again with a new code from either side.

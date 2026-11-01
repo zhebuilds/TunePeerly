@@ -65,6 +65,10 @@ Open **Devices**. Before pairing, **Discover nearby devices**, the switch next t
 
 The four relay fields are on the **Devices** page, in **Relay server** below **Nearby**: address, port, the relay's certificate ID, and a token, with the relay status shown under the heading. **Relay server** is marked **Not completed yet, not tested** and **Do not use**.
 
+- Pairing happens only on the local network. The relay only carries data between devices that are already paired, and never pairs. Pair the devices on the same network first.
+- When using a relay, set both devices to **Full trust** for each other. A device set to **Ask each time** does not dial over the relay; it only waits for the other device to connect and then asks you. If both sides use **Ask each time**, they never connect over the relay.
+- The relay cannot read your data (TLS 1.3 end to end), but it sees each device's relay ID, public IP, when it is online, and who connects to whom and how much data. Anyone who knows the relay address and a device's relay ID can learn whether that device is online; the app refuses every device that is not paired. See [SECURITY.md](../SECURITY.md).
+
 Settings → **This computer** is where you rename this computer; other devices see that name. Below it are read-only details: the **TCP listening port**, the discovery UDP port and multicast group, the LAN IPv4 addresses this computer announces, and last the **Device ID**. The discovery rows show Off while discovery is off. The TCP port cannot be set: each time the app starts or the network is turned back on, the system picks a free port, and discovery announces it. Changing other settings keeps the current port.
 
 ## Play a song that is on another computer

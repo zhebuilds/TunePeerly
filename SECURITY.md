@@ -26,6 +26,13 @@ Please give the maintainer time to confirm and ship a fix before any public disc
 - Streaming or downloading a song from this computer without being a paired, connected device, or while it is in incognito
 - Reading or writing files outside the library, the download folder, or the app data folder
 
+## Relay
+
+- Pairing happens only on the local network. The relay only carries data between devices that are already paired, and never pairs. Pairing messages are dropped on a relay connection, and a relay connection from a device that is not paired is closed at once.
+- The relay cannot read the content: devices talk over TLS 1.3 end to end, and each side checks the other's pinned key.
+- The relay does see metadata: each device's relay ID (its certificate ID), its public IP, when it is online, and who connects to whom and how much data.
+- strelaysrv checks the token only when a device registers, not when someone asks it for a session. So anyone who knows the relay address and a device's relay ID can ask for a session and learn whether that device is online. The app refuses every device that is not paired, so they get no data. A device's relay ID is exchanged only during pairing on the local network.
+
 ## Out of scope
 
 - The device name announced on the local network. Discovery sends the name only.
@@ -60,6 +67,13 @@ Please give the maintainer time to confirm and ship a fix before any public disc
 - 采用未配对或未确认设备发来的同步副本，或显示它发来的最近播放。
 - 不是已配对并已连接的设备，或这台电脑开着无痕模式时，仍能串流或下载它的歌曲。
 - 读写曲库、下载文件夹和应用数据文件夹以外的文件。
+
+### 中继
+
+- 配对只在局域网里进行。中继只在已配对的设备之间转发数据，从不配对。经中继收到的配对消息会被丢弃，未配对设备经中继连进来会被立刻断开。
+- 中继读不到内容：设备之间用端到端 TLS 1.3 通信，双方都核对配对时记住的公钥。
+- 中继能看到元数据：每台设备的中继标识（证书标识）、公网 IP、在线时间，以及谁连谁、传了多少数据。
+- strelaysrv 只在设备注册时检查 token，有人请求会话时不检查。所以知道中继地址和某台设备中继标识的人，可以请求会话，看出这台设备在不在线。应用会拒绝所有未配对的设备，他拿不到任何数据。设备的中继标识只在局域网配对时交换。
 
 ### 范围外
 
