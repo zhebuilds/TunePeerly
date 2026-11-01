@@ -21,7 +21,6 @@ TunePeerly plays the music already on this computer and shares it with paired de
 - Send or override liked songs and appearance by hand. Nothing syncs on its own.
 - Incognito pauses discovery, sync, and history recording. You can also block a device.
 - Light and dark themes, English and Chinese, scrolling lyrics, a tray icon, a mini player, and playback buttons on the Windows taskbar thumbnail.
-- Some settings are marked **To be revised**, **Do not use**, or **Not completed yet, not tested**. The mark does not describe the problem. The [user guide](docs/guide.md) lists which setting has which mark. The relay is marked do not use, and also not completed yet and not tested.
 
 ## Security and privacy
 

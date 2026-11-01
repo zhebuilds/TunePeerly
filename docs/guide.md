@@ -42,15 +42,6 @@ A playlist is a list of songs. Deleting a playlist does not delete the songs.
 
 Every readable local song is offered to paired devices. Once a device is paired and connected, it can see, play, and download all of them, including songs added later. Only incognito stops this.
 
-## Unfinished settings
-
-Some settings show a short mark beside the title. The mark does not describe the problem.
-
-- **To be revised** means this version keeps the current behavior, and it will change later. The mark is on **Sync**.
-- **Not completed yet, not tested** is on **Relay server** on the Devices page. A relay implementation is in this version. It is not completed yet, and it has not been tested.
-
-The rest of this guide says what those controls are for.
-
 ## Pair a device
 
 Open **Devices**. Before pairing, **Discover nearby devices**, the switch next to **Nearby**, must be on, or devices cannot be found.
@@ -62,7 +53,7 @@ Open **Devices**. Before pairing, **Discover nearby devices**, the switch next t
 - Block removes a device. Later data from it is dropped.
 - **Remove** unpairs both sides. This computer deletes the device's saved key and tells the device, which removes this computer and shows a notice. If the device is offline, it is told the next time the two connect, and until then it only gets that notice from this computer. Your other devices are not changed. To use the two together again, press **Pair** on either one and type the new code.
 
-The four relay fields are on the **Devices** page, in **Relay server** below **Nearby**: address, port, the relay's certificate ID, and a token, with the relay status shown under the heading. **Relay server** is marked **Not completed yet, not tested**. Both devices must set each other to **Full trust**. To set up your own relay, see [Deploy a relay](relay.md).
+The four relay fields are on the **Devices** page, in **Relay server** below **Nearby**: address, port, the relay's certificate ID, and a token, with the relay status shown under the heading. Both devices must set each other to **Full trust**. To set up your own relay, see [Deploy a relay](relay.md).
 
 - Pairing happens only on the local network. The relay only carries data between devices that are already paired, and never pairs. Pair the devices on the same network first.
 - When using a relay, set both devices to **Full trust** for each other. A device set to **Ask each time** does not dial over the relay; it only waits for the other device to connect and then asks you. If both sides use **Ask each time**, they never connect over the relay.
@@ -76,7 +67,7 @@ Any song on an online paired device can be played from that device. **Download**
 
 ## Sync
 
-The **Sync** section in Settings, right after Music and download folders, is marked **To be revised**. Nothing syncs on its own: a copy moves only when you press Send or Override.
+The **Sync** section in Settings, right after Music and download folders. Nothing syncs on its own: a copy moves only when you press Send or Override.
 
 Incognito cuts every device connection, stops discovery, turns sync off, and stops offering this computer's songs to other devices.
 
@@ -101,4 +92,4 @@ The bell opens the notification list. You can mark items read when they scroll i
 
 The database is in `%APPDATA%\TunePeerly`. It is encrypted, and its key file `db.key` beside it is sealed for your Windows account. Covers and the window cache are in `%LOCALAPPDATA%\TunePeerly`. These two folders cannot be changed. Uninstalling asks whether to delete them.
 
-There is no account. Paired devices on the same local network sync and stream directly. Outside that network they can meet through the relay configured on the **Devices** page under **Relay server**. **Relay server** is marked **Not completed yet, not tested**.
+There is no account. Paired devices on the same local network sync and stream directly. Outside that network they can meet through the relay configured on the **Devices** page under **Relay server**. Both devices must set each other to **Full trust**.
