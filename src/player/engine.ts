@@ -1,6 +1,8 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
 import { api, errorText, type Track } from "../api";
+import { trackKey } from "../lib/library";
 import { clock, transport } from "./clock";
+import type { NativeAudio, Upcoming } from "./native";
 
 export type FailureKind = "transport" | "decode" | "unsupported" | "missing" | "offline";
 export type Failure = { reason: string; kind: FailureKind };
@@ -40,10 +42,46 @@ export class PlaybackEngine {
   private playTicket = 0;
   private endedSent = false;
   private replayGuard = false;
+  private upTicket = 0;
+  /** Android's player in the app (see native.ts). Null on desktop, which plays in the web view. */
+  private readonly native: NativeAudio | null;
 
-  constructor(private readonly events: EngineEvents) {
-    this.audio = new Audio();
+  constructor(private readonly events: EngineEvents, native: NativeAudio | null = null) {
+    this.native = native;
+    this.audio = native ? (native as unknown as HTMLAudioElement) : new Audio();
     this.audio.preload = "auto";
+  }
+
+  /**
+   * Android only: tells the phone's player which song follows, so it can start it by itself when this
+   * one ends, even while the page's script is held back with the screen off. Desktop ignores it.
+   */
+  async lineUp(track: Track | null, meta: Upcoming["meta"] | null): Promise<void> {
+    const native = this.native;
+    if (!native) return;
+    const ticket = ++this.upTicket;
+    if (!track || !meta || track.video || (this.track && sameMedia(this.track, track))) {
+      native.setUpcoming(null);
+      return;
+    }
+    const key = trackKey(track);
+    if (native.upcomingKey === key) return;
+    try {
+      const local = track.absolutePath && track.accessStatus === "available" && track.badge !== "remote";
+      let source: Source;
+      if (local && track.absolutePath) source = { url: api.fileUrl(track.absolutePath), remote: false, deviceId: null };
+      else if (track.contentId) {
+        const remote = await api.remoteUrl(track.contentId, []);
+        source = { url: remote.url, remote: true, deviceId: remote.deviceId };
+      } else {
+        native.setUpcoming(null);
+        return;
+      }
+      if (ticket !== this.upTicket) return;
+      native.setUpcoming({ key, url: source.url, remote: source.remote, deviceId: source.deviceId, meta });
+    } catch {
+      if (ticket === this.upTicket) native.setUpcoming(null);
+    }
   }
 
   get current(): Track | null {
@@ -214,6 +252,23 @@ export class PlaybackEngine {
   private async attach(generation: number, position: number, autoplay: boolean): Promise<void> {
     const track = this.track;
     if (!track) return;
+    // Android: the phone's player may already be playing this song, started by itself when the last one ended.
+    const adopted = position <= 0.05 ? this.native?.adopt(trackKey(track)) : null;
+    if (adopted) {
+      this.listeners?.abort();
+      this.listeners = null;
+      this.playTicket += 1;
+      this.playPending = false;
+      this.bufferEnough = false;
+      this.pendingSeek = 0;
+      this.lastTime = 0;
+      this.source = adopted;
+      clock.set({ position: this.audio.currentTime, duration: this.durationOf(track) });
+      this.bind(generation, 0, autoplay, track, adopted);
+      this.native?.replay();
+      if (!autoplay) this.audio.pause();
+      return;
+    }
     this.detach();
     this.pendingSeek = position;
     this.lastTime = position;
@@ -300,6 +355,8 @@ export class PlaybackEngine {
 
   private maybeFinish(generation: number, track: Track): void {
     if (!this.wantPlay || this.replayGuard) return;
+    // The phone's player reports its own end and may already have started the next song; wait for it.
+    if (this.native) return;
     const duration = this.audio.duration;
     if (!Number.isFinite(duration) || duration < 0.3) return;
     if (this.audio.ended || this.audio.currentTime >= duration - 0.12) this.markEnded(generation, track);

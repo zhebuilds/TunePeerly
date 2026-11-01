@@ -5,7 +5,8 @@ import { useTranslation } from "react-i18next";
 import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type ImportSummary, type MemberRef, type OverwriteAsk, type Settings, type SyncResult, type Track } from "../api";
 import i18n from "../i18n";
 import { isAndroid } from "../lib/platform";
-import { albumParts, filterText, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
+import { nativeAudio } from "../player/native";
+import { albumParts, displayTitle, filterText, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
 import {
   addToQueue,
   continueLibrary,
@@ -210,7 +211,7 @@ function useModel() {
       progress: (position) => handlers.current?.progress(position),
       activity: (playing, track, enough) => handlers.current?.activity(playing, track, enough),
       playable: (track) => handlers.current?.playable(track),
-    });
+    }, isAndroid && "__TAURI_INTERNALS__" in window ? nativeAudio() : null);
   }
   const engine = engineRef.current;
 
@@ -952,6 +953,25 @@ function useModel() {
     window.addEventListener("beforeunload", flush);
     return () => window.removeEventListener("beforeunload", flush);
   }, [engine]);
+
+  // Android: line up the next song with the phone's player, so it moves on by itself with the screen off.
+  const upcoming = queue.repeat === "one" ? undefined : index.get(queue.future[0]);
+  useEffect(() => {
+    if (!isAndroid) return;
+    const track = upcoming && upcoming.playable ? upcoming : null;
+    const cover = track?.coverUrl && !/^(data:|blob:|https?:)/.test(track.coverUrl) ? track.coverUrl : null;
+    const meta = track
+      ? {
+          title: displayTitle(track, t("library.untitled")),
+          artist: track.artist ?? "",
+          album: track.album ?? "",
+          coverPath: cover,
+          favorite: Boolean(track.favorite),
+          duration: (track.durationMs ?? 0) / 1000,
+        }
+      : null;
+    void engine.lineUp(track, meta);
+  }, [upcoming, current, engine, t]);
 
   const shown = current ?? null;
   const lookup = useCallback((ref: TrackRef | null | undefined): Track | undefined => (ref ? index.get(ref) : undefined), [index]);
