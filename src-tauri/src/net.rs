@@ -894,6 +894,25 @@ async fn restart_listener(
     }));
 }
 
+/// The path of a connection that goes through the relay.
+const RELAY_PATH: &str = "relay";
+
+/// Pairing happens only on the local network. The relay only carries data between devices that are
+/// already paired, so a relay connection is kept only for a device saved here, holding the key that
+/// was pinned when it was paired. Anyone else is dropped at once: no first contact, no pairing dialog.
+fn relay_admits(saved: Option<&crate::db::PeerRow>, public_key: &[u8]) -> bool {
+    saved.is_some_and(|peer| peer.public_key == public_key)
+}
+
+/// Frames that never cross the relay, in either direction: the pairing code check, and asking the
+/// other device to forget this one and show a new code, which is pairing again.
+fn relay_forbids(frame: &Frame) -> bool {
+    matches!(
+        frame,
+        Frame::PairStart { .. } | Frame::PairAnswer { .. } | Frame::PairConfirm { .. } | Frame::PairFail { .. } | Frame::Unpaired { pair: true }
+    )
+}
+
 /// Handshakes from unknown devices that may run at the same time.
 const MAX_HANDSHAKES: usize = 16;
 /// Time allowed for TCP, relay and TLS setup before a connection is dropped.
@@ -999,6 +1018,20 @@ where
     if blocked {
         return Err(crate::error::AppError::Message("unreachable".into()));
     }
+    let relay = path == RELAY_PATH;
+    if relay {
+        let saved = db
+            .lock()
+            .ok()
+            .and_then(|guard| guard.peers().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|peer| peer.device_id == device_id);
+        if !relay_admits(saved.as_ref(), &public_key) {
+            eprintln!("relay: dropped {}, it is not a paired device", short_id(&device_id));
+            return Err(crate::error::AppError::Message("not paired".into()));
+        }
+    }
     if removed {
         tell_removed(stream, &db, &device_id).await;
         return Ok(());
@@ -1035,6 +1068,10 @@ where
             };
             match next {
                 Ok(Ok(frame)) => {
+                    if relay && relay_forbids(&frame) {
+                        eprintln!("relay: dropped a pairing frame from {}", short_id(&device_read));
+                        continue;
+                    }
                     if events_read.send(NetEvent::Frame { device_id: device_read.clone(), frame }).is_err() {
                         break;
                     }
@@ -1052,6 +1089,9 @@ where
                 biased;
                 frame = rx.recv() => {
                     let Some(frame) = frame else { break };
+                    if relay && relay_forbids(&frame) {
+                        continue;
+                    }
                     if write_or_stop(&mut writer, &frame).await {
                         break;
                     }
@@ -1136,6 +1176,11 @@ fn adopt_connection(
     if blocked {
         return;
     }
+    // Checked again here, against the device list as it is now: over the relay only a paired device.
+    let relay = path == RELAY_PATH;
+    if relay && !relay_admits(known.as_ref(), &public_key) {
+        return;
+    }
     if live.inner.lock().ok().is_some_and(|guard| guard.paused.contains(&device_id)) {
         let _ = writer.send(Frame::Hold);
         return;
@@ -1207,7 +1252,7 @@ fn adopt_connection(
     }
     // Pairing from here with a device that may still have this one saved: it forgets this device
     // and shows a code, instead of treating the connection as already paired.
-    if known.is_none() && !incoming {
+    if known.is_none() && !incoming && !relay {
         let _ = writer.send(Frame::Unpaired { pair: true });
     }
     peers.insert(device_id.clone(), PeerOut {
@@ -2893,6 +2938,7 @@ async fn join_invited(
             .find(|peer| ids::parse_cert_id(&peer.cert_id).is_some_and(|id| id.as_slice() == invitation.from.as_slice()))
             .and_then(|peer| ids::key_hash_from_device_id(&peer.device_id))
     }) else {
+        eprintln!("relay: refused a session from a device that is not paired");
         return;
     };
     let Ok(fallback) = resolve_v4(&host, port).await else { return };
@@ -5059,5 +5105,185 @@ mod announce_timing_tests {
         assert_eq!(&broadcast[..2], &[0, 100]);
         assert!(most_in_window(&multicast, 3_000) <= 2);
         assert!(most_in_window(&broadcast, 15_000) <= 2);
+    }
+}
+
+#[cfg(test)]
+mod relay_rule_tests {
+    use super::{finish_handshake, relay_admits, relay_forbids, NetEvent, RELAY_PATH};
+    use crate::db::{Db, PeerRow};
+    use crate::frames::{self, Frame};
+    use crate::identity::{self, IdentityMaterial};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn open(name: &str) -> (Db, IdentityMaterial) {
+        let dir = std::env::temp_dir().join(format!("tunepeerly-relay-{name}-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).expect("db");
+        let material = identity::load_or_create(&db).expect("identity");
+        (db, material)
+    }
+
+    fn row(device: &IdentityMaterial, public_key: Vec<u8>, trust: &str) -> PeerRow {
+        PeerRow {
+            device_id: device.device_id.clone(),
+            public_key,
+            cert_id: device.cert_id.clone(),
+            display_name: "Other".into(),
+            trust: trust.into(),
+        }
+    }
+
+    /// Runs this computer's side of a connection from `other` on `path`. Returns whether it was kept,
+    /// the events it produced and the other device's end of the stream.
+    async fn connect(
+        db: Db,
+        here: &IdentityMaterial,
+        other: &IdentityMaterial,
+        path: &str,
+    ) -> (bool, mpsc::UnboundedReceiver<NetEvent>, tokio::io::DuplexStream) {
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let (events, rx) = mpsc::unbounded_channel();
+        let certs = vec![rustls::pki_types::CertificateDer::from(other.cert_der.clone())];
+        let db = Arc::new(Mutex::new(db));
+        let kept = finish_handshake(near, certs, db, here.clone_parts(), events, path.into(), String::new(), true, None)
+            .await
+            .is_ok();
+        (kept, rx, far)
+    }
+
+    fn connected(rx: &mut mpsc::UnboundedReceiver<NetEvent>) -> Option<String> {
+        while let Ok(event) = rx.try_recv() {
+            if let NetEvent::Connected { path, .. } = event {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn only_a_saved_device_with_its_pinned_key_passes_the_relay() {
+        let (_, other) = open("admit");
+        assert!(!relay_admits(None, &other.public_key));
+        assert!(relay_admits(Some(&row(&other, other.public_key.clone(), "full")), &other.public_key));
+        // A saved device set to Ask each time may still come in: it gets the usual Allow prompt, not a code.
+        assert!(relay_admits(Some(&row(&other, other.public_key.clone(), "verify")), &other.public_key));
+        assert!(!relay_admits(Some(&row(&other, vec![7; 32], "full")), &other.public_key));
+    }
+
+    #[test]
+    fn pairing_frames_never_cross_the_relay() {
+        for frame in [
+            Frame::PairStart { message: vec![1] },
+            Frame::PairAnswer { message: vec![1], tag: [0; 32] },
+            Frame::PairConfirm { tag: [0; 32] },
+            Frame::PairFail { reason: "cancelled".into() },
+            Frame::Unpaired { pair: true },
+        ] {
+            assert!(relay_forbids(&frame), "{frame:?}");
+        }
+        for frame in [
+            Frame::Keepalive,
+            Frame::Message(b"{}".to_vec()),
+            Frame::Hold,
+            Frame::Unpaired { pair: false },
+            Frame::AudioReq { id: 1, content_id: "c".into(), start: 0, end: None },
+            Frame::AudioChunk { id: 1, offset: 0, eof: true, data: vec![1] },
+        ] {
+            assert!(!relay_forbids(&frame), "{frame:?}");
+        }
+    }
+
+    /// A device that is not saved here is dropped on the relay before anything reaches the app, so no
+    /// pairing dialog can open. On the local network the same device still gets through to pair.
+    #[tokio::test]
+    async fn an_unpaired_device_is_dropped_on_the_relay_but_not_on_the_lan() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (here_db, here) = open("stranger");
+                let (_, other) = open("stranger-other");
+                let (kept, mut events, mut far) = connect(here_db, &here, &other, RELAY_PATH).await;
+                assert!(!kept);
+                assert_eq!(connected(&mut events), None);
+                // The connection is closed without a word.
+                let mut byte = [0u8; 1];
+                assert_eq!(tokio::io::AsyncReadExt::read(&mut far, &mut byte).await.unwrap(), 0);
+
+                let (here_db, here) = open("stranger-lan");
+                let (kept, mut events, _far) = connect(here_db, &here, &other, "lan").await;
+                assert!(kept);
+                assert_eq!(connected(&mut events).as_deref(), Some("lan"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_saved_device_with_another_key_is_dropped_on_the_relay() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (here_db, here) = open("wrong-key");
+                let (_, other) = open("wrong-key-other");
+                here_db.upsert_peer(&row(&other, vec![7; 32], "full")).unwrap();
+                let (kept, mut events, _far) = connect(here_db, &here, &other, RELAY_PATH).await;
+                assert!(!kept);
+                assert_eq!(connected(&mut events), None);
+            })
+            .await;
+    }
+
+    /// A paired device, also one set to Ask each time, connects over the relay. Pairing frames it
+    /// sends are dropped, pairing frames this side queues are not sent, everything else passes.
+    #[tokio::test]
+    async fn a_paired_device_connects_over_the_relay_without_pairing_frames() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for trust in ["full", "verify"] {
+                    let (here_db, here) = open("paired");
+                    let (_, other) = open("paired-other");
+                    here_db.upsert_peer(&row(&other, other.public_key.clone(), trust)).unwrap();
+                    let (kept, mut events, mut far) = connect(here_db, &here, &other, RELAY_PATH).await;
+                    assert!(kept);
+                    let writer = loop {
+                        match events.recv().await.expect("connected") {
+                            NetEvent::Connected { path, writer, .. } => {
+                                assert_eq!(path, RELAY_PATH);
+                                break writer;
+                            }
+                            _ => continue,
+                        }
+                    };
+
+                    for frame in [
+                        Frame::PairStart { message: vec![1] },
+                        Frame::PairConfirm { tag: [0; 32] },
+                        Frame::Unpaired { pair: true },
+                        Frame::PairFail { reason: "wrong".into() },
+                        Frame::Unpaired { pair: false },
+                    ] {
+                        frames::write_frame(&mut far, &frame).await.unwrap();
+                    }
+                    let mut arrived = Vec::new();
+                    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(300), events.recv()).await {
+                        if let NetEvent::Frame { frame, .. } = event {
+                            arrived.push(frame);
+                        }
+                    }
+                    assert!(matches!(arrived.as_slice(), [Frame::Unpaired { pair: false }]), "{arrived:?}");
+
+                    for frame in [Frame::PairFail { reason: "cancelled".into() }, Frame::Unpaired { pair: true }, Frame::Hold] {
+                        writer.send(frame).unwrap();
+                    }
+                    let mut sent = Vec::new();
+                    while let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_millis(300), frames::read_frame(&mut far)).await {
+                        if !matches!(frame, Frame::Keepalive) {
+                            sent.push(frame);
+                        }
+                    }
+                    assert!(matches!(sent.as_slice(), [Frame::Hold]), "{sent:?}");
+                }
+            })
+            .await;
     }
 }
