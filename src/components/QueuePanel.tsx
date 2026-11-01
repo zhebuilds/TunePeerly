@@ -9,6 +9,7 @@ import { albumParts, displayTitle } from "../lib/library";
 import { transport } from "../player/clock";
 import { Icons } from "../ui/icons";
 import { Cover } from "./Cover";
+import { isAndroid } from "../lib/platform";
 
 export function QueuePanel() {
   const { t } = useTranslation();
@@ -57,6 +58,7 @@ export function QueuePanel() {
                   className="queue-item"
                   data-drop={`queue:${at}`}
                   onPointerDown={(event) =>
+                    !isAndroid &&
                     track &&
                     beginDrag(
                       event,

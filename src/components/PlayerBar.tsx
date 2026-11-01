@@ -8,6 +8,7 @@ import { clockText } from "../lib/format";
 import { displayTitle, trackKey } from "../lib/library";
 import { clock, transport } from "../player/clock";
 import { Icons } from "../ui/icons";
+import { isAndroid } from "../lib/platform";
 
 export function PlayerBar() {
   const { t } = useTranslation();
@@ -25,7 +26,8 @@ export function PlayerBar() {
   useDesktopNowPlaying();
 
   return (
-    <footer className="player-bar">
+    <footer className={`player-bar${isAndroid && app.route.name === "now" && !app.queueOpen && !app.noticesOpen ? " expanded" : ""}`}>
+      {isAndroid && <MiniProgress fallback={(track?.durationMs ?? 0) / 1000} />}
       <div className="player-left">
         {track ? (
           <>
@@ -93,6 +95,18 @@ export function PlayerBar() {
         </button>
       </div>
     </footer>
+  );
+}
+
+/** The phone's thin, read-only progress line along the top of the mini player. */
+function MiniProgress({ fallback }: { fallback: number }) {
+  const time = useSyncExternalStore(clock.subscribe, clock.get);
+  const duration = time.duration > 0 ? time.duration : fallback;
+  const fill = duration > 0 ? Math.min(100, (time.position / duration) * 100) : 0;
+  return (
+    <div className="mini-progress" aria-hidden="true">
+      <span style={{ width: `${fill}%` }} />
+    </div>
   );
 }
 
@@ -191,6 +205,14 @@ function useDesktopNowPlaying() {
   const position = time.position;
   const second = Math.floor(position);
   const duration = time.duration || (track?.durationMs ?? 0) / 1000;
+  // Android colours its status and navigation bars from the theme sent here, so resend when it changes.
+  const [look, setLook] = useState(0);
+  useEffect(() => {
+    if (!isAndroid) return;
+    const watch = new MutationObserver(() => setLook((value) => value + 1));
+    watch.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => watch.disconnect();
+  }, []);
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
     const cover = track?.coverUrl && !/^(data:|blob:|https?:)/.test(track.coverUrl) ? track.coverUrl : null;
@@ -213,7 +235,7 @@ function useDesktopNowPlaying() {
         like: t("menu.like"),
       },
     }).catch(() => {});
-  }, [track, playing, second, duration, i18n.language, t]);
+  }, [track, playing, second, duration, i18n.language, t, look]);
 }
 
 function useMediaSession() {

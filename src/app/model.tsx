@@ -2,8 +2,9 @@
 import { listen } from "@tauri-apps/api/event";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type MemberRef, type OverwriteAsk, type Settings, type SyncResult, type Track } from "../api";
+import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type ImportSummary, type MemberRef, type OverwriteAsk, type Settings, type SyncResult, type Track } from "../api";
 import i18n from "../i18n";
+import { isAndroid } from "../lib/platform";
 import { albumParts, filterText, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
 import {
   addToQueue,
@@ -113,7 +114,7 @@ function useModel() {
     } catch {
       /* storage unavailable: use the default */
     }
-    return window.innerWidth > 1040;
+    return !isAndroid && window.innerWidth > 1040;
   });
   const [noticesOpen, setNoticesOpenState] = useState(false);
   const setQueueOpen = useCallback((open: boolean) => {
@@ -602,10 +603,10 @@ function useModel() {
     }
   }, [applyLook, engine, patchBoot, say, scheduleRefresh, setNotice, t]);
 
-  const importPaths = useCallback(async (paths: string[], kind: "directory" | "file" | "auto") => {
-    if (paths.length === 0) return;
+  const imported = useCallback(async (run: () => Promise<ImportSummary[]>, quietWhenNone = false) => {
     try {
-      const summaries = await api.importPaths(paths, kind);
+      const summaries = await run();
+      if (quietWhenNone && summaries.length === 0) return;
       const added = summaries.reduce((sum, item) => sum + item.added, 0);
       toast(added > 0 ? t("toast.imported", { count: added }) : t("toast.importedNone"));
       reloadLyrics();
@@ -614,6 +615,11 @@ function useModel() {
       say(error);
     }
   }, [refresh, reloadLyrics, say, t, toast]);
+
+  const importPaths = useCallback(async (paths: string[], kind: "directory" | "file" | "auto") => {
+    if (paths.length === 0) return;
+    await imported(() => api.importPaths(paths, kind));
+  }, [imported]);
 
   /** Scans every added folder and file again. Tags and lyrics files that changed are read again. */
   const rescan = useCallback(async () => {
@@ -633,13 +639,18 @@ function useModel() {
   }, [refresh, reloadLyrics, say, t, toast]);
 
   const addMusic = useCallback(async (kind: "directory" | "file") => {
+    if (isAndroid) {
+      // Cancelling the picker copies nothing and says nothing.
+      await imported(() => api.androidImport(kind === "directory"), true);
+      return;
+    }
     try {
       const paths = kind === "directory" ? [await pickFolder()].filter((item): item is string => Boolean(item)) : await pickFiles();
       await importPaths(paths, kind);
     } catch (error) {
       say(error);
     }
-  }, [importPaths, say]);
+  }, [imported, importPaths, say]);
 
   const like = useCallback(async (track: Track) => {
     const key = trackKey(track);

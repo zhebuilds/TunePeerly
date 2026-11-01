@@ -3,6 +3,9 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import "./i18n";
 import "./styles.css";
+import { isAndroid } from "./lib/platform";
+
+if (isAndroid) document.documentElement.classList.add("android");
 
 async function start() {
   const tauri = "__TAURI_INTERNALS__" in window;

@@ -5,6 +5,7 @@ import { api } from "../api";
 import { useApp } from "../app/model";
 import { albumId } from "../lib/library";
 import { Icons } from "../ui/icons";
+import { isAndroid } from "../lib/platform";
 
 export function ContextMenu() {
   const { t } = useTranslation();
@@ -102,7 +103,7 @@ export function ContextMenu() {
             <hr />
             {one.artist && <Item icon={<Icons.artist />} label={t("menu.goArtist")} onClick={run(() => app.navigate({ name: "artist", id: one.artist }))} />}
             {one.album && <Item icon={<Icons.album />} label={t("menu.goAlbum")} onClick={run(() => app.navigate({ name: "album", id: albumId(one.artist, one.album) }))} />}
-            {one.localFileId && one.accessStatus === "available" && (
+            {one.localFileId && one.accessStatus === "available" && !isAndroid && (
               <Item icon={<Icons.folder />} label={t("menu.showInFolder")} onClick={run(() => void api.showInFolder(one.localFileId!).catch(app.say))} />
             )}
           </>

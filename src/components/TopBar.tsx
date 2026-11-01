@@ -2,6 +2,8 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useApp } from "../app/model";
+import { isAndroid } from "../lib/platform";
+import { useBackClose } from "../lib/back";
 import { reshuffleCovers } from "../lib/library";
 import { DownloadButton } from "./DownloadButton";
 import { Icons } from "../ui/icons";
@@ -12,6 +14,8 @@ export function TopBar() {
   const { t } = useTranslation();
   const app = useApp();
   const [refreshing, setRefreshing] = useState(false);
+  const [more, setMore] = useState(false);
+  useBackClose(more, () => setMore(false));
   const online = app.boot?.links.filter((link) => link.state === "online").length ?? 0;
   const incognito = Boolean(app.settings.incognito);
   const reload = () => {
@@ -68,20 +72,44 @@ export function TopBar() {
       </label>
       <div className="top-actions" data-tauri-drag-region="false">
         <DownloadButton />
-        <button type="button" className={`round-btn${refreshing ? " spinning" : ""}`} aria-label={t("top.refresh")} title={t("top.refreshHelp")} disabled={!app.boot || refreshing} onClick={reload}>
-          <Icons.sync />
-        </button>
-        <button
-          type="button"
-          className={`round-btn${incognito ? " on" : ""}`}
-          aria-label={t("top.incognito")}
-          aria-pressed={incognito}
-          title={incognito ? t("top.incognitoOn") : t("top.incognitoOff")}
-          disabled={!app.boot}
-          onClick={() => void app.setSetting("incognito", !incognito)}
-        >
-          <Icons.incognito />
-        </button>
+        {isAndroid ? (
+          // A phone has room for one button here; refresh and incognito move into a small menu.
+          <div className="top-more">
+            <button type="button" className={`round-btn${incognito ? " on" : ""}`} aria-label={t("menu.more")} aria-haspopup="menu" aria-expanded={more} onClick={() => setMore((value) => !value)}>
+              <Icons.more />
+            </button>
+            {more && (
+              <>
+                <div className="top-more-scrim" onClick={() => setMore(false)} />
+                <div className="menu top-more-menu" role="menu">
+                  <button type="button" role="menuitem" className="menu-item" disabled={!app.boot || refreshing} onClick={() => { setMore(false); reload(); }}>
+                    <Icons.sync /> <span>{t("top.refresh")}</span>
+                  </button>
+                  <button type="button" role="menuitemcheckbox" aria-checked={incognito} className="menu-item" disabled={!app.boot} onClick={() => { setMore(false); void app.setSetting("incognito", !incognito); }}>
+                    <Icons.incognito /> <span>{t("top.incognito")}</span>{incognito && <Icons.check className="top-more-check" />}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        ) : (
+          <>
+            <button type="button" className={`round-btn${refreshing ? " spinning" : ""}`} aria-label={t("top.refresh")} title={t("top.refreshHelp")} disabled={!app.boot || refreshing} onClick={reload}>
+              <Icons.sync />
+            </button>
+            <button
+              type="button"
+              className={`round-btn${incognito ? " on" : ""}`}
+              aria-label={t("top.incognito")}
+              aria-pressed={incognito}
+              title={incognito ? t("top.incognitoOn") : t("top.incognitoOff")}
+              disabled={!app.boot}
+              onClick={() => void app.setSetting("incognito", !incognito)}
+            >
+              <Icons.incognito />
+            </button>
+          </>
+        )}
       </div>
       <div className="top-status" data-tauri-drag-region="false">
         {app.settings.incognito && (

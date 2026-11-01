@@ -184,6 +184,8 @@ export const api = {
   hideToTray: () => invoke("hide_to_tray"),
   setTrayMenu: (show: string, quit: string, name: string) => invoke("set_tray_menu", { show, quit, name }),
   fileUrl: (path: string) => convertFileSrc(path),
+  /** Android: the system picker copies the chosen songs or folder into the app, which then imports them. */
+  androidImport: (folder: boolean) => invoke<ImportSummary[]>("android_import", { folder }),
 };
 
 export async function pickFolder(): Promise<string | null> {

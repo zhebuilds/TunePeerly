@@ -3,15 +3,11 @@ import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { Icons } from "../ui/icons";
+import { useBackClose } from "../lib/back";
 
 export function Revise() {
   const { t } = useTranslation();
   return <span className="setting-mark">{t("settings.revise")}</span>;
-}
-
-export function DoNotUse() {
-  const { t } = useTranslation();
-  return <span className="setting-mark danger">{t("settings.doNotUse")}</span>;
 }
 
 export function NotImplemented() {
@@ -73,6 +69,7 @@ export function Select({ value, onChange, options, label, disabled }: { value: s
     setOpen(false);
     if (refocus) button.current?.focus();
   };
+  useBackClose(open, () => setOpen(false));
   const choose = (index: number) => {
     const option = options[index];
     close(true);

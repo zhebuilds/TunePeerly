@@ -5,6 +5,8 @@ import { api, type Download, type DownloadFeed, type DownloadHistoryItem } from 
 import { useApp } from "../app/model";
 import { displayTitle } from "../lib/library";
 import { Icons } from "../ui/icons";
+import { isAndroid } from "../lib/platform";
+import { useBackClose } from "../lib/back";
 
 const RING = 2 * Math.PI * 15;
 
@@ -17,6 +19,7 @@ export function DownloadButton() {
   const { t } = useTranslation();
   const app = useApp();
   const [open, setOpen] = useState(false);
+  useBackClose(open, () => setOpen(false));
   const root = useRef<HTMLDivElement>(null);
   const feed: DownloadFeed = app.downloadFeed ?? {
     current: app.boot?.download ?? null,
@@ -133,7 +136,7 @@ function HistoryRow({ item, title, showLabel, failedLabel, onShow }: { item: Dow
         <div className="download-title">{title}</div>
         {!item.ok && <div className="muted small">{failedLabel}</div>}
       </div>
-      {item.ok && item.path && (
+      {item.ok && item.path && !isAndroid && (
         <button type="button" className="icon-btn" aria-label={showLabel} title={showLabel} onClick={onShow}>
           <Icons.folder />
         </button>
