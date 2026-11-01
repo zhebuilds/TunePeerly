@@ -33,6 +33,7 @@ class PlaybackService : MediaSessionService() {
   private var player: MirrorPlayer? = null
   private var wake: PowerManager.WakeLock? = null
   private var wifi: WifiManager.WifiLock? = null
+  private val handler = android.os.Handler(Looper.getMainLooper())
   private val listener: (Snapshot, Snapshot) -> Unit = { before, now -> changed(before, now) }
 
   override fun onCreate() {
@@ -79,7 +80,17 @@ class PlaybackService : MediaSessionService() {
    * The audio element streams songs from linked devices, so the CPU and the Wi-Fi radio stay up
    * while it plays, including the gap while the next song loads.
    */
-  private fun locks(playing: Boolean) {
+  private val release = Runnable { locks(false, now = true) }
+
+  private fun locks(playing: Boolean, now: Boolean = false) {
+    if (!playing && !now) {
+      // A pause or the gap between two songs: keep the CPU and Wi-Fi up a little longer, so the next
+      // song can still connect with the screen off.
+      handler.removeCallbacks(release)
+      handler.postDelayed(release, 20_000)
+      return
+    }
+    handler.removeCallbacks(release)
     if (playing) {
       if (wake == null) {
         wake = (getSystemService(Context.POWER_SERVICE) as PowerManager)
@@ -102,14 +113,15 @@ class PlaybackService : MediaSessionService() {
   override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session
 
   override fun onTaskRemoved(rootIntent: Intent?) {
-    // Swiping the app away closes the web view that plays, so the notification goes too.
+    // Swiping the app away closes the page that runs the queue, so the music and the notification stop too.
+    NativeAudio.stop()
     stopSelf()
   }
 
   override fun onDestroy() {
     running = false
     NowPlaying.listeners.remove(listener)
-    locks(false)
+    locks(false, now = true)
     session?.release()
     session = null
     player?.release()

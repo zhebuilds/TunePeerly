@@ -87,6 +87,7 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
   override fun load(webView: WebView) {
     this.webView = webView
     instance = this
+    NativeAudio.attach(activity)
     holdMulticast()
     watchNetwork()
   }
@@ -110,6 +111,7 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
     multicast?.let { if (it.isHeld) it.release() }
     multicast = null
     worker.shutdown()
+    NativeAudio.release()
     PlaybackService.stop(activity)
   }
 
@@ -177,6 +179,22 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
     return true
   }
 
+  /** Sends what the phone's player is doing to the page (`src/player/native.ts`). */
+  fun audioEvent(json: String) {
+    val script = "window.__tpAudio&&window.__tpAudio($json)"
+    main.post { webView?.evaluateJavascript(script, null) }
+  }
+
+  /** A command from the page for the phone's player. Applied in order on the main thread. */
+  @Command
+  fun audio(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val op = args.getString("op") ?: ""
+    val body = JSONObject(args.toString())
+    main.post { runCatching { NativeAudio.command(op, body) }.onFailure { Log.w(TAG, "audio $op: ${it.message}") } }
+    invoke.resolve()
+  }
+
   @Command
   fun seal(invoke: Invoke) {
     val args = invoke.parseArgs(BlobArgs::class.java)
@@ -235,7 +253,7 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun playback(invoke: Invoke) {
     val args = invoke.parseArgs(TrackArgs::class.java)
-    val next = Snapshot(
+    val draft = Snapshot(
       title = args.title,
       artist = args.artist,
       album = args.album,
@@ -249,6 +267,11 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
     )
     val dark = args.theme != "light"
     main.post {
+      // While the phone's player has a song, it is the one that knows whether sound is coming and
+      // where. The page briefly reports "not playing" between songs, which must not stop the service.
+      val next = if (NativeAudio.current != 0L) {
+        draft.copy(playing = NativeAudio.wantsPlay, position = NativeAudio.position, duration = NativeAudio.duration.takeIf { it > 0 } ?: draft.duration)
+      } else draft
       (activity as? MainActivity)?.applyTheme(dark)
       NowPlaying.update(next)
       if (next.hasTrack) PlaybackService.ensure(activity)
