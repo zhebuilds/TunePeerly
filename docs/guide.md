@@ -63,7 +63,7 @@ Open **Devices**. Before pairing, **Discover nearby devices**, the switch next t
 - Block removes a device. Later data from it is dropped.
 - **Remove** unpairs both sides. This computer deletes the device's saved key and tells the device, which removes this computer and shows a notice. If the device is offline, it is told the next time the two connect, and until then it only gets that notice from this computer. Your other devices are not changed. To use the two together again, press **Pair** on either one and type the new code.
 
-The four relay fields are on the **Devices** page, in **Relay server** below **Nearby**: address, port, the relay's certificate ID, and a token, with the relay status shown under the heading. **Relay server** is marked **Not completed yet, not tested** and **Do not use**.
+The four relay fields are on the **Devices** page, in **Relay server** below **Nearby**: address, port, the relay's certificate ID, and a token, with the relay status shown under the heading. **Relay server** is marked **Not completed yet, not tested** and **Do not use**. To set up your own relay, see [Deploy a relay](relay.md).
 
 - Pairing happens only on the local network. The relay only carries data between devices that are already paired, and never pairs. Pair the devices on the same network first.
 - When using a relay, set both devices to **Full trust** for each other. A device set to **Ask each time** does not dial over the relay; it only waits for the other device to connect and then asks you. If both sides use **Ask each time**, they never connect over the relay.

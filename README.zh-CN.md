@@ -34,7 +34,7 @@
 
 ## 手册
 
-[使用手册](docs/guide.zh-CN.md)
+[使用手册](docs/guide.zh-CN.md) · [部署中继](docs/relay.zh-CN.md)
 
 ## 安装
 

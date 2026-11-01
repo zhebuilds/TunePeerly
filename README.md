@@ -34,7 +34,7 @@ TunePeerly plays the music already on this computer and shares it with paired de
 
 ## Guide
 
-[User guide](docs/guide.md)
+[User guide](docs/guide.md) · [Deploy a relay](docs/relay.md)
 
 ## Install
 
