@@ -2,7 +2,7 @@
 import { api, errorText, type Track } from "../api";
 import { trackKey } from "../lib/library";
 import { clock, transport } from "./clock";
-import type { NativeAudio, Upcoming } from "./native";
+import type { NativeAudio } from "./native";
 
 export type FailureKind = "transport" | "decode" | "unsupported" | "missing" | "offline";
 export type Failure = { reason: string; kind: FailureKind };
@@ -42,7 +42,6 @@ export class PlaybackEngine {
   private playTicket = 0;
   private endedSent = false;
   private replayGuard = false;
-  private upTicket = 0;
   /** Android's player in the app (see native.ts). Null on desktop, which plays in the web view. */
   private readonly native: NativeAudio | null;
 
@@ -52,36 +51,46 @@ export class PlaybackEngine {
     this.audio.preload = "auto";
   }
 
+  /** Android's player in the app, or null on desktop. */
+  get nativePlayer(): NativeAudio | null {
+    return this.native;
+  }
+
   /**
-   * Android only: tells the phone's player which song follows, so it can start it by itself when this
-   * one ends, even while the page's script is held back with the screen off. Desktop ignores it.
+   * Android only: the phone's player started `track` by itself as `id` (a song ended or next was
+   * pressed on the lock screen). Shows it and listens to it without loading it again.
    */
-  async lineUp(track: Track | null, meta: Upcoming["meta"] | null): Promise<void> {
+  follow(track: Track, id: number, playing: boolean): void {
     const native = this.native;
     if (!native) return;
-    const ticket = ++this.upTicket;
-    if (!track || !meta || track.video || (this.track && sameMedia(this.track, track))) {
-      native.setUpcoming(null);
-      return;
-    }
-    const key = trackKey(track);
-    if (native.upcomingKey === key) return;
-    try {
-      const local = track.absolutePath && track.accessStatus === "available" && track.badge !== "remote";
-      let source: Source;
-      if (local && track.absolutePath) source = { url: api.fileUrl(track.absolutePath), remote: false, deviceId: null };
-      else if (track.contentId) {
-        const remote = await api.remoteUrl(track.contentId, []);
-        source = { url: remote.url, remote: true, deviceId: remote.deviceId };
-      } else {
-        native.setUpcoming(null);
-        return;
-      }
-      if (ticket !== this.upTicket) return;
-      native.setUpcoming({ key, url: source.url, remote: source.remote, deviceId: source.deviceId, meta });
-    } catch {
-      if (ticket === this.upTicket) native.setUpcoming(null);
-    }
+    if (native.currentId === id && this.track && sameMedia(this.track, track)) return;
+    this.generation += 1;
+    const generation = this.generation;
+    this.listeners?.abort();
+    this.listeners = null;
+    this.playTicket += 1;
+    this.playPending = false;
+    this.bufferEnough = false;
+    this.track = track;
+    this.failedDevices = [];
+    this.skipLocal = false;
+    this.reloads = 0;
+    this.heardSeconds = 0;
+    this.heardSent = false;
+    this.reportedPlayable = false;
+    this.endedSent = false;
+    this.replayGuard = false;
+    this.pendingSeek = 0;
+    this.lastTime = 0;
+    const local = isLocal(track);
+    const url = local && track.absolutePath ? api.fileUrl(track.absolutePath) : native.streamBase + (track.contentId ?? "");
+    const source: Source = { url, remote: !local, deviceId: null };
+    native.claim(id, url);
+    this.source = source;
+    clock.set({ position: this.audio.currentTime, duration: this.durationOf(track) });
+    transport.set({ playing });
+    this.bind(generation, 0, playing, track, source);
+    native.replay();
   }
 
   get current(): Track | null {
@@ -240,10 +249,14 @@ export class PlaybackEngine {
 
   private async resolve(track: Track): Promise<Source> {
     if (track.video) throw new Error("playback.video");
-    const local = !this.skipLocal && track.absolutePath && track.accessStatus === "available" && track.badge !== "remote";
+    const local = !this.skipLocal && isLocal(track);
     if (local && track.absolutePath) return { url: api.fileUrl(track.absolutePath), remote: false, deviceId: null };
     if (track.contentId) {
       const remote = await api.remoteUrl(track.contentId, this.failedDevices);
+      // Android: a stream URL that picks a connected device on every request, so the phone's player can
+      // reconnect or move on by itself. Asking for a route above still checks that a device has the song.
+      const stream = this.native?.streamBase;
+      if (stream) return { url: stream + track.contentId, remote: true, deviceId: remote.deviceId };
       return { url: remote.url, remote: true, deviceId: remote.deviceId };
     }
     throw new Error(track.reasonKey ?? "notice.offlineTrack");
@@ -252,23 +265,6 @@ export class PlaybackEngine {
   private async attach(generation: number, position: number, autoplay: boolean): Promise<void> {
     const track = this.track;
     if (!track) return;
-    // Android: the phone's player may already be playing this song, started by itself when the last one ended.
-    const adopted = position <= 0.05 ? this.native?.adopt(trackKey(track)) : null;
-    if (adopted) {
-      this.listeners?.abort();
-      this.listeners = null;
-      this.playTicket += 1;
-      this.playPending = false;
-      this.bufferEnough = false;
-      this.pendingSeek = 0;
-      this.lastTime = 0;
-      this.source = adopted;
-      clock.set({ position: this.audio.currentTime, duration: this.durationOf(track) });
-      this.bind(generation, 0, autoplay, track, adopted);
-      this.native?.replay();
-      if (!autoplay) this.audio.pause();
-      return;
-    }
     this.detach();
     this.pendingSeek = position;
     this.lastTime = position;
@@ -287,6 +283,7 @@ export class PlaybackEngine {
     this.source = source;
     this.bind(generation, position, autoplay, track, source);
     this.audio.src = source.url;
+    if (this.native) this.native.loadKey = trackKey(track);
     this.audio.load();
   }
 
@@ -349,7 +346,8 @@ export class PlaybackEngine {
     if (this.endedSent || this.replayGuard || generation !== this.generation) return;
     this.endedSent = true;
     transport.set({ playing: false });
-    this.countHeard(track, true);
+    // Android counts what was heard in the phone's player, also while the page is held back.
+    if (!this.native) this.countHeard(track, true);
     this.events.ended();
   }
 
@@ -372,7 +370,7 @@ export class PlaybackEngine {
     if (!this.audio.paused) {
       const delta = now - this.lastTime;
       if (delta > 0 && delta < 1.5) this.heardSeconds += delta;
-      this.countHeard(track, false);
+      if (!this.native) this.countHeard(track, false);
       const wall = performance.now();
       if (wall - this.lastProgress > 5000) {
         this.lastProgress = wall;
@@ -414,6 +412,17 @@ export class PlaybackEngine {
     if (generation !== this.generation) return;
     const code = this.audio.error?.code ?? 0;
     if (code === MediaError.MEDIA_ERR_ABORTED) return;
+    if (this.native) {
+      // The phone's player already tried again and moves on by itself (NativeAudio.kt); only say so.
+      // Unloading here would stop it from moving on with the screen off.
+      transport.set({ playing: false });
+      const reason = this.native.errorReason;
+      const failure: Failure = code === MediaError.MEDIA_ERR_DECODE || code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
+        ? formatFailure(code)
+        : reason === "missing" ? { reason: "file.missing", kind: "missing" } : { reason: "playback.allSourcesFailed", kind: "transport" };
+      this.events.failed(track, failure);
+      return;
+    }
     const position = this.audio.currentTime || this.pendingSeek;
     const wasPlaying = this.wantPlay;
     const status = await probe(source.url);
@@ -468,6 +477,10 @@ export class PlaybackEngine {
     transport.set({ playing: false });
     this.events.failed(track, failure);
   }
+}
+
+function isLocal(track: Track): boolean {
+  return Boolean(track.absolutePath && track.accessStatus === "available" && track.badge !== "remote");
 }
 
 function sameMedia(left: Track, right: Track): boolean {

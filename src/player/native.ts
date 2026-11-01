@@ -5,20 +5,44 @@ import { invoke } from "@tauri-apps/api/core";
 export type NativeEvent =
   | { t: "state"; id: number; seq: number; pos: number; dur: number; buf: number; pwr: boolean; playing: boolean; ready: boolean; ended: boolean }
   | { t: "error"; id: number; code: number; msg?: string }
-  | { t: "advanced"; from: number; to: number };
+  | QueueEvent
+  | { t: "heard"; id: number; key: string }
+  | { t: "restarted"; id: number };
+
+/** The phone's player moved the queue on by itself (a song ended, next or previous on the lock screen), or was asked where it is. */
+export type QueueEvent = {
+  t: "queue";
+  rev: number;
+  seq: number;
+  reason: string;
+  id: number;
+  past: string[];
+  current: string | null;
+  future: string[];
+  repeat: string;
+  order: string;
+  contextId: string;
+  playing: boolean;
+  ended: boolean;
+  pos: number;
+};
 
 export type NativeSend = (op: string, args: Record<string, unknown>) => Promise<unknown>;
 
-/** The song the phone's player starts by itself when the current one ends. */
-export type Upcoming = {
-  key: string;
-  url: string;
-  remote: boolean;
-  deviceId: string | null;
-  meta: { title: string; artist: string; album: string; coverPath: string | null; favorite: boolean; duration: number };
-};
+/** A song the phone's player may start by itself. `u` is set for songs on the phone; others stream by content id `c`. */
+export type CatalogSong = { k: string; u: string | null; c: string | null; t: string; a: string; l: string; p: string | null; f: boolean; d: number };
 
-export type Adopted = { url: string; remote: boolean; deviceId: string | null };
+/** The queue and its rules, so the phone's player can go on without the page (see `advance.ts`). */
+export type QueuePlan = {
+  past: string[];
+  current: string | null;
+  future: string[];
+  repeat: string;
+  order: string;
+  contextId: string;
+  pool: string[];
+  library: string[];
+};
 
 type Item = {
   id: number;
@@ -50,9 +74,9 @@ const fresh = (id: number): Item => ({
  * back into the media events the playback engine already listens to. The engine is the same as on
  * desktop; only its element differs.
  *
- * When a song ends, the phone's player starts the song lined up with `setUpcoming` by itself. The
- * engine then claims it (`adopt`) instead of loading it again, so a slow or held-back script never
- * stops the music between songs.
+ * The phone's player also holds the whole queue (`setCatalog`, `setPlan`) and moves on by itself when
+ * a song ends or next or previous is pressed on the lock screen, so a held-back script never stops the
+ * music. Each move comes back as a queue event; the page then takes the new song over (`claim`).
  */
 export class NativeAudio extends EventTarget {
   preload = "auto";
@@ -63,9 +87,23 @@ export class NativeAudio extends EventTarget {
   private chain: Promise<unknown> = Promise.resolve();
   private volume_ = 1;
   private muted_ = false;
-  private upcoming: (Upcoming & { id: number }) | null = null;
-  /** The song the phone's player moved on to by itself, waiting for the engine to claim it. */
-  private advanced: (Upcoming & { item: Item }) | null = null;
+  /** The newest change the phone's player made to the queue that the page has seen. */
+  private rev = 0;
+  /** The command number of the page's last load; queue events from before it are out of date. */
+  private loadSeq = 0;
+  private plan: QueuePlan | null = null;
+  private planSent = "";
+  private librarySent = "";
+  private poolSent = "";
+  private catalogSent = "";
+  /** The start of the app's stream URLs on 127.0.0.1; add a content id. Set once known. */
+  streamBase = "";
+  /** Why the last song failed, as far as the page needs to know. */
+  errorReason: "missing" | "other" = "other";
+  /** The key of the song the next `load` is for. */
+  loadKey: string | null = null;
+  onQueue: ((event: QueueEvent) => void) | null = null;
+  onHeard: ((key: string) => void) | null = null;
 
   constructor(private readonly sendRaw: NativeSend) {
     super();
@@ -111,7 +149,8 @@ export class NativeAudio extends EventTarget {
   load(): void {
     if (this.src_ === null) return;
     this.item = fresh(++this.nextId);
-    this.send("load", { id: this.item.id, url: this.src_ });
+    this.send("load", { id: this.item.id, url: this.src_, key: this.loadKey ?? "" });
+    this.loadSeq = this.seq;
   }
 
   play(): Promise<void> {
@@ -189,34 +228,63 @@ export class NativeAudio extends EventTarget {
     this.send("volume", { v: this.muted_ ? 0 : this.volume_ });
   }
 
-  /** Lines up the song that follows, or clears it with null. */
-  setUpcoming(next: Upcoming | null): void {
-    if (!next) {
-      if (!this.upcoming) return;
-      this.upcoming = null;
-      this.send("next", {});
-      return;
-    }
-    if (this.upcoming && this.upcoming.key === next.key && this.upcoming.url === next.url) return;
-    this.upcoming = { ...next, id: ++this.nextId };
-    this.send("next", { id: this.upcoming.id, url: next.url, ...next.meta });
+  /** Every song the phone's player may start by itself, and the start of the app's stream URLs. */
+  setCatalog(base: string, songs: CatalogSong[]): void {
+    const sig = base + "\n" + JSON.stringify(songs);
+    if (sig === this.catalogSent) return;
+    this.catalogSent = sig;
+    this.send("catalog", { base, songs });
   }
 
-  get upcomingKey(): string | null {
-    return this.upcoming?.key ?? null;
+  /** The queue and its rules. The pool and library are sent again only when they changed. */
+  setPlan(plan: QueuePlan): void {
+    this.plan = plan;
+    this.sendPlan(false);
   }
 
-  /** Claims the song the phone's player already moved on to, if it is `key`. Call `replay` once listeners are bound. */
-  adopt(key: string): Adopted | null {
-    const advanced = this.advanced;
-    this.advanced = null;
-    if (!advanced || advanced.key !== key) return null;
-    this.item = advanced.item;
-    this.src_ = advanced.url;
-    return { url: advanced.url, remote: advanced.remote, deviceId: advanced.deviceId };
+  private sendPlan(force: boolean): void {
+    const plan = this.plan;
+    if (!plan) return;
+    const pool = plan.pool.join("\n");
+    const library = plan.library.join("\n");
+    const body: Record<string, unknown> = {
+      rev: this.rev,
+      past: plan.past,
+      current: plan.current ?? "",
+      future: plan.future,
+      repeat: plan.repeat,
+      order: plan.order,
+      contextId: plan.contextId,
+    };
+    if (force || pool !== this.poolSent) body.pool = plan.pool;
+    if (force || library !== this.librarySent) body.library = plan.library;
+    const sig = JSON.stringify(body);
+    if (!force && sig === this.planSent) return;
+    this.planSent = sig;
+    this.poolSent = pool;
+    this.librarySent = library;
+    this.send("queue", body);
   }
 
-  /** Sends the events a fresh listener missed for the adopted song. */
+  /** Asks the phone's player where it is; it answers with a queue event. */
+  sync(): void {
+    this.send("sync");
+  }
+
+  /** Takes over the song the phone's player started by itself. Call `replay` once listeners are bound. */
+  claim(id: number, url: string): void {
+    if (this.item.id === id) return;
+    const item = fresh(id);
+    item.paused = false;
+    this.item = item;
+    this.src_ = url;
+  }
+
+  get currentId(): number {
+    return this.item.id;
+  }
+
+  /** Sends the events a fresh listener missed for the claimed song. */
   replay(): void {
     const item = this.item;
     queueMicrotask(() => {
@@ -236,18 +304,27 @@ export class NativeAudio extends EventTarget {
 
   /** A report from the phone's player. */
   receive(event: NativeEvent): void {
-    if (event.t === "advanced") {
-      const upcoming = this.upcoming;
-      this.upcoming = null;
-      // Only a move on from the song shown here counts; anything else was already replaced by the page.
-      if (upcoming && upcoming.id === event.to && event.from === this.item.id && this.item.id !== 0) {
-        const item = fresh(event.to);
-        item.paused = false;
-        this.advanced = { ...upcoming, item };
-      } else {
-        this.advanced = null;
+    if (event.t === "queue") {
+      if (event.rev > this.rev) this.rev = event.rev;
+      if (event.seq < this.loadSeq) {
+        // The page loaded another song after this move; the phone's player plays that one now. Send
+        // the page's queue again so both agree.
+        this.sendPlan(true);
+        return;
       }
-      if (event.from === this.item.id) this.finish();
+      this.onQueue?.(event);
+      return;
+    }
+    if (event.t === "heard") {
+      this.onHeard?.(event.key);
+      return;
+    }
+    if (event.t === "restarted") {
+      if (event.id === this.item.id) {
+        this.item.ended = false;
+        this.item.currentTime = 0;
+        this.fire("timeupdate");
+      }
       return;
     }
     const item = this.itemFor(event.id);
@@ -255,6 +332,7 @@ export class NativeAudio extends EventTarget {
     const shown = item === this.item;
     if (event.t === "error") {
       item.error = { code: event.code };
+      this.errorReason = /FILE_NOT_FOUND|NO_PERMISSION/.test(event.msg ?? "") ? "missing" : "other";
       item.playing = false;
       if (shown) this.fire("error");
       return;
@@ -287,7 +365,6 @@ export class NativeAudio extends EventTarget {
 
   private itemFor(id: number): Item | null {
     if (id === this.item.id && id !== 0) return this.item;
-    if (this.advanced && this.advanced.item.id === id) return this.advanced.item;
     return null;
   }
 

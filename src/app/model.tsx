@@ -5,7 +5,7 @@ import { useTranslation } from "react-i18next";
 import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type ImportSummary, type MemberRef, type OverwriteAsk, type Settings, type SyncResult, type Track } from "../api";
 import i18n from "../i18n";
 import { isAndroid } from "../lib/platform";
-import { nativeAudio } from "../player/native";
+import { nativeAudio, type CatalogSong, type QueueEvent } from "../player/native";
 import { albumParts, displayTitle, filterText, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
 import {
   addToQueue,
@@ -954,24 +954,121 @@ function useModel() {
     return () => window.removeEventListener("beforeunload", flush);
   }, [engine]);
 
-  // Android: line up the next song with the phone's player, so it moves on by itself with the screen off.
-  const upcoming = queue.repeat === "one" ? undefined : index.get(queue.future[0]);
+  // Android: the phone's player holds every playable song and the whole queue with its rules, so it
+  // goes on by itself with the screen off (NativeAudio.kt). The page follows what it did when it runs.
+  const native = engine.nativePlayer;
+  const [streamBase, setStreamBase] = useState("");
   useEffect(() => {
-    if (!isAndroid) return;
-    const track = upcoming && upcoming.playable ? upcoming : null;
-    const cover = track?.coverUrl && !/^(data:|blob:|https?:)/.test(track.coverUrl) ? track.coverUrl : null;
-    const meta = track
-      ? {
-          title: displayTitle(track, t("library.untitled")),
-          artist: track.artist ?? "",
-          album: track.album ?? "",
-          coverPath: cover,
-          favorite: Boolean(track.favorite),
-          duration: (track.durationMs ?? 0) / 1000,
-        }
-      : null;
-    void engine.lineUp(track, meta);
-  }, [upcoming, current, engine, t]);
+    if (!native || !boot) return;
+    const timer = window.setTimeout(() => {
+      const songs: CatalogSong[] = [];
+      for (const track of boot.tracks) {
+        if (!track.playable || track.video) continue;
+        const local = track.absolutePath && track.accessStatus === "available" && track.badge !== "remote";
+        const cover = track.coverUrl && !/^(data:|blob:|https?:)/.test(track.coverUrl) ? track.coverUrl : null;
+        songs.push({
+          k: trackKey(track),
+          u: local && track.absolutePath ? api.fileUrl(track.absolutePath) : null,
+          c: track.contentId,
+          t: displayTitle(track, t("library.untitled")),
+          a: track.artist ?? "",
+          l: track.album ?? "",
+          p: cover,
+          f: Boolean(track.favorite),
+          d: (track.durationMs ?? 0) / 1000,
+        });
+      }
+      native.setCatalog(streamBase, songs);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [native, boot, streamBase, t]);
+
+  useEffect(() => {
+    // Not before the saved queue is back, so an empty queue never replaces the one still playing.
+    if (!native || !boot) return;
+    const timer = window.setTimeout(() => {
+      const state = queueRef.current;
+      const key = (ref: TrackRef) => {
+        const track = indexRef.current.get(ref);
+        return track ? trackKey(track) : ref.key;
+      };
+      native.setPlan({
+        past: state.past.slice(-50).map(key),
+        current: state.current ? key(state.current) : null,
+        future: state.future.map(key),
+        repeat: state.repeat,
+        order: state.order,
+        contextId: state.contextId,
+        pool: rebuildPool(state).map(trackKey),
+        library: contextTracks("library").filter((track) => track.playable).map(trackKey),
+      });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [native, queue, boot, members, rebuildPool, contextTracks]);
+
+  const followNative = useRef<(event: QueueEvent) => void>(() => {});
+  followNative.current = (event: QueueEvent) => {
+    // Nothing loaded in the phone's player (the app just started): the page's own saved queue stays.
+    if (event.id === 0 || !event.current) return;
+    const ref = (key: string): TrackRef => {
+      const track = indexRef.current.get({ key });
+      return track ? refOf(track) : { key, contentId: null, localFileId: null };
+    };
+    const prior = queueRef.current;
+    const state: QueueState = {
+      ...prior,
+      order: event.order as QueueState["order"],
+      repeat: event.repeat as QueueState["repeat"],
+      contextId: event.contextId,
+      past: event.past.map(ref),
+      current: ref(event.current),
+      future: event.future.map(ref),
+      positionSec: 0,
+    };
+    if (state.contextId !== prior.contextId) {
+      context.current = state.contextId === "library"
+        ? { id: "library", tracks: contextTracks("library").filter((track) => track.playable) }
+        : { id: state.contextId, tracks: null };
+    }
+    const track = indexRef.current.get(state.current);
+    if (track && native && native.currentId !== event.id) {
+      setFailure(null);
+      engine.follow(track, event.id, event.playing);
+    }
+    commit(state, event.pos);
+  };
+
+  useEffect(() => {
+    if (!native) return;
+    native.onQueue = (event) => followNative.current(event);
+    native.onHeard = (key) => {
+      const track = indexRef.current.get({ key });
+      if (track) handlers.current?.heard(track);
+    };
+    let live = true;
+    void api.streamBase().then(
+      (base) => {
+        if (!live) return;
+        native.streamBase = base;
+        setStreamBase(base);
+      },
+      () => {},
+    );
+    return () => {
+      live = false;
+      native.onQueue = null;
+      native.onHeard = null;
+    };
+  }, [native]);
+
+  // Once the saved queue is back: the phone's player may have played on while the page was away
+  // (the window was closed by the system); show what it plays now.
+  const synced = useRef(false);
+  useEffect(() => {
+    if (!native || !boot || synced.current) return;
+    synced.current = true;
+    native.sync();
+  }, [native, boot]);
 
   const shown = current ?? null;
   const lookup = useCallback((ref: TrackRef | null | undefined): Track | undefined => (ref ? index.get(ref) : undefined), [index]);
