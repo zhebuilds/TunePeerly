@@ -1993,24 +1993,6 @@ body.resizing * {
   opacity: 1;
 }
 
-.sharing-panel {
-  margin-bottom: 16px;
-  padding: 16px 20px;
-  border-radius: var(--r-lg);
-  background: var(--surface);
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.sharing-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 24px;
-  flex-wrap: wrap;
-}
-
 .empty-hint {
   display: flex;
   flex-direction: column;
@@ -2432,24 +2414,6 @@ body.resizing * {
   padding: 0;
   color: var(--faint);
   font-weight: 600;
-}
-
-.badge.expose {
-  gap: 4px;
-  height: 18px;
-  padding: 0;
-  background: transparent;
-  color: var(--faint);
-  font-weight: 600;
-}
-
-.badge.expose.on {
-  color: var(--accent-text);
-}
-
-.badge.expose svg {
-  width: 13px;
-  height: 13px;
 }
 
 @container table (max-width: 880px) {
@@ -3678,8 +3642,7 @@ body.resizing * {
   text-align: left;
 }
 
-.sync-menu button:hover,
-.sync-menu button.current {
+.sync-menu button:hover {
   background: var(--hover);
 }
 

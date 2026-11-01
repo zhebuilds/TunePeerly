@@ -48,7 +48,6 @@ export function ContextMenu() {
     );
   }
 
-  const allLocal = tracks.every((track) => track.localFileId && track.accessStatus === "available");
   const allRemote = tracks.every((track) => !(track.localFileId && track.accessStatus === "available") && track.contentId);
   const playlists = app.boot?.playlists ?? [];
   const allLiked = tracks.every((track) => track.favorite);
@@ -118,23 +117,9 @@ export function ContextMenu() {
             })}
           />
         )}
-        {allLocal && (
-          <>
-            <hr />
-            {tracks.every((track) => track.exposed) ? (
-              <Item icon={<Icons.eyeOff />} label={t("menu.stopExposing")} onClick={run(() => void exposeTracks(tracks.map((track) => track.localFileId!), false).then(() => { app.toast(t("toast.hidden")); app.scheduleRefresh(); }).catch(app.say))} />
-            ) : (
-              <Item icon={<Icons.eye />} label={t("menu.expose")} onClick={run(() => void exposeTracks(tracks.map((track) => track.localFileId!), true).then(() => { app.toast(t("toast.exposed")); app.scheduleRefresh(); }).catch(app.say))} />
-            )}
-          </>
-        )}
       </div>
     </Layer>
   );
-}
-
-async function exposeTracks(ids: string[], expose: boolean) {
-  for (const id of ids) await api.setTrackExposure(id, expose);
 }
 
 function Layer({ children, onClose }: { children: ReactNode; onClose: () => void }) {

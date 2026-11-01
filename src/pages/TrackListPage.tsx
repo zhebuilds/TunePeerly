@@ -37,13 +37,11 @@ export function TrackListPage({ route }: { route: Route }) {
   const routeKey = `${route.name}:${route.id ?? ""}`;
   const [filter, setFilter] = useState("");
   const [filterOpen, setFilterOpen] = useState(false);
-  const [sharingOpen, setSharingOpen] = useState(false);
   const filterInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setFilter("");
     setFilterOpen(false);
-    setSharingOpen(false);
   }, [routeKey]);
 
   const online = (app.boot?.links ?? []).filter((link) => link.state === "online" && link.deviceId !== app.boot?.deviceId);
@@ -116,9 +114,6 @@ export function TrackListPage({ route }: { route: Route }) {
             <button type="button" className="btn ghost" title={t("library.scanHint")} aria-label={t("library.scanHint")} onClick={() => void app.rescan()}>
               <Icons.sync /> <span className="btn-label">{t("library.scan")}</span>
             </button>
-            <button type="button" className={`icon-btn lg${sharingOpen ? " on" : ""}`} aria-label={t("playlist.sharing")} title={t("playlist.sharing")} aria-pressed={sharingOpen} onClick={() => setSharingOpen((value) => !value)}>
-              <Icons.eye />
-            </button>
           </>
         )}
         {route.name === "liked" && <SyncButton feature="favorites" />}
@@ -137,9 +132,6 @@ export function TrackListPage({ route }: { route: Route }) {
         )}
         {playlist && (
           <>
-            <button type="button" className={`icon-btn lg${sharingOpen ? " on" : ""}`} aria-label={t("playlist.sharing")} title={t("playlist.sharing")} onClick={() => setSharingOpen((value) => !value)}>
-              {playlist.exposure === "hide" ? <Icons.eyeOff /> : <Icons.eye />}
-            </button>
             <button type="button" className="icon-btn lg" aria-label={t("playlist.rename")} title={t("playlist.rename")} onClick={() => app.renamePlaylist(playlist.id)}>
               <Icons.pencil />
             </button>
@@ -198,8 +190,6 @@ export function TrackListPage({ route }: { route: Route }) {
           <Icons.chevronDown className={sort.dir === 1 ? "up" : ""} />
         </button>
       </ActionBar>
-      {playlist && sharingOpen && <SharingPanel playlistId={playlist.id} exposure={playlist.exposure} />}
-      {route.name === "library" && sharingOpen && <LibrarySharingPanel />}
       <TrackTable
         tracks={shown}
         contextId={info.contextId}
@@ -241,85 +231,6 @@ function sortOptions(defaultSort: Sort, t: (key: string) => string, history: boo
   if (defaultSort.key === "order") options.unshift({ value: "order:1", label: history ? t("sort.recent") : t("sort.custom") });
   if (defaultSort.key === "trackNumber") options.unshift({ value: "trackNumber:1", label: t("sort.trackNumber") });
   return options;
-}
-
-function SharingPanel({ playlistId, exposure }: { playlistId: string; exposure: string }) {
-  const { t } = useTranslation();
-  const app = useApp();
-  return (
-    <div className="sharing-panel">
-      <div className="sharing-row">
-        <div>
-          <div className="setting-title">{t("playlist.exposureDefault")}</div>
-          <div className="setting-help">{t("settings.exposureHelp")}</div>
-        </div>
-        <Select
-          label={t("playlist.exposureDefault")}
-          value={exposure}
-          onChange={(value) => void api.setExposure("playlist", playlistId, value).then(app.scheduleRefresh).catch(app.say)}
-          options={[
-            { value: "follow", label: t("exposure.follow"), hint: t("exposure.followHint") },
-            { value: "expose", label: t("exposure.expose"), hint: t("exposure.exposeHint") },
-            { value: "hide", label: t("exposure.hide"), hint: t("exposure.hideHint") },
-          ]}
-        />
-      </div>
-      <div className="sharing-row">
-        <div className="setting-help">{t("settings.exposeNowHelp")}</div>
-        <div className="button-row">
-          <button type="button" className="btn soft" title={t("exposure.exposeAllHint")} onClick={() => void api.exposeMembers("playlist", playlistId, true).then(() => { app.toast(t("toast.exposed")); app.scheduleRefresh(); }).catch(app.say)}>
-            <Icons.eye /> {t("exposure.exposeAll")}
-          </button>
-          <button type="button" className="btn soft" title={t("exposure.hideAllHint")} onClick={() => void api.exposeMembers("playlist", playlistId, false).then(() => { app.toast(t("toast.hidden")); app.scheduleRefresh(); }).catch(app.say)}>
-            <Icons.eyeOff /> {t("exposure.hideAll")}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function LibrarySharingPanel() {
-  const { t } = useTranslation();
-  const app = useApp();
-  const run = (expose: boolean) =>
-    void api
-      .exposeMembers("library", "", expose)
-      .then(() => {
-        app.toast(t(expose ? "toast.exposed" : "toast.hidden"));
-        app.scheduleRefresh();
-      })
-      .catch(app.say);
-  return (
-    <div className="sharing-panel">
-      <div className="sharing-row">
-        <div>
-          <div className="setting-title">{t("settings.exposeDefault")}</div>
-          <div className="setting-help">{t("settings.exposeDefaultHelp")}</div>
-        </div>
-        <Select
-          label={t("settings.exposeDefault")}
-          value={app.settings.exposeDefault === "expose" ? "expose" : "hide"}
-          onChange={(value) => void app.setSetting("exposeDefault", value)}
-          options={[
-            { value: "hide", label: t("exposure.hideDefault"), hint: t("exposure.hideDefaultHint") },
-            { value: "expose", label: t("exposure.exposeDefault"), hint: t("exposure.exposeDefaultHint") },
-          ]}
-        />
-      </div>
-      <div className="sharing-row">
-        <div className="setting-help">{t("settings.exposeNowHelp")}</div>
-        <div className="button-row">
-          <button type="button" className="btn soft" title={t("exposure.exposeAllHint")} onClick={() => run(true)}>
-            <Icons.eye /> {t("exposure.exposeAll")}
-          </button>
-          <button type="button" className="btn soft" title={t("exposure.hideAllHint")} onClick={() => run(false)}>
-            <Icons.eyeOff /> {t("exposure.hideAll")}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 /** Another connected device's Recently Played, asked for when chosen and shown read-only. Nothing is

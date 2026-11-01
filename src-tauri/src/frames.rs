@@ -32,11 +32,11 @@ pub enum Frame {
     /// Pairing stopped: "wrong", "expired", "locked", "busy" or "cancelled".
     PairFail { reason: String },
     /// The sender disconnected this device on purpose, so do not dial it again until it comes back
-    /// or the user presses Connect. Empty payload. Older versions read it as a keepalive.
+    /// or the user presses Connect. Empty payload.
     Hold,
     /// The sender no longer has this device saved. `pair: false`: it was removed there, so forget the
     /// sender and stay quiet. `pair: true`: the user is pairing again from the sender, so forget the
-    /// sender and show a new code. One byte. Older versions read it as a keepalive.
+    /// sender and show a new code. One byte.
     Unpaired { pair: bool },
 }
 
@@ -71,14 +71,12 @@ impl Frame {
                 payload.extend_from_slice(&total.to_be_bytes());
                 (8, payload)
             }
-            // Kind 9 was the old accept-without-a-code answer.
             Self::PairStart { message } => (12, message.clone()),
             Self::PairAnswer { message, tag } => (13, [tag.as_slice(), message].concat()),
             Self::PairConfirm { tag } => (14, tag.to_vec()),
             Self::PairFail { reason } => (15, reason.as_bytes().to_vec()),
             Self::Hold => (10, Vec::new()),
             Self::Unpaired { pair } => (16, vec![u8::from(*pair)]),
-            // Kinds 2 and 3 carried the retired Signal bundles and ciphertexts.
             Self::Message(bytes) => (11, bytes.clone()),
         };
         if payload.len() > MAX_PAYLOAD {
@@ -226,8 +224,6 @@ mod tests {
         // A tag shorter than 32 bytes is refused instead of read past the end.
         assert!(Frame::decode(&[14, 0, 0, 0, 3, 1, 2, 3]).is_err());
         assert!(Frame::decode(&[13, 0, 0, 0, 1, 1]).is_err());
-        // The retired accept-without-a-code frame is skipped like any unknown kind.
-        assert!(matches!(Frame::decode(&[9, 0, 0, 0, 0]), Ok(Frame::Keepalive)));
     }
 
     #[test]

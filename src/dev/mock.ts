@@ -65,7 +65,6 @@ if (!empty) {
           fileName: `${String(i + 1).padStart(2, "0")} ${title}.flac`,
           addedAt: new Date(Date.now() - n * 36e5 * 7).toISOString(),
           favorite: n % 4 === 0,
-          exposed: n % 3 === 0,
           badge: !local ? (n % 18 === 0 ? "unavailable" : "remote") : missing ? "unavailable" : "local",
           accessStatus: local ? (missing ? "missing" : "available") : "missing",
           metadataStatus: "ready",
@@ -87,9 +86,9 @@ const key = (track: Track) => track.contentId ?? track.localFileId ?? "";
 const playlists: Playlist[] = empty
   ? []
   : [
-      { id: "p1", name: "Late Night Drive", exposure: "follow", count: 0 },
-      { id: "p2", name: "Focus", exposure: "expose", count: 0 },
-      { id: "p3", name: "周末早晨", exposure: "hide", count: 0 },
+      { id: "p1", name: "Late Night Drive", count: 0 },
+      { id: "p2", name: "Focus", count: 0 },
+      { id: "p3", name: "周末早晨", count: 0 },
     ];
 const members: Record<string, MemberRef[]> = {
   p1: tracks.filter((_, at) => at % 3 === 0).slice(0, 14).map((track) => ({ contentId: track.contentId, localFileId: track.localFileId })),
@@ -122,7 +121,6 @@ const settings: Record<string, unknown> = {
   showUnavailable: true,
   historyCap: 100,
   incognito: false,
-  exposeDefault: "hide",
   downloadFolder: "",
   volume: 0.8,
   relayHost: "",
@@ -220,7 +218,7 @@ function bootstrap(): Bootstrap {
     settings: structuredClone(settings),
     theme: state.theme,
     language: state.language,
-    grants: empty ? [] : [{ id: 1, kind: "directory", path: "D:\\Music", exposure: "follow" }, { id: 2, kind: "file", path: "C:\\Users\\me\\Downloads\\single.mp3", exposure: "hide" }],
+    grants: empty ? [] : [{ id: 1, kind: "directory", path: "D:\\Music" }, { id: 2, kind: "file", path: "C:\\Users\\me\\Downloads\\single.mp3" }],
     playlists: structuredClone(playlists),
     player: structuredClone(state.player),
     history: [...state.history],
@@ -314,7 +312,7 @@ async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<
       const name = String(args.name).trim();
       if (!name) throw "playlist.nameEmpty";
       const id = `p${Date.now()}`;
-      playlists.push({ id, name, exposure: "follow", count: 0 });
+      playlists.push({ id, name, count: 0 });
       members[id] = [];
       return id;
     }
@@ -350,16 +348,6 @@ async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<
       else if (args.key === "language") state.language = String(args.value);
       else settings[String(args.key)] = args.value;
       return null;
-    case "set_exposure": {
-      const playlist = playlists.find((item) => item.id === args.id);
-      if (playlist) playlist.exposure = args.value as Playlist["exposure"];
-      return null;
-    }
-    case "set_track_exposure": {
-      const track = tracks.find((item) => item.localFileId === args.localFileId);
-      if (track) track.exposed = Boolean(args.expose);
-      return null;
-    }
     case "network_command": {
       const action = String(args.action);
       if (action === "reject") state.offer = null;
@@ -407,7 +395,6 @@ async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<
     case "remove_grant":
     case "playback_result":
     case "remote_failure":
-    case "expose_members":
     case "reveal_path":
     case "move_membership":
     case "show_in_folder":

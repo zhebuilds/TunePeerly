@@ -279,12 +279,6 @@ const TrackRow = memo(function TrackRow({ track, index, top, number, gridClass, 
       {cols.source && (
         <div className="cell c-source">
           <span className={`badge ${track.badge}`}>{t(`badge.${track.badge}`)}</span>
-          {track.localFileId && (
-            <span className={`badge expose${track.exposed ? " on" : ""}`} title={track.exposed ? t("list.exposedHelp") : t("list.hiddenHelp")}>
-              {track.exposed ? <Icons.eye /> : <Icons.eyeOff />}
-              {track.exposed ? t("list.exposed") : t("list.hidden")}
-            </span>
-          )}
         </div>
       )}
       {cols.album && (

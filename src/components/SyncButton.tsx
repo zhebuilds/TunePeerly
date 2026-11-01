@@ -20,7 +20,6 @@ export function SyncButton({ feature, compact, quiet }: { feature: Feature; comp
   const online = (boot?.links ?? []).filter((link) => link.state === "online" && link.deviceId !== boot?.deviceId);
   const incognito = Boolean(settings.incognito);
   const unavailable = !boot || incognito || online.length === 0;
-  const preferred = String(settings.syncRequestDevice ?? "");
   const reason = incognito ? t("sync.pushIncognito") : online.length === 0 ? t("sync.noneOnline") : "";
   const pushTitle = reason || t("sync.pushTitle", { feature: t(`feature.${feature}`) });
   const pullTitle = reason || t("sync.pullTitle", { feature: t(`feature.${feature}`) });
@@ -66,9 +65,8 @@ export function SyncButton({ feature, compact, quiet }: { feature: Feature; comp
         <div className="sync-menu" style={{ left: pos.left, top: pos.top }} role="menu" aria-label={t("sync.pullChoose")}>
           <div className="sync-menu-title">{t("sync.pullChoose")}</div>
           {online.map((link) => (
-            <button type="button" role="menuitem" key={link.deviceId} className={link.deviceId === preferred ? "current" : ""} onClick={() => request(link.deviceId, link.name || link.deviceId)}>
+            <button type="button" role="menuitem" key={link.deviceId} onClick={() => request(link.deviceId, link.name || link.deviceId)}>
               <span>{link.name || link.deviceId}</span>
-              {link.deviceId === preferred && <span className="muted small">{t("sync.pullDefault")}</span>}
             </button>
           ))}
         </div>

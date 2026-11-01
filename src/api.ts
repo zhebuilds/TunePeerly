@@ -17,7 +17,6 @@ export type Track = {
   fileName: string;
   addedAt: string;
   favorite: boolean;
-  exposed: boolean;
   badge: Badge;
   accessStatus: string;
   metadataStatus: string;
@@ -32,9 +31,8 @@ export type Track = {
   snippet?: string;
 };
 
-export type Grant = { id: number; kind: "directory" | "file"; path: string; exposure: Exposure };
-export type Exposure = "follow" | "expose" | "hide";
-export type Playlist = { id: string; name: string; exposure: Exposure; count: number };
+export type Grant = { id: number; kind: "directory" | "file"; path: string };
+export type Playlist = { id: string; name: string; count: number };
 export type Nearby = { deviceId: string; name: string; host: string; hosts: string[]; port: number };
 export type LinkState = "online" | "pending" | "offline" | "failed";
 export type Link = { deviceId: string; name: string; state: LinkState; path: string; detail: string; trust?: "full" | "verify" | string };
@@ -85,7 +83,6 @@ export type Settings = {
   overwritePolicy?: Partial<Record<Feature, OverwritePolicy>>;
   historyPaused?: boolean;
   incognito?: boolean;
-  exposeDefault?: "expose" | "hide";
   downloadFolder?: string;
   volume?: number;
   relayHost?: string;
@@ -93,7 +90,6 @@ export type Settings = {
   relayDeviceId?: string;
   relayToken?: string;
   discovery?: boolean;
-  syncRequestDevice?: string;
   displayName?: string;
   silenceSeconds?: number;
   noticeRead?: "open" | "click" | "visible";
@@ -175,9 +171,6 @@ export const api = {
   movePlaylistMember: (playlistId: string, from: number, to: number) => invoke("move_playlist_member", { playlistId, from, to }),
   setLibraryOrder: (keys: string[]) => invoke("set_library_order", { keys }),
   playlistMembers: (id: string) => invoke<MemberRef[]>("playlist_members", { id }),
-  setExposure: (scope: "grant" | "playlist" | "global", id: string, value: string) => invoke("set_exposure", { scope, id, value }),
-  exposeMembers: (scope: "grant" | "playlist" | "library", id: string, expose: boolean) => invoke("expose_members", { scope, id, expose }),
-  setTrackExposure: (localFileId: string, expose: boolean) => invoke("set_track_exposure", { localFileId, expose }),
   updateSetting: (key: string, value: unknown) => invoke("update_setting", { key, value }),
   network: (action: string, payload: unknown = null) => invoke("network_command", { action, payload }),
   remoteUrl: (contentId: string, exclude: string[]) => invoke<{ url: string; deviceId: string }>("remote_url", { contentId, exclude }),

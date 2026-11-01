@@ -293,7 +293,6 @@ fn add_to_playlist(state: State<'_, AppState>, playlist_id: String, content_id: 
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .add_to_playlist(&playlist_id, content_id.as_deref(), local_file_id.as_deref())?;
-    let _ = state.net.tx.send(net::Cmd::Publish);
     Ok(())
 }
 
@@ -321,50 +320,6 @@ fn move_playlist_member(state: State<'_, AppState>, playlist_id: String, from: u
 #[tauri::command(async)]
 fn set_library_order(state: State<'_, AppState>, keys: Vec<String>) -> AppResult<()> {
     state.db.lock().unwrap_or_else(PoisonError::into_inner).set_library_order(&keys)?;
-    Ok(())
-}
-
-#[tauri::command(async)]
-fn set_exposure(state: State<'_, AppState>, scope: String, id: String, value: String) -> AppResult<()> {
-    let allowed: &[&str] = if scope == "global" { &["expose", "hide"] } else { &["expose", "hide", "follow"] };
-    if !allowed.contains(&value.as_str()) {
-        return Err(AppError::Message("problems.unknown".into()));
-    }
-    let db = state.db.lock().unwrap_or_else(PoisonError::into_inner);
-    if scope == "grant" {
-        db.set_grant_exposure(grant_id(&id)?, &value)?;
-    } else if scope == "playlist" {
-        db.set_playlist_exposure(&id, &value)?;
-    } else if scope == "global" {
-        db.set_device_setting("exposeDefault", json!(value))?;
-    }
-    Ok(())
-}
-
-#[tauri::command(async)]
-fn expose_members(state: State<'_, AppState>, scope: String, id: String, expose: bool) -> AppResult<()> {
-    let db = state.db.lock().unwrap_or_else(PoisonError::into_inner);
-    if scope == "grant" {
-        db.expose_grant_members(grant_id(&id)?, expose)?;
-    } else if scope == "library" {
-        db.expose_library_members(expose)?;
-    } else {
-        db.expose_playlist_members(&id, expose)?;
-    }
-    drop(db);
-    let _ = state.net.tx.send(net::Cmd::Publish);
-    Ok(())
-}
-
-/// A folder id from the page. A malformed one is an error instead of silently doing nothing.
-fn grant_id(id: &str) -> AppResult<i64> {
-    id.parse().map_err(|_| AppError::Message("problems.unknown".into()))
-}
-
-#[tauri::command(async)]
-fn set_track_exposure(state: State<'_, AppState>, local_file_id: String, expose: bool) -> AppResult<()> {
-    state.db.lock().unwrap_or_else(PoisonError::into_inner).set_track_exposure(&local_file_id, expose)?;
-    let _ = state.net.tx.send(net::Cmd::Publish);
     Ok(())
 }
 
@@ -622,9 +577,6 @@ pub fn run() {
             remove_playlist_member,
             move_playlist_member,
             set_library_order,
-            set_exposure,
-            expose_members,
-            set_track_exposure,
             update_setting,
             network_command,
             remote_url,

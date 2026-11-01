@@ -67,7 +67,7 @@ pub enum SourceChoice {
     Stop,
 }
 
-/// Transport failures try another still-exposed path on the same device, then the next device.
+/// Transport failures try another readable path on the same device, then the next device.
 /// Decode and unsupported stay on the original bytes.
 pub fn select_source(
     sources: &[PlaySource],

@@ -50,7 +50,6 @@ struct ExistingRow {
     content_id: Option<String>,
     mtime_ms: Option<i64>,
     size_bytes: Option<i64>,
-    exposed: i64,
     lyrics_stamp: Option<String>,
 }
 
@@ -238,7 +237,7 @@ fn relative_under(root: &Path, file: &Path) -> Option<String> {
 
 fn existing_rows(db: &Db, grant_id: i64) -> AppResult<HashMap<String, ExistingRow>> {
     let mut stmt = db.conn.prepare(
-        "SELECT relative_path, local_file_id, content_id, mtime_ms, size_bytes, exposed, lyrics_stamp
+        "SELECT relative_path, local_file_id, content_id, mtime_ms, size_bytes, lyrics_stamp
          FROM local_files WHERE grant_id = ?1",
     )?;
     let rows = stmt.query_map(params![grant_id], |row| {
@@ -249,8 +248,7 @@ fn existing_rows(db: &Db, grant_id: i64) -> AppResult<HashMap<String, ExistingRo
                 content_id: row.get(2)?,
                 mtime_ms: row.get(3)?,
                 size_bytes: row.get(4)?,
-                exposed: row.get(5)?,
-                lyrics_stamp: row.get(6)?,
+                lyrics_stamp: row.get(5)?,
             },
         ))
     })?;
@@ -348,7 +346,6 @@ fn write_prepared(
 ) -> AppResult<(usize, usize)> {
     let mut added = 0;
     let mut updated = 0;
-    let new_exposed = if db.exposure_for_new_folder_file(grant_id)? { 1 } else { 0 };
     for item in prepared {
         let previous = existing.get(&item.relative);
         if item.unreadable {
@@ -397,16 +394,15 @@ fn write_prepared(
         let local_file_id = previous
             .map(|row| row.local_file_id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let exposed = previous.map(|row| row.exposed).unwrap_or(new_exposed);
         let folder = file.parent().map(|path| path.to_string_lossy().to_string()).unwrap_or_default();
         db.conn.execute(
             "INSERT INTO local_files(
                 local_file_id, grant_id, relative_path, absolute_path, file_name, lyrics,
                 metadata_status, metadata_reason, access_status, access_reason,
-                playback_status, playback_reason, exposed, added_at, mtime_ms, size_bytes,
+                playback_status, playback_reason, added_at, mtime_ms, size_bytes,
                 content_id, duration_ms, title, artist, album, track_number, codec,
                 sample_rate, bit_depth, video, cover_path, cover_checked, lyrics_stamp
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'available',NULL,'untried',NULL,?9,?10,?11,?12,NULL,?13,?14,?15,?16,?17,?18,?19,?20,?21,NULL,0,?22)
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'available',NULL,'untried',NULL,?9,?10,?11,NULL,?12,?13,?14,?15,?16,?17,?18,?19,?20,NULL,0,?21)
              ON CONFLICT(local_file_id) DO UPDATE SET
                 absolute_path = excluded.absolute_path,
                 file_name = excluded.file_name,
@@ -441,7 +437,6 @@ fn write_prepared(
                 read.lyrics,
                 read.metadata_status,
                 read.metadata_reason,
-                exposed,
                 now,
                 item.mtime_ms,
                 item.size,
@@ -555,7 +550,7 @@ pub fn file_extension_for_codec(codec: &str) -> String {
     if AUDIO_EXT.contains(&codec.as_str()) {
         return codec;
     }
-    // Names that older versions stored from the probe instead of from the file name.
+    // Names the probe reports for some formats instead of the file extension.
     let mapped = match codec.as_str() {
         "mpeg" | "mp2" => "mp3",
         "vorbis" => "ogg",
@@ -1198,6 +1193,23 @@ mod tests {
         let (again, _, status) = lyrics_of(&db);
         assert_eq!(again, id);
         assert_eq!(status, "available");
+    }
+
+    #[test]
+    fn every_readable_local_song_is_offered_to_paired_devices_unless_incognito() {
+        let (db, _keep) = open_db();
+        let music = temp("offered");
+        fs::write(music.join("a.mp3"), b"not really audio").unwrap();
+        fs::write(music.join("b.mp3"), b"not really audio either").unwrap();
+        import_path(&db, &music, "directory").unwrap();
+        let guard = db.lock().unwrap();
+        guard.conn.execute("UPDATE local_files SET content_id = 'c-' || file_name", []).unwrap();
+        let mut offered: Vec<String> = crate::catalog::local_publishable(&guard).unwrap().into_iter().map(|row| row.content_id).collect();
+        offered.sort();
+        assert_eq!(offered, vec!["c-a.mp3".to_string(), "c-b.mp3".to_string()]);
+        assert_eq!(crate::catalog::readable_paths(&guard, "c-a.mp3").unwrap().len(), 1);
+        guard.set_device_setting("incognito", serde_json::json!(true)).unwrap();
+        assert!(crate::catalog::local_publishable(&guard).unwrap().is_empty());
     }
 
     #[test]

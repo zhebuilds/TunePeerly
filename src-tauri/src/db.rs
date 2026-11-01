@@ -33,7 +33,6 @@ pub struct TrackStub {
     pub file_name: String,
     pub added_at: String,
     pub favorite: bool,
-    pub exposed: bool,
     pub badge: String,
     pub access_status: String,
     pub metadata_status: String,
@@ -53,7 +52,6 @@ pub struct GrantRow {
     pub id: i64,
     pub kind: String,
     pub path: String,
-    pub exposure: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +59,6 @@ pub struct GrantRow {
 pub struct PlaylistRow {
     pub id: String,
     pub name: String,
-    pub exposure: String,
     pub count: i64,
 }
 
@@ -97,42 +94,11 @@ fn open_encrypted(database: &Path) -> AppResult<Connection> {
 fn unlock(database: &Path, key: &[u8; KEY_LEN]) -> AppResult<Connection> {
     // A raw 256-bit key in SQLCipher's `x'…'` form skips its passphrase KDF; the key is random already.
     let key = format!("x'{}'", data_encoding::HEXUPPER.encode(key));
-    let mut header = [0u8; 16];
-    let plain = std::fs::File::open(database).and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header)).is_ok()
-        && &header == b"SQLite format 3\0";
-    if plain {
-        encrypt_plain(database, &key)?;
-    }
     let conn = Connection::open(database)?;
     conn.pragma_update(None, "key", &key)?;
     // A wrong key only shows on the first read.
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
     Ok(conn)
-}
-
-/// A library from before encryption. SQLCipher cannot encrypt a file in place, so the data is
-/// exported into an encrypted copy, which then replaces the plain file.
-fn encrypt_plain(database: &Path, key: &str) -> AppResult<()> {
-    let copy = beside(database, ".encrypting");
-    if copy.exists() {
-        std::fs::remove_file(&copy)?;
-    }
-    {
-        let plain = Connection::open(database)?;
-        // Folds any WAL into the main file first, so the export sees every committed row.
-        plain.pragma_update(None, "journal_mode", "DELETE")?;
-        let version: i64 = plain.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        plain.execute("ATTACH DATABASE ?1 AS encrypted KEY ?2", rusqlite::params![copy.to_string_lossy(), key])?;
-        plain.query_row("SELECT sqlcipher_export('encrypted')", [], |_| Ok(()))?;
-        plain.execute_batch(&format!("PRAGMA encrypted.user_version = {version}; DETACH DATABASE encrypted;"))?;
-    }
-    for stale in [beside(database, "-wal"), beside(database, "-shm")] {
-        if stale.exists() {
-            std::fs::remove_file(stale)?;
-        }
-    }
-    std::fs::rename(&copy, database)?;
-    Ok(())
 }
 
 fn beside(path: &Path, suffix: &str) -> PathBuf {
@@ -167,76 +133,14 @@ impl Db {
             app_dir,
             cache_dir,
         };
-        db.migrate()?;
+        db.create_schema()?;
         db.seed()?;
         db.queue_missing_covers()?;
         Ok(db)
     }
 
-    fn migrate(&self) -> AppResult<()> {
-        // Pairings made under the retired Signal identity pinned keys this device no longer has.
-        // Drop them with that identity, so the device gets a new TLS key and pairs again.
-        let signal_era: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'signal_state')",
-            [],
-            |row| row.get(0),
-        )?;
-        if signal_era {
-            self.conn.execute_batch("DROP TABLE signal_state; DROP TABLE IF EXISTS peers;")?;
-        }
+    fn create_schema(&self) -> AppResult<()> {
         self.conn.execute_batch(SCHEMA)?;
-        self.add_column_if_missing("local_files", "cover_checked", "INTEGER NOT NULL DEFAULT 0")?;
-        // Time and size of the `.lrc` next to the song, so a lyrics file added later is noticed.
-        self.add_column_if_missing("local_files", "lyrics_stamp", "TEXT")?;
-        self.add_column_if_missing("notices", "read", "INTEGER NOT NULL DEFAULT 1")?;
-        self.add_column_if_missing("notices", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
-        // Left over from removals that were shared between devices; a removal is local now.
-        self.drop_column_if_present("peers", "paired_at")?;
-        self.drop_column_if_present("removed_devices", "removed_by")?;
-        // Left over from the retired safety-number check; pairing checks a code now.
-        self.drop_column_if_present("peers", "safety_number")?;
-        // Tables and switches left behind when sync revisions, the mailbox, and the old on/off toggles were removed.
-        self.conn.execute_batch(
-            "DROP TABLE IF EXISTS mailbox_acks;
-             DROP TABLE IF EXISTS mailbox;
-             DROP TABLE IF EXISTS applied_ops;
-             DROP TABLE IF EXISTS snapshots;
-             DROP TABLE IF EXISTS feature_revisions;
-             DELETE FROM device_settings WHERE key IN ('historySyncMode', 'syncEnabled', 'audioShare', 'positionSync', 'positionSyncDevice');",
-        )?;
-        // Lookups by song and by file. Without these, large libraries scan whole tables on every listing.
-        self.conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS local_files_content ON local_files(content_id);
-             CREATE INDEX IF NOT EXISTS holdings_content ON holdings(content_id);
-             CREATE INDEX IF NOT EXISTS play_history_content ON play_history(content_id);
-             CREATE INDEX IF NOT EXISTS play_history_file ON play_history(local_file_id);
-             CREATE INDEX IF NOT EXISTS playlist_tracks_content ON playlist_tracks(content_id);
-             CREATE INDEX IF NOT EXISTS playlist_tracks_file ON playlist_tracks(local_file_id);",
-        )?;
-        Ok(())
-    }
-
-    fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> AppResult<()> {
-        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let names = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?;
-        if !names.iter().any(|name| name == column) {
-            self.conn
-                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))?;
-        }
-        Ok(())
-    }
-
-    fn drop_column_if_present(&self, table: &str, column: &str) -> AppResult<()> {
-        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let names = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?;
-        if names.iter().any(|name| name == column) {
-            self.conn
-                .execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))?;
-        }
         Ok(())
     }
 
@@ -255,60 +159,11 @@ impl Db {
                 params![key, value],
             )?;
         }
-        self.drop_auto_sync()?;
-        self.drop_listen_port()?;
-        self.split_overwrite_mode()?;
         let name = self.setting_string("displayName")?;
         if name.is_empty() {
             let host = whoami::fallible::hostname().unwrap_or_else(|_| "This computer".into());
             self.set_device_setting("displayName", json!(host))?;
         }
-        let applied = self
-            .conn
-            .query_row(
-                "SELECT value FROM device_settings WHERE key = 'darkDefaultApplied'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .unwrap_or_default();
-        if applied != "true" {
-            if self.synced("theme")?.is_empty() || self.synced("theme")? == "light" {
-                self.set_synced("theme", "dark")?;
-            }
-            self.set_device_setting("darkDefaultApplied", json!(true))?;
-        }
-        Ok(())
-    }
-
-    /// Favorites and appearance sync only by hand now, and another device's Recently Played is only
-    /// viewed. Drop the settings that automatic sync left behind.
-    /// The LAN port is picked by the system on every start now. A port saved by an older version is
-    /// not used anymore.
-    fn drop_listen_port(&self) -> AppResult<()> {
-        self.conn.execute("DELETE FROM device_settings WHERE key = 'listenPort'", [])?;
-        Ok(())
-    }
-
-    fn drop_auto_sync(&self) -> AppResult<()> {
-        self.conn.execute(
-            "DELETE FROM device_settings WHERE key IN ('dirty', 'pendingSnapshots', 'syncSources', 'syncBlocks', 'autoSend', 'conflictPolicy', 'historySync', 'historyStartup')",
-            [],
-        )?;
-        Ok(())
-    }
-
-    /// The single "overwriteMode" (silent or ask) became one choice per feature. Carry the old choice over.
-    fn split_overwrite_mode(&self) -> AppResult<()> {
-        let old: Option<String> = self
-            .conn
-            .query_row("SELECT value FROM device_settings WHERE key = 'overwriteMode'", [], |row| row.get(0))
-            .optional()?;
-        let Some(old) = old else { return Ok(()) };
-        let mode = if serde_json::from_str::<Value>(&old).ok().and_then(|value| value.as_str().map(str::to_string)).as_deref() == Some("ask") { "ask" } else { "silent" };
-        let policy: serde_json::Map<String, Value> = FEATURES.iter().map(|feature| (feature.to_string(), json!(mode))).collect();
-        self.set_device_setting("overwritePolicy", Value::Object(policy))?;
-        self.conn.execute("DELETE FROM device_settings WHERE key = 'overwriteMode'", [])?;
         Ok(())
     }
 
@@ -414,13 +269,12 @@ impl Db {
     pub fn grants(&self) -> AppResult<Vec<GrantRow>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, kind, path, exposure FROM grants ORDER BY path")?;
+            .prepare("SELECT id, kind, path FROM grants ORDER BY path")?;
         let rows = stmt.query_map([], |row| {
             Ok(GrantRow {
                 id: row.get(0)?,
                 kind: row.get(1)?,
                 path: row.get(2)?,
-                exposure: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -448,7 +302,7 @@ impl Db {
             return Ok(id);
         }
         self.conn.execute(
-            "INSERT INTO grants(kind, path, exposure) VALUES(?1, ?2, 'follow')
+            "INSERT INTO grants(kind, path) VALUES(?1, ?2)
              ON CONFLICT(path) DO UPDATE SET kind = excluded.kind",
             params![kind, path],
         )?;
@@ -467,14 +321,13 @@ impl Db {
         let grant = self
             .conn
             .query_row(
-                "SELECT id, kind, path, exposure FROM grants WHERE id = ?1",
+                "SELECT id, kind, path FROM grants WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(GrantRow {
                         id: row.get(0)?,
                         kind: row.get(1)?,
                         path: row.get(2)?,
-                        exposure: row.get(3)?,
                     })
                 },
             )
@@ -542,48 +395,9 @@ impl Db {
         Ok(())
     }
 
-    pub fn exposure_for_new_folder_file(&self, grant_id: i64) -> AppResult<bool> {
-        let exposure: String = self.conn.query_row(
-            "SELECT exposure FROM grants WHERE id = ?1",
-            params![grant_id],
-            |row| row.get(0),
-        )?;
-        self.resolve_exposure(&exposure)
-    }
-
-    pub fn resolve_exposure(&self, exposure: &str) -> AppResult<bool> {
-        let mode = if exposure == "follow" {
-            self.setting_string("exposeDefault")?
-        } else {
-            exposure.to_string()
-        };
-        Ok(mode == "expose")
-    }
-
-    pub fn set_grant_exposure(&self, id: i64, exposure: &str) -> AppResult<()> {
-        self.conn.execute(
-            "UPDATE grants SET exposure = ?1 WHERE id = ?2",
-            params![exposure, id],
-        )?;
-        Ok(())
-    }
-
-    pub fn expose_grant_members(&self, id: i64, expose: bool) -> AppResult<()> {
-        self.conn.execute(
-            "UPDATE local_files SET exposed = ?1 WHERE grant_id = ?2",
-            params![expose, id],
-        )?;
-        Ok(())
-    }
-
-    pub fn expose_library_members(&self, expose: bool) -> AppResult<()> {
-        self.conn.execute("UPDATE local_files SET exposed = ?1", params![expose])?;
-        Ok(())
-    }
-
     pub fn playlists(&self) -> AppResult<Vec<PlaylistRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.name, p.exposure,
+            "SELECT p.id, p.name,
                     (SELECT COUNT(*) FROM playlist_tracks t WHERE t.playlist_id = p.id)
              FROM playlists p ORDER BY p.position, p.name",
         )?;
@@ -591,8 +405,7 @@ impl Db {
             Ok(PlaylistRow {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                exposure: row.get(2)?,
-                count: row.get(3)?,
+                count: row.get(2)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -606,7 +419,7 @@ impl Db {
                 row.get(0)
             })?;
         self.conn.execute(
-            "INSERT INTO playlists(id, name, position, exposure, revision) VALUES(?1, ?2, ?3, 'follow', 0)",
+            "INSERT INTO playlists(id, name, position, revision) VALUES(?1, ?2, ?3, 0)",
             params![id, name, position],
         )?;
         Ok(id)
@@ -653,22 +466,6 @@ impl Db {
              VALUES(?1, ?2, ?3, ?4)",
             params![playlist_id, position, content_id, local_file_id],
         )?;
-        if let Some(local_file_id) = local_file_id {
-            let exposure: String = self.conn.query_row(
-                "SELECT exposure FROM playlists WHERE id = ?1",
-                params![playlist_id],
-                |row| row.get(0),
-            )?;
-            // A list that only follows the default leaves the song as its folder or the user set it.
-            if exposure == "follow" {
-                return Ok(());
-            }
-            let exposed = self.resolve_exposure(&exposure)?;
-            self.conn.execute(
-                "UPDATE local_files SET exposed = ?1 WHERE local_file_id = ?2",
-                params![exposed, local_file_id],
-            )?;
-        }
         Ok(())
     }
 
@@ -759,42 +556,6 @@ impl Db {
                 params![playlist_id, local_file_id],
             )?;
         }
-        Ok(())
-    }
-
-    pub fn set_playlist_exposure(&self, id: &str, exposure: &str) -> AppResult<()> {
-        self.conn.execute(
-            "UPDATE playlists SET exposure = ?1 WHERE id = ?2",
-            params![exposure, id],
-        )?;
-        Ok(())
-    }
-
-    pub fn expose_playlist_members(&self, id: &str, expose: bool) -> AppResult<()> {
-        let ids = self.playlist_local_ids(id)?;
-        for local_file_id in ids {
-            self.conn.execute(
-                "UPDATE local_files SET exposed = ?1 WHERE local_file_id = ?2",
-                params![expose, local_file_id],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn playlist_local_ids(&self, id: &str) -> AppResult<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT local_file_id FROM playlist_tracks
-             WHERE playlist_id = ?1 AND local_file_id IS NOT NULL",
-        )?;
-        let rows = stmt.query_map(params![id], |row| row.get(0))?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    pub fn set_track_exposure(&self, local_file_id: &str, expose: bool) -> AppResult<()> {
-        self.conn.execute(
-            "UPDATE local_files SET exposed = ?1 WHERE local_file_id = ?2",
-            params![expose, local_file_id],
-        )?;
         Ok(())
     }
 
@@ -1301,10 +1062,6 @@ impl Db {
         self.delete_peer_holdings(device_id)?;
         self.conn
             .execute("DELETE FROM peers WHERE device_id = ?1", params![device_id])?;
-        self.conn.execute(
-            "DELETE FROM peer_list_prefs WHERE device_id = ?1",
-            params![device_id],
-        )?;
         Ok(())
     }
 
@@ -1422,12 +1179,6 @@ impl Db {
     }
 
     pub fn notices(&self) -> AppResult<Vec<NoticeRow>> {
-        // Block, unblock, and decline are local actions. Drop any already stored, and the conflict
-        // notices that automatic sync used to leave.
-        self.conn.execute(
-            "DELETE FROM notices WHERE kind IN ('blocked', 'unblocked', 'declined', 'conflict') OR (kind = 'disconnected' AND detail = 'incognito') OR (kind = 'sync' AND detail = 'queue')",
-            [],
-        )?;
         let mut stmt = self.conn.prepare(
             "SELECT id, at, kind, device_id, name, detail, read, pinned FROM notices ORDER BY pinned DESC, id DESC",
         )?;
@@ -1561,7 +1312,6 @@ fn device_defaults() -> Vec<(&'static str, Value)> {
         ("historyCap", json!(100)),
         ("historyPaused", json!(false)),
         ("incognito", json!(false)),
-        ("exposeDefault", json!("hide")),
         ("downloadFolder", json!("")),
         ("volume", json!(1.0)),
         ("window", json!({})),
@@ -1574,7 +1324,6 @@ fn device_defaults() -> Vec<(&'static str, Value)> {
         ("miniTray", json!(true)),
         ("silenceSeconds", json!(60)),
         ("overwritePolicy", json!({"favorites": "silent", "appearance": "silent"})),
-        ("syncRequestDevice", json!("")),
         ("downloadHistory", json!([])),
         ("noticeRead", json!("visible")),
         ("noticeClear", json!("ask")),
@@ -1600,8 +1349,7 @@ CREATE TABLE IF NOT EXISTS content_items (
 CREATE TABLE IF NOT EXISTS grants (
     id INTEGER PRIMARY KEY,
     kind TEXT NOT NULL,
-    path TEXT NOT NULL UNIQUE,
-    exposure TEXT NOT NULL DEFAULT 'follow'
+    path TEXT NOT NULL UNIQUE
 );
 CREATE TABLE IF NOT EXISTS local_files (
     local_file_id TEXT PRIMARY KEY,
@@ -1616,7 +1364,6 @@ CREATE TABLE IF NOT EXISTS local_files (
     access_reason TEXT,
     playback_status TEXT NOT NULL,
     playback_reason TEXT,
-    exposed INTEGER NOT NULL,
     added_at TEXT NOT NULL,
     mtime_ms INTEGER,
     size_bytes INTEGER,
@@ -1632,6 +1379,8 @@ CREATE TABLE IF NOT EXISTS local_files (
     video INTEGER NOT NULL DEFAULT 0,
     cover_path TEXT,
     cover_checked INTEGER NOT NULL DEFAULT 0,
+    -- Time and size of the `.lrc` next to the song, so a lyrics file added later is noticed.
+    lyrics_stamp TEXT,
     UNIQUE(grant_id, relative_path)
 );
 CREATE TABLE IF NOT EXISTS favorites (
@@ -1673,7 +1422,6 @@ CREATE TABLE IF NOT EXISTS playlists (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     position INTEGER NOT NULL,
-    exposure TEXT NOT NULL DEFAULT 'follow',
     revision INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS playlist_tracks (
@@ -1696,10 +1444,6 @@ CREATE TABLE IF NOT EXISTS device_settings (
 CREATE TABLE IF NOT EXISTS synced_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS peer_list_prefs (
-    device_id TEXT PRIMARY KEY,
-    exposure TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS peers (
     device_id TEXT PRIMARY KEY,
@@ -1724,7 +1468,9 @@ CREATE TABLE IF NOT EXISTS notices (
     kind TEXT NOT NULL,
     device_id TEXT NOT NULL,
     name TEXT NOT NULL,
-    detail TEXT NOT NULL
+    detail TEXT NOT NULL,
+    read INTEGER NOT NULL DEFAULT 1,
+    pinned INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS device_identity (
     key TEXT PRIMARY KEY,
@@ -1742,6 +1488,13 @@ CREATE TABLE IF NOT EXISTS library_order (
     track_key TEXT PRIMARY KEY,
     position INTEGER NOT NULL
 );
+-- Lookups by song and by file. Without these, large libraries scan whole tables on every listing.
+CREATE INDEX IF NOT EXISTS local_files_content ON local_files(content_id);
+CREATE INDEX IF NOT EXISTS holdings_content ON holdings(content_id);
+CREATE INDEX IF NOT EXISTS play_history_content ON play_history(content_id);
+CREATE INDEX IF NOT EXISTS play_history_file ON play_history(local_file_id);
+CREATE INDEX IF NOT EXISTS playlist_tracks_content ON playlist_tracks(content_id);
+CREATE INDEX IF NOT EXISTS playlist_tracks_file ON playlist_tracks(local_file_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS library_fts USING fts5(
     local_file_id,
     content_id,
@@ -1818,44 +1571,9 @@ mod tests {
     }
 
     #[test]
-    fn the_old_safety_number_column_is_dropped_and_pairings_kept() {
-        let (db, dir) = open_db("safety-number");
-        db.conn.execute_batch(
-            "DROP TABLE peers;
-             CREATE TABLE peers (device_id TEXT PRIMARY KEY, public_key BLOB NOT NULL, cert_id TEXT NOT NULL,
-               display_name TEXT NOT NULL, safety_number TEXT NOT NULL, trust TEXT NOT NULL DEFAULT 'full');
-             INSERT INTO peers VALUES ('dev', x'01', '', 'Old', '', 'full');",
-        ).unwrap();
-        drop(db);
-        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
-        let mut stmt = db.conn.prepare("PRAGMA table_info(peers)").unwrap();
-        let names = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-        assert!(!names.iter().any(|name| name == "safety_number"));
-        drop(stmt);
-        let peers = db.peers().unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].display_name, "Old");
-        drop(db);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn removals_stay_local_and_older_shared_removal_columns_are_dropped() {
+    fn removals_are_kept_until_ended() {
         let (db, dir) = open_db("removals");
-        db.conn.execute_batch(
-            "DROP TABLE removed_devices;
-             CREATE TABLE removed_devices (device_id TEXT PRIMARY KEY, name TEXT NOT NULL, removed_at INTEGER NOT NULL, removed_by TEXT NOT NULL);
-             INSERT INTO removed_devices VALUES ('gone', 'Laptop', 5, 'someone');
-             ALTER TABLE peers ADD COLUMN paired_at INTEGER NOT NULL DEFAULT 0;",
-        ).unwrap();
-        drop(db);
-        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
-        let columns = |table: &str| -> Vec<String> {
-            let mut stmt = db.conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
-            stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
-        };
-        assert!(!columns("removed_devices").contains(&"removed_by".to_string()));
-        assert!(!columns("peers").contains(&"paired_at".to_string()));
+        db.record_removal("gone", "Laptop", 5).unwrap();
         assert!(db.is_removed("gone"));
         db.record_removal("gone", "Laptop", 9).unwrap();
         db.record_removal("other", "Tower", 7).unwrap();
@@ -1869,71 +1587,15 @@ mod tests {
     }
 
     #[test]
-    fn automatic_sync_settings_and_conflict_notices_are_dropped() {
-        let (db, dir) = open_db("auto-sync");
-        for key in ["dirty", "pendingSnapshots", "syncSources", "syncBlocks", "autoSend", "conflictPolicy", "historySync", "historyStartup"] {
-            db.set_device_setting(key, json!({"favorites": true})).unwrap();
-        }
-        db.add_notice("conflict", "peer", "Laptop", "favorites:peer").unwrap();
-        db.add_notice("sync", "peer", "Laptop", "favorites").unwrap();
-        drop(db);
-        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
-        let settings = db.device_settings_map().unwrap();
-        for key in ["dirty", "pendingSnapshots", "syncSources", "syncBlocks", "autoSend", "conflictPolicy", "historySync", "historyStartup"] {
-            assert!(settings.get(key).is_none(), "{key} is still stored");
-        }
-        assert!(settings.get("overwritePolicy").is_some());
-        let kinds: Vec<String> = db.notices().unwrap().into_iter().map(|row| row.kind).collect();
-        assert_eq!(kinds, vec!["sync".to_string()]);
-        drop(db);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_saved_lan_port_is_dropped() {
-        let (db, dir) = open_db("listen-port");
-        assert!(db.device_settings_map().unwrap().get("listenPort").is_none());
-        db.set_device_setting("listenPort", json!(22000)).unwrap();
-        drop(db);
-        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
-        assert!(db.device_settings_map().unwrap().get("listenPort").is_none());
-        drop(db);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn the_old_overwrite_mode_becomes_one_choice_per_feature() {
-        let (db, dir) = open_db("overwrite-mode");
+    fn overwrite_choices_are_kept_per_feature() {
+        let (db, dir) = open_db("overwrite-policy");
         assert_eq!(db.overwrite_policy("favorites"), "silent");
-        db.set_device_setting("overwriteMode", json!("ask")).unwrap();
-        drop(db);
-        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
-        assert_eq!(db.overwrite_policy("favorites"), "ask");
-        assert_eq!(db.overwrite_policy("appearance"), "ask");
-        assert!(db.device_settings_map().unwrap().get("overwriteMode").is_none());
-        db.set_device_setting("overwritePolicy", json!({"favorites": "deny", "appearance": "silent"})).unwrap();
+        db.set_device_setting("overwritePolicy", json!({"favorites": "deny", "appearance": "ask"})).unwrap();
         drop(db);
         let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
         assert_eq!(db.overwrite_policy("favorites"), "deny");
-        assert_eq!(db.overwrite_policy("appearance"), "silent");
+        assert_eq!(db.overwrite_policy("appearance"), "ask");
         drop(db);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_plain_library_is_encrypted_on_first_open() {
-        let dir = std::env::temp_dir().join(format!("tunepeerly-db-plain-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("library.db");
-        let plain = Connection::open(&file).unwrap();
-        plain.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE device_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO device_settings VALUES ('marker', 'kept');").unwrap();
-        drop(plain);
-        assert!(std::fs::read(&file).unwrap().starts_with(b"SQLite format 3\0"));
-        let db = Db::open(&file, dir.clone(), dir.join("cache")).unwrap();
-        assert_eq!(marker(&db).as_deref(), Some("kept"));
-        drop(db);
-        assert!(!std::fs::read(&file).unwrap().starts_with(b"SQLite format 3\0"));
-        assert!(!dir.join("library.db.encrypting").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1973,19 +1635,10 @@ mod tests {
     }
 
     #[test]
-    fn opening_twice_keeps_removed_settings_away_and_indexes_in_place() {
-        let (db, dir) = open_db("migrate");
+    fn opening_twice_keeps_the_indexes_in_place() {
+        let (db, dir) = open_db("reopen");
         drop(db);
         let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
-        let legacy: i64 = db
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM device_settings WHERE key IN ('historySyncMode', 'syncEnabled', 'audioShare', 'positionSync', 'positionSyncDevice')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(legacy, 0);
         let indexes: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'holdings_content'", [], |row| row.get(0))

@@ -145,17 +145,6 @@ export function SettingsPage() {
         <Row title={t("settings.showUnavailable")} help={t("settings.showUnavailableHelp")}>
           <Switch label={t("settings.showUnavailable")} checked={settings.showUnavailable !== false} onChange={(value) => set("showUnavailable", value)} />
         </Row>
-        <Row title={t("settings.exposeDefault")} help={t("settings.exposeDefaultHelp")}>
-          <Select
-            label={t("settings.exposeDefault")}
-            value={settings.exposeDefault === "expose" ? "expose" : "hide"}
-            onChange={(value) => set("exposeDefault", value)}
-            options={[
-              { value: "hide", label: t("exposure.hideDefault"), hint: t("exposure.hideDefaultHint") },
-              { value: "expose", label: t("exposure.exposeDefault"), hint: t("exposure.exposeDefaultHint") },
-            ]}
-          />
-        </Row>
         <Row title={t("settings.problems")} help={t("settings.problemsHelp")}>
           <button type="button" className="btn soft" onClick={() => app.navigate({ name: "problems" })}>
             {problems > 0 && <span className="count-badge">{problems}</span>}
@@ -183,14 +172,6 @@ export function SettingsPage() {
         <h2>{t("settings.sync")}<Revise /></h2>
         <p className="setting-help">{t("settings.syncHelp")}</p>
         <p className="setting-help">{t("settings.overwritePolicyHelp")}</p>
-        <Row title={t("settings.requestDevice")} help={t("settings.requestDeviceHelp")}>
-          <Select
-            label={t("settings.requestDevice")}
-            value={String(settings.syncRequestDevice ?? "")}
-            onChange={(value) => set("syncRequestDevice", value)}
-            options={[{ value: "", label: t("sync.requestNone") }, ...boot.links.map((link) => ({ value: link.deviceId, label: link.name || link.deviceId }))]}
-          />
-        </Row>
         {FEATURES.map((feature) => {
           const policy = settings.overwritePolicy?.[feature];
           return (
@@ -290,7 +271,7 @@ export function SettingsPage() {
         <Row title={t("devices.name")} help={t("devices.nameHelp")}>
           <CommitInput key={nameEpoch} label={t("devices.name")} value={boot.deviceName} width={260} onCommit={rename} />
         </Row>
-        <Row title={<span className="setting-title-line">{t("settings.lanPort")}<Revise /></span>} help={t("settings.lanPortHelp")}>
+        <Row title={t("settings.lanPort")} help={t("settings.lanPortHelp")}>
           <code className="mono small selectable" data-testid="lan-port">{net?.tcpPort || "—"}</code>
         </Row>
         <Row title={t("settings.discoveryUdp")}>
@@ -302,7 +283,7 @@ export function SettingsPage() {
         <Row title={t("settings.lanAddresses")} help={t("settings.lanAddressesHelp")}>
           <code className="mono small selectable" data-testid="lan-addresses">{net?.discovery && net.addresses.length > 0 ? net.addresses.join(", ") : "—"}</code>
         </Row>
-        <Row title={<span className="setting-title-line">{t("settings.deviceId")}<Revise /></span>}>
+        <Row title={t("settings.deviceId")}>
           <code className="mono small selectable">{boot.certId}</code>
         </Row>
       </section>
@@ -391,25 +372,9 @@ function GrantRow({ grant }: { grant: Grant }) {
           {grant.path}
         </div>
         <div className="setting-help">
-          {grant.kind === "directory" ? t("list.songCount", { count }) : t("settings.singleFile")} · {t("settings.exposeNowHelp")}
+          {grant.kind === "directory" ? t("list.songCount", { count }) : t("settings.singleFile")}
         </div>
       </div>
-      <Select
-        label={t("playlist.exposureDefault")}
-        value={grant.exposure}
-        onChange={(value) => void api.setExposure("grant", String(grant.id), value).then(refresh).catch(app.say)}
-        options={[
-          { value: "follow", label: t("exposure.follow"), hint: t("exposure.followHint") },
-          { value: "expose", label: t("exposure.expose"), hint: t("exposure.exposeHint") },
-          { value: "hide", label: t("exposure.hide"), hint: t("exposure.hideHint") },
-        ]}
-      />
-      <button type="button" className="icon-btn" title={`${t("exposure.exposeAll")}: ${t("exposure.exposeAllHint")}`} aria-label={t("exposure.exposeAll")} onClick={() => void api.exposeMembers("grant", String(grant.id), true).then(() => { app.toast(t("toast.exposed")); refresh(); }).catch(app.say)}>
-        <Icons.eye />
-      </button>
-      <button type="button" className="icon-btn" title={`${t("exposure.hideAll")}: ${t("exposure.hideAllHint")}`} aria-label={t("exposure.hideAll")} onClick={() => void api.exposeMembers("grant", String(grant.id), false).then(() => { app.toast(t("toast.hidden")); refresh(); }).catch(app.say)}>
-        <Icons.eyeOff />
-      </button>
       <button
         type="button"
         className="icon-btn danger"

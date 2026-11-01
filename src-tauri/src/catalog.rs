@@ -19,7 +19,6 @@ struct LocalRow {
     folder: String,
     file_name: String,
     added_at: String,
-    exposed: bool,
     access_status: String,
     metadata_status: String,
     playback_status: String,
@@ -111,7 +110,6 @@ pub fn library(db: &Db, online: &[String]) -> AppResult<Value> {
             file_name: String::new(),
             added_at: String::new(),
             favorite: favorite_content.contains(&holding.content_id),
-            exposed: false,
             badge: badge.into(),
             access_status: "missing".into(),
             metadata_status: "ready".into(),
@@ -167,7 +165,6 @@ fn stub_from_local(cached: &CoverCache, row: &LocalRow, holders: &[String], badg
         file_name: row.file_name.clone(),
         added_at: row.added_at.clone(),
         favorite: row.favorite,
-        exposed: row.exposed,
         badge: badge.into(),
         access_status: row.access_status.clone(),
         metadata_status: row.metadata_status.clone(),
@@ -261,7 +258,7 @@ fn load_holdings(db: &Db) -> AppResult<Vec<HoldingRow>> {
 fn load_local(db: &Db) -> AppResult<Vec<LocalRow>> {
     let mut stmt = db.conn.prepare(
         "SELECT f.local_file_id, f.content_id, f.title, f.artist, f.album, f.track_number, f.duration_ms,
-                f.absolute_path, f.file_name, f.added_at, f.exposed, f.access_status, f.metadata_status,
+                f.absolute_path, f.file_name, f.added_at, f.access_status, f.metadata_status,
                 f.playback_status, f.playback_reason, f.access_reason, f.video, f.cover_path,
                 EXISTS(SELECT 1 FROM favorites fav WHERE fav.local_file_id = f.local_file_id OR (f.content_id IS NOT NULL AND fav.content_id = f.content_id)),
                 COALESCE((SELECT c.unplayable FROM content_items c WHERE c.content_id = f.content_id), 0)
@@ -284,17 +281,16 @@ fn load_local(db: &Db) -> AppResult<Vec<LocalRow>> {
             absolute_path: absolute,
             file_name: row.get(8)?,
             added_at: row.get(9)?,
-            exposed: row.get::<_, i64>(10)? != 0,
-            access_status: row.get(11)?,
-            metadata_status: row.get(12)?,
-            playback_status: row.get(13)?,
-            playback_reason: row.get(14)?,
-            access_reason: row.get(15)?,
-            video: row.get::<_, i64>(16)? != 0,
-            cover_path: row.get(17)?,
-            favorite: row.get::<_, i64>(18)? != 0,
+            access_status: row.get(10)?,
+            metadata_status: row.get(11)?,
+            playback_status: row.get(12)?,
+            playback_reason: row.get(13)?,
+            access_reason: row.get(14)?,
+            video: row.get::<_, i64>(15)? != 0,
+            cover_path: row.get(16)?,
+            favorite: row.get::<_, i64>(17)? != 0,
             folder,
-            unplayable: row.get::<_, i64>(19)? != 0,
+            unplayable: row.get::<_, i64>(18)? != 0,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -311,7 +307,7 @@ pub fn local_publishable(db: &Db) -> AppResult<Vec<crate::db::HoldingInput>> {
                 CASE WHEN metadata_status = 'failed' THEN '' ELSE album END,
                 track_number, duration_ms, codec, file_name
          FROM local_files
-         WHERE exposed = 1 AND access_status = 'available' AND content_id IS NOT NULL AND video = 0",
+         WHERE access_status = 'available' AND content_id IS NOT NULL AND video = 0",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(crate::db::HoldingInput {
@@ -342,7 +338,7 @@ fn blank_if_filename(title: String, file_name: String) -> String {
 pub fn readable_paths(db: &Db, content_id: &str) -> AppResult<Vec<(String, String)>> {
     let mut stmt = db.conn.prepare(
         "SELECT local_file_id, absolute_path FROM local_files
-         WHERE content_id = ?1 AND exposed = 1 AND access_status = 'available'",
+         WHERE content_id = ?1 AND access_status = 'available'",
     )?;
     let rows = stmt.query_map(params![content_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -395,11 +391,11 @@ pub fn search(db: &Db, query: &str, online: &[String]) -> AppResult<Value> {
     Ok(json!(out))
 }
 
-/// Cover pictures of exposed, readable local copies of this content.
+/// Cover pictures of readable local copies of this content.
 pub fn cover_paths(db: &Db, content_id: &str) -> AppResult<Vec<(String, String)>> {
     let mut stmt = db.conn.prepare(
         "SELECT local_file_id, cover_path FROM local_files
-         WHERE content_id = ?1 AND exposed = 1 AND access_status = 'available' AND cover_path IS NOT NULL",
+         WHERE content_id = ?1 AND access_status = 'available' AND cover_path IS NOT NULL",
     )?;
     let rows = stmt.query_map(params![content_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -409,7 +405,7 @@ pub fn cover_paths(db: &Db, content_id: &str) -> AppResult<Vec<(String, String)>
 pub fn cover_pending(db: &Db, content_id: &str) -> bool {
     db.conn
         .query_row(
-            "SELECT COUNT(*) FROM local_files WHERE content_id = ?1 AND exposed = 1 AND cover_checked = 0",
+            "SELECT COUNT(*) FROM local_files WHERE content_id = ?1 AND cover_checked = 0",
             params![content_id],
             |row| row.get::<_, i64>(0),
         )
