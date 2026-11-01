@@ -17,7 +17,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::catalog::{local_publishable, readable_paths};
 use crate::media::{self, AudioBus, AudioPiece, Pull};
-use crate::db::{merge_history_into_db, Db, HoldingInput};
+use crate::db::{Db, HoldingInput};
 use crate::error::{AppError, AppResult};
 use crate::frames::{self, Frame};
 use crate::identity::{self, IdentityMaterial};
@@ -57,7 +57,21 @@ pub(crate) struct OverwriteAsk {
     feature: String,
     items: Value,
     shown: Option<Instant>,
+    /// The sender's id for this Send, so the answer can go back to it. Older senders have none.
+    send_id: Option<String>,
 }
+
+/// A Send from this computer that is waiting for one device's result.
+pub(crate) struct SendWait {
+    device_id: String,
+    feature: String,
+    deadline: Instant,
+}
+
+/// How long a device has to report what it did with a Send. A device that is asking its user
+/// reports that first, and then has until the question times out on its side.
+const SEND_RESULT_WINDOW: Duration = Duration::from_secs(15);
+const SEND_ASK_WINDOW: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -175,22 +189,25 @@ pub struct LiveInner {
     pub overwrite_waiting: VecDeque<OverwriteAsk>,
     pub overwrite_shown: Vec<OverwriteAsk>,
     pub overwrite_next: u64,
-    /// Devices we asked for Recently Played during the one startup merge.
-    pub history_asked: HashSet<String>,
-    pub history_waiting: HashSet<String>,
-    pub history_deadline: Option<Instant>,
-    pub history_done: bool,
+    /// Recently Played asked of one connected device for viewing, and when the answer stops counting.
+    pub history_view: Option<(String, Instant)>,
     /// Copies this computer asked for with "sync-request", keyed by device and feature, until the deadline.
     /// Only these replies may skip the overwrite question.
     pub sync_requests: HashMap<String, Instant>,
     /// Sync requests this computer answered recently, keyed like `sync_requests`.
     pub sync_replies: HashMap<String, Instant>,
+    /// Sends from this computer waiting for results, keyed like `sync_requests` with the send id.
+    pub send_waits: HashMap<String, SendWait>,
 }
+
+/// How long a device has to answer when its Recently Played is opened here.
+const HISTORY_REPLY_WINDOW: Duration = Duration::from_secs(8);
 
 pub enum Cmd {
     Apply,
     Publish,
-    AutoSync(String),
+    /// Show a connected device's Recently Played here. Read-only: it is never stored or merged.
+    ViewHistory(String),
     Pair { device_id: String, host: Option<String> },
     /// Approves a saved Ask-each-time device, or sends the typed code to the device that shows it.
     Confirm { device_id: String, trust: String, code: String },
@@ -201,9 +218,9 @@ pub enum Cmd {
     ClearNotices,
     Notice { action: String, id: i64, ids: Vec<i64> },
     Remove(String),
-    Sync { feature: String, refresh: bool },
+    /// Sends this computer's copy. `target` None means every connected device.
+    Sync { feature: String, target: Option<String> },
     RequestSync { feature: String, device_id: String },
-    Resolve { feature: String, take: bool },
     Download(String),
     Activity { playing: bool, local_file_id: Option<String>, buffer_enough: bool },
     CloseRoutes,
@@ -309,8 +326,9 @@ async fn run(
     loop {
         tokio::select! {
             _ = overwrite_tick.tick() => {
-                expire_overwrites(&app, &db, &live);
-                tick_history_startup(&db, &peers, &live);
+                expire_overwrites(&app, &db, &live, &peers);
+                expire_send_waits(&app, &db, &live, &peers);
+                tick_history_view(&app, &peers, &live);
                 let ticked = tick_pairing(&live, &mut peers, Instant::now());
                 if drop_stale_unpaired(&db, &live, &mut peers) || ticked {
                     publish(&app, &db, &live, &peers);
@@ -342,8 +360,8 @@ async fn run(
                     Cmd::Publish => {
                         publish_holdings(&db, &peers, &mut published_holdings);
                     }
-                    Cmd::AutoSync(feature) => {
-                        auto_sync(&db, &material, &peers, &feature);
+                    Cmd::ViewHistory(device_id) => {
+                        view_history(&app, &db, &peers, &live, &device_id);
                     }
                     Cmd::Pair { device_id, host } => {
                         if let Ok(mut guard) = live.inner.lock() {
@@ -474,14 +492,11 @@ async fn run(
                         pending.remove(&device_id);
                         publish(&app, &db, &live, &peers);
                     }
-                    Cmd::Sync { feature, refresh } => {
-                        send_sync(&db, &material, &peers, &feature, refresh);
+                    Cmd::Sync { feature, target } => {
+                        send_sync(&app, &db, &peers, &live, &feature, target.as_deref());
                     }
                     Cmd::RequestSync { feature, device_id } => {
                         request_sync(&db, &peers, &live, &feature, &device_id);
-                    }
-                    Cmd::Resolve { feature, take } => {
-                        resolve_pending(&app, &db, &feature, take);
                     }
                     Cmd::Download(content_id) => {
                         start_download(&app, &db, &peers, &live, &bus, &tx, content_id).await;
@@ -514,7 +529,7 @@ async fn run(
                         publish(&app, &db, &live, &peers);
                     }
                     Cmd::ResolveOverwrite { id, accept } => {
-                        resolve_overwrite(&app, &db, &live, id, accept);
+                        resolve_overwrite(&app, &db, &live, &peers, id, accept);
                     }
                 }
             }
@@ -576,7 +591,7 @@ async fn run(
                                 guard.held.insert(device_id.clone());
                             }
                         } else {
-                            handle_frame(&app, &db, &material, &mut peers, &live, &bus, &mut pending_holdings, &mut published_holdings, &device_id, frame);
+                            handle_frame(&app, &db, &mut peers, &live, &bus, &mut pending_holdings, &mut published_holdings, &device_id, frame);
                             let wanted: Vec<String> = live
                                 .inner
                                 .lock()
@@ -752,8 +767,7 @@ fn dial_gate(device_id: &str) -> bool {
 fn switches(db: &Db) -> (bool, bool, bool, bool) {
     let incognito = db.setting_bool("incognito").unwrap_or(false);
     let discovery = db.setting_bool("discovery").unwrap_or(false);
-    // Sync and audio stay available. Exposure decides which songs leave this computer,
-    // and Auto send decides which of your edits are pushed out.
+    // Sync and audio stay available. Exposure decides which songs leave this computer.
     (incognito, discovery, true, true)
 }
 
@@ -1696,7 +1710,7 @@ fn short_id(device_id: &str) -> String {
 }
 
 /// Paired devices are listed even while offline. Unconfirmed connections show as pending.
-fn enqueue_overwrite(live: &Live, device_id: &str, name: &str, feature: &str, items: Value) -> bool {
+fn enqueue_overwrite(live: &Live, device_id: &str, name: &str, feature: &str, items: Value, send_id: Option<String>) -> bool {
     let Ok(mut guard) = live.inner.lock() else { return false };
     if guard.overwrite_waiting.len() + guard.overwrite_shown.len() >= 20 {
         return false;
@@ -1710,6 +1724,7 @@ fn enqueue_overwrite(live: &Live, device_id: &str, name: &str, feature: &str, it
         feature: feature.to_string(),
         items,
         shown: None,
+        send_id,
     });
     promote_overwrites(&mut guard);
     true
@@ -1733,7 +1748,7 @@ fn emit_overwrite_asks(app: &AppHandle, live: &Live) {
     let _ = app.emit("overwrite-asks", json!(rows));
 }
 
-fn expire_overwrites(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live) {
+fn expire_overwrites(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, peers: &HashMap<String, PeerOut>) {
     let expired = {
         let Ok(mut guard) = live.inner.lock() else { return };
         if guard.overwrite_shown.is_empty() && guard.overwrite_waiting.is_empty() {
@@ -1757,7 +1772,11 @@ fn expire_overwrites(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live) {
     if let Ok(guard) = db.lock() {
         for ask in &expired {
             let _ = guard.add_notice("overwrite", &ask.device_id, &ask.name, &format!("{}:timeout", ask.feature));
+            eprintln!("sync {} from {}: no answer, not changed", ask.feature, short_id(&ask.device_id));
         }
+    }
+    for ask in &expired {
+        send_result(peers, &ask.device_id, &ask.feature, ask.send_id.as_deref(), "timeout", None);
     }
     if !expired.is_empty() {
         let _ = app.emit("network-updated", json!({}));
@@ -1765,7 +1784,7 @@ fn expire_overwrites(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live) {
     emit_overwrite_asks(app, live);
 }
 
-fn resolve_overwrite(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, id: u64, accept: bool) {
+fn resolve_overwrite(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, peers: &HashMap<String, PeerOut>, id: u64, accept: bool) {
     let ask = {
         let Ok(mut guard) = live.inner.lock() else { return };
         let Some(index) = guard.overwrite_shown.iter().position(|ask| ask.id == id) else { return };
@@ -1773,17 +1792,21 @@ fn resolve_overwrite(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, id: u64,
         promote_overwrites(&mut guard);
         ask
     };
+    let mut applied = false;
     if let Ok(guard) = db.lock() {
         let accept = accept && !guard.is_blocked(&ask.device_id).unwrap_or(true);
         if accept {
             apply_snapshot_payload(&guard, &ask.feature, &ask.items);
             sync_appearance_window(app, &guard, &ask.feature);
-            let _ = guard.mark_dirty(&ask.feature, false);
             let _ = guard.add_notice("sync", &ask.device_id, &ask.name, &ask.feature);
+            applied = true;
         } else {
             let _ = guard.add_notice("overwrite", &ask.device_id, &ask.name, &format!("{}:cancel", ask.feature));
         }
     }
+    let status = if applied { "applied" } else { "declined" };
+    eprintln!("sync {} from {}: {status}", ask.feature, short_id(&ask.device_id));
+    send_result(peers, &ask.device_id, &ask.feature, ask.send_id.as_deref(), status, None);
     let _ = app.emit("library-updated", json!({}));
     let _ = app.emit("network-updated", json!({}));
     emit_overwrite_asks(app, live);
@@ -2373,11 +2396,23 @@ fn lan_interface(name: &str, ip: Ipv4Addr) -> bool {
 mod lan_tests {
     use super::{
         accept_holdings_part, accept_snapshot_part, clean_name, download_name, is_cover_image, history_part_messages, holdings_messages, lan_interface,
-        port_setting, HoldingsBuild, HISTORY_PARTS_KEY, HOLDINGS_PART_BYTES, SNAPSHOT_PART_BYTES,
+        port_setting, snapshot_part_messages, HoldingsBuild, HISTORY_PARTS_KEY, HOLDINGS_PART_BYTES, SNAPSHOT_PART_BYTES,
     };
     use crate::db::HoldingInput;
     use serde_json::{json, Value};
     use std::collections::HashMap;
+
+    #[test]
+    fn copies_sent_by_hand_are_marked_manual_in_every_part() {
+        let rows: Vec<Value> = (0..200).map(|index| json!({"contentId": format!("c{index}"), "name": "x".repeat(400)})).collect();
+        let parts = snapshot_part_messages("favorites", &Value::Array(rows));
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|part| part["manual"] == json!(true) && part["kind"] == "snapshot"));
+        assert!(parts.iter().all(|part| serde_json::to_vec(part).unwrap().len() < SNAPSHOT_PART_BYTES + 1024));
+        let single = snapshot_part_messages("appearance", &json!({"theme": "dark"}));
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0]["manual"], json!(true));
+    }
 
     #[test]
     fn download_names_are_safe_windows_file_names() {
@@ -2846,7 +2881,6 @@ async fn join_invited(
 fn handle_frame(
     app: &AppHandle,
     db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
     peers: &mut HashMap<String, PeerOut>,
     live: &Live,
     bus: &AudioBus,
@@ -2871,13 +2905,12 @@ fn handle_frame(
             // TLS already proved which paired device sent this: the one on the other end of this connection.
             let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { return };
             if value.get("kind").and_then(Value::as_str) == Some("hello") {
-                accept_hello(db, material, peers, published_holdings, device_id, &value);
+                accept_hello(db, peers, published_holdings, device_id, &value);
                 publish(app, db, live, peers);
             } else if !reply_sync_request(db, peers, live, device_id, &value)
                 && !reply_history_request(db, peers, device_id, &value)
             {
-                note_history_reply(live, device_id, &value);
-                apply_message(app, db, live, pending_holdings, device_id, &value);
+                apply_message(app, db, peers, live, pending_holdings, device_id, &value);
             }
         }
         Frame::AudioReq { id, content_id, start, end } => {
@@ -3136,6 +3169,7 @@ fn finish_audio_request(live: &Live, id: u64, was_serving: bool) {
 fn apply_message(
     app: &AppHandle,
     db: &Arc<Mutex<Db>>,
+    peers: &HashMap<String, PeerOut>,
     live: &Live,
     pending_holdings: &mut HashMap<String, HoldingsBuild>,
     device_id: &str,
@@ -3159,9 +3193,21 @@ fn apply_message(
                 }
             }
         }
-        "history" => {
-            // Apply only when this computer has recently-played sync on. Equal timestamps keep one copy.
-            if !data_sync_open(&guard) || !guard.setting_bool("historySync").unwrap_or(false) {
+        "history" | "history-denied" => {
+            // Only an answer to the Recently Played this computer is viewing counts. Anything else, such
+            // as the automatic lists older versions send after each song or on connect, is ignored.
+            // The list is shown, never stored here.
+            let asked = live.inner.lock().ok().is_some_and(|state| {
+                state.history_view.as_ref().is_some_and(|(id, deadline)| id == device_id && Instant::now() < *deadline)
+            });
+            drop(guard);
+            if !asked {
+                return;
+            }
+            if kind == "history-denied" {
+                eprintln!("history from {}: refused", short_id(device_id));
+                end_history_view(live, device_id);
+                let _ = app.emit("remote-history", json!({"deviceId": device_id, "error": "denied"}));
                 return;
             }
             // Long histories arrive in parts, like snapshots. Older senders send one message without parts.
@@ -3178,15 +3224,17 @@ fn apply_message(
                 };
                 done
             };
-            let entries = entries.as_array().cloned().unwrap_or_default();
-            let parsed = entries.iter().filter_map(|item| {
-                let content_id = item.get("contentId")?.as_str()?.to_string();
-                let at = chrono::DateTime::parse_from_rfc3339(item.get("at")?.as_str()?).ok()?;
-                Some(HistoryEntry { content_id, at: at.with_timezone(&chrono::Utc) })
-            }).collect::<Vec<_>>();
-            eprintln!("history from {}: {} entries", short_id(device_id), parsed.len());
-            let _ = merge_history_into_db(&guard, parsed);
-            let _ = app.emit("library-updated", json!({}));
+            let parsed = parse_history(&entries);
+            eprintln!("history from {}: showing {} entries", short_id(device_id), parsed.len());
+            end_history_view(live, device_id);
+            let rows: Vec<Value> = parsed.iter().map(|entry| json!({"contentId": entry.content_id, "at": entry.at.to_rfc3339()})).collect();
+            let _ = app.emit("remote-history", json!({"deviceId": device_id, "entries": rows}));
+            return;
+        }
+        "sync-result" => {
+            drop(guard);
+            take_send_result(app, db, live, device_id, value);
+            return;
         }
         "sync-denied" => {
             let feature = value.get("feature").and_then(|item| item.as_str()).unwrap_or("");
@@ -3198,13 +3246,27 @@ fn apply_message(
         }
         "snapshot" => {
             if !data_sync_open(&guard) {
+                // Incognito takes nothing in. A Send is told so once its last part arrives.
+                let last = value.get("part").and_then(|item| item.as_u64()).unwrap_or(0) + 1 >= value.get("parts").and_then(|item| item.as_u64()).unwrap_or(1);
+                let requested = value.get("requested").and_then(|item| item.as_bool()).unwrap_or(false);
+                if last && !requested {
+                    let feature = value.get("feature").and_then(|item| item.as_str()).unwrap_or("");
+                    let send_id = value.get("sendId").and_then(|item| item.as_str()).filter(|id| id.len() <= 64);
+                    if crate::db::FEATURES.contains(&feature) {
+                        send_result(peers, device_id, feature, send_id, "rejected", Some("incognito"));
+                    }
+                }
                 return;
             }
             let feature = value.get("feature").and_then(|item| item.as_str()).unwrap_or("").to_string();
             if !crate::db::FEATURES.contains(&feature.as_str()) {
                 return;
             }
-            let manual = value.get("manual").and_then(|item| item.as_bool()).unwrap_or(false);
+            // Only copies someone sent on purpose apply: Send, or a reply to Override. Older versions also
+            // send automatic copies ("manual": false) after each edit and on connect; those are ignored.
+            if value.get("manual").and_then(|item| item.as_bool()) != Some(true) {
+                return;
+            }
             let part = value.get("part").and_then(|item| item.as_u64()).unwrap_or(0) as usize;
             let part_count = value.get("parts").and_then(|item| item.as_u64()).unwrap_or(1) as usize;
             let piece = value.get("items").cloned().unwrap_or(json!([]));
@@ -3221,55 +3283,36 @@ fn apply_message(
             // A reply counts as requested only when this computer really asked that device for this feature.
             let requested = value.get("requested").and_then(|item| item.as_bool()).unwrap_or(false)
                 && live.inner.lock().map(|mut state| take_sync_request(&mut state, device_id, &feature)).unwrap_or(false);
-            if manual && !requested && guard.overwrite_mode().unwrap_or_else(|_| "silent".into()) == "ask" {
-                let name = guard.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id).map(|peer| peer.display_name).unwrap_or_default();
+            // Override asked for here always applies. A Send from another device follows this
+            // computer's choice for the feature, and the sender is told what happened.
+            let send_id = value.get("sendId").and_then(|item| item.as_str()).filter(|id| id.len() <= 64).map(str::to_string);
+            let policy = if requested { "silent" } else { guard.overwrite_policy(&feature) };
+            let name = guard.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id).map(|peer| peer.display_name).unwrap_or_default();
+            if policy == "deny" {
                 drop(guard);
-                if enqueue_overwrite(&live, device_id, &name, &feature, items) {
-                    emit_overwrite_asks(app, &live);
+                eprintln!("sync {feature} from {}: not allowed here", short_id(device_id));
+                send_result(peers, device_id, &feature, send_id.as_deref(), "rejected", Some("disabled"));
+                return;
+            }
+            if policy == "ask" {
+                drop(guard);
+                if enqueue_overwrite(live, device_id, &name, &feature, items, send_id.clone()) {
+                    eprintln!("sync {feature} from {}: asking", short_id(device_id));
+                    send_result(peers, device_id, &feature, send_id.as_deref(), "pending", None);
+                    emit_overwrite_asks(app, live);
+                } else {
+                    eprintln!("sync {feature} from {}: too many questions waiting", short_id(device_id));
+                    send_result(peers, device_id, &feature, send_id.as_deref(), "rejected", Some("busy"));
                 }
                 return;
             }
-            if !manual {
-                let blocks = guard.block_flags(&feature).unwrap_or(crate::db::BlockFlags { manual: false, source: false, all: false });
-                let source = guard.sync_source(&feature).unwrap_or(None);
-                if blocks.source || blocks.all || source.as_deref() != Some(device_id) {
-                    return;
-                }
-                if guard.is_dirty(&feature).unwrap_or(false) {
-                    let policy = guard.setting_string("conflictPolicy").unwrap_or_else(|_| "ask".into());
-                    let name = guard.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id).map(|peer| peer.display_name).unwrap_or_default();
-                    if policy == "keep" {
-                        let _ = guard.add_notice("conflict", device_id, &name, &format!("{feature}:keep"));
-                        return;
-                    }
-                    if policy == "take" {
-                        apply_snapshot_payload(&guard, &feature, &items);
-                        sync_appearance_window(app, &guard, &feature);
-                        let _ = guard.mark_dirty(&feature, false);
-                        let _ = guard.add_notice("conflict", device_id, &name, &format!("{feature}:take"));
-                        drop(guard);
-                        let _ = app.emit("library-updated", json!({}));
-                        return;
-                    }
-                    let mut waiting = guard.setting_json("pendingSnapshots").unwrap_or(json!({}));
-                    if !waiting.is_object() {
-                        waiting = json!({});
-                    }
-                    waiting[&feature] = json!({"source": device_id, "items": items});
-                    let _ = guard.set_device_setting("pendingSnapshots", waiting);
-                    let _ = guard.add_notice("conflict", device_id, &name, &format!("{feature}:ask"));
-                    drop(guard);
-                    let _ = app.emit("network-updated", json!({}));
-                    return;
-                }
-            }
             apply_snapshot_payload(&guard, &feature, &items);
             sync_appearance_window(app, &guard, &feature);
-            let _ = guard.mark_dirty(&feature, false);
-            clear_pending(&guard, &feature);
-            let name = guard.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id).map(|peer| peer.display_name).unwrap_or_default();
             let _ = guard.add_notice("sync", device_id, &name, &feature);
             eprintln!("sync {feature} from {}: applied", short_id(device_id));
+            if !requested {
+                send_result(peers, device_id, &feature, send_id.as_deref(), "applied", None);
+            }
         }
         // Messages this version does not know change nothing, so the library is not reloaded. This
         // includes the device-control messages ("connect-*") that older versions still send.
@@ -3289,16 +3332,17 @@ pub(crate) struct SnapshotBuild {
     slots: Vec<Option<Value>>,
 }
 
-fn snapshot_part_messages(feature: &str, manual: bool, items: &Value) -> Vec<Value> {
+/// One copy sent on purpose. `"manual": true` is what receivers, old and new, apply.
+fn snapshot_part_messages(feature: &str, items: &Value) -> Vec<Value> {
     let Some(rows) = items.as_array() else {
-        return vec![json!({"kind": "snapshot", "feature": feature, "manual": manual, "part": 0, "parts": 1, "items": items})];
+        return vec![json!({"kind": "snapshot", "feature": feature, "manual": true, "part": 0, "parts": 1, "items": items})];
     };
     let groups = part_groups(rows);
     let count = groups.len();
     groups
         .into_iter()
         .enumerate()
-        .map(|(index, rows)| json!({"kind": "snapshot", "feature": feature, "manual": manual, "part": index, "parts": count, "items": rows}))
+        .map(|(index, rows)| json!({"kind": "snapshot", "feature": feature, "manual": true, "part": index, "parts": count, "items": rows}))
         .collect()
 }
 
@@ -3333,26 +3377,6 @@ fn part_groups(rows: &[Value]) -> Vec<Vec<Value>> {
         groups.push(current);
     }
     groups
-}
-
-fn expand_sync_body(body: Value) -> Vec<Value> {
-    if body.get("kind").and_then(|item| item.as_str()) == Some("history") {
-        let entries = body.get("entries").cloned().unwrap_or(json!([]));
-        return history_part_messages(&entries);
-    }
-    if body.get("kind").and_then(|item| item.as_str()) != Some("snapshot") {
-        return vec![body];
-    }
-    let feature = body.get("feature").and_then(|item| item.as_str()).unwrap_or("");
-    let manual = body.get("manual").and_then(|item| item.as_bool()).unwrap_or(false);
-    let items = body.get("items").cloned().unwrap_or(json!([]));
-    snapshot_part_messages(feature, manual, &items)
-}
-
-fn deliver_sync(peers: &HashMap<String, PeerOut>, bodies: Vec<Value>) {
-    for body in &bodies {
-        broadcast(peers, body);
-    }
 }
 
 fn accept_snapshot_part(
@@ -3465,15 +3489,13 @@ fn reply_sync_request(
     }
     let answer = {
         let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
-        // No manual and Stop all only stop this computer from pushing or following.
-        // A device that asked for this copy still receives it.
         if !data_sync_open(&guard) {
             eprintln!("sync {feature}: refused a request from {}", short_id(device_id));
             vec![json!({"kind": "sync-denied", "feature": feature})]
         } else {
             let items = snapshot_items(&guard, &feature);
             let count = items.as_array().map(|rows| rows.len()).unwrap_or(1);
-            let mut parts = snapshot_part_messages(&feature, true, &items);
+            let mut parts = snapshot_part_messages(&feature, &items);
             for part in &mut parts {
                 if let Some(object) = part.as_object_mut() {
                     object.insert("requested".into(), json!(true));
@@ -3489,16 +3511,8 @@ fn reply_sync_request(
     true
 }
 
-fn note_history_reply(live: &Live, device_id: &str, value: &Value) {
-    if value.get("kind").and_then(|item| item.as_str()) != Some("history") {
-        return;
-    }
-    if let Ok(mut guard) = live.inner.lock() {
-        guard.history_waiting.remove(device_id);
-    }
-}
-
-/// A startup request for this computer's play history. Sync off means no reply and no notice.
+/// Another device opened this computer's Recently Played: send the list back to it only.
+/// Incognito answers with a refusal so it does not wait.
 fn reply_history_request(
     db: &Arc<Mutex<Db>>,
     peers: &HashMap<String, PeerOut>,
@@ -3508,165 +3522,231 @@ fn reply_history_request(
     if value.get("kind").and_then(|item| item.as_str()) != Some("history-request") {
         return false;
     }
-    let Some(body) = db.lock().ok().and_then(|guard| history_message(&guard)) else { return true };
-    for part in expand_sync_body(body) {
-        send_message(peers, device_id, &part);
+    let parts = {
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+        if !data_sync_open(&guard) {
+            eprintln!("history: refused a request from {}", short_id(device_id));
+            vec![json!({"kind": "history-denied"})]
+        } else {
+            let entries = history_entries(&guard);
+            eprintln!("history: sending {} entries to {}", entries.as_array().map(Vec::len).unwrap_or(0), short_id(device_id));
+            history_part_messages(&entries)
+        }
+    };
+    for part in &parts {
+        send_message(peers, device_id, part);
     }
     true
 }
 
-/// Once, after this computer comes online: merge every synced device's history, then send the result.
-fn tick_history_startup(db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, live: &Live) {
-    let enabled = db.lock().map(|guard| {
-        data_sync_open(&guard) && guard.setting_bool("historySync").unwrap_or(false) && guard.setting_bool("historyStartup").unwrap_or(false)
-    }).unwrap_or(false);
-    let online: Vec<String> = peers.iter().filter(|(_, peer)| peer.ready).map(|(id, _)| id.clone()).collect();
-    let (ask, send) = {
-        let Ok(mut guard) = live.inner.lock() else { return };
-        if guard.history_done || !enabled || online.is_empty() {
-            return;
-        }
-        if guard.history_deadline.is_none() {
-            guard.history_deadline = Some(Instant::now() + Duration::from_secs(8));
-        }
-        let ask: Vec<String> = online.iter().filter(|id| guard.history_asked.insert((*id).clone())).cloned().collect();
-        for id in &ask {
-            guard.history_waiting.insert(id.clone());
-        }
-        let due = guard.history_deadline.is_some_and(|deadline| Instant::now() >= deadline)
-            || (!guard.history_asked.is_empty() && guard.history_waiting.is_empty());
-        let send = due && ask.is_empty();
-        if send {
-            guard.history_done = true;
-            guard.history_waiting.clear();
-        }
-        (ask, send)
-    };
-    for id in &ask {
-        send_message(peers, id, &json!({"kind": "history-request"}));
-    }
-    if send {
-        if let Some(body) = db.lock().ok().and_then(|guard| history_message(&guard)) {
-            deliver_sync(peers, expand_sync_body(body));
-        }
-    }
-}
-
-fn history_message(db: &Db) -> Option<Value> {
-    if !data_sync_open(db) || !db.setting_bool("historySync").unwrap_or(false) {
-        return None;
-    }
-    let entries = db
-        .history_for_sync()
-        .ok()?
-        .into_iter()
-        .map(|entry| json!({"contentId": entry.content_id, "at": entry.at.to_rfc3339()}))
-        .collect::<Vec<_>>();
-    Some(json!({"kind": "history", "entries": entries}))
-}
-
-fn send_sync(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    peers: &HashMap<String, PeerOut>,
-    feature: &str,
-    refresh: bool,
-) {
-    if feature == "history" {
-        let Some(body) = db.lock().ok().and_then(|guard| history_message(&guard)) else { return };
-        deliver_sync(peers, expand_sync_body(body));
+/// Opens a connected device's Recently Played here: ask it once and show the answer as it is.
+fn view_history(app: &AppHandle, db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, live: &Live, device_id: &str) {
+    let open = db.lock().map(|guard| data_sync_open(&guard)).unwrap_or(false);
+    if !open || !peers.get(device_id).is_some_and(|peer| peer.ready) {
+        eprintln!("history: {} is not connected", short_id(device_id));
+        let _ = app.emit("remote-history", json!({"deviceId": device_id, "error": "offline"}));
         return;
     }
+    if let Ok(mut state) = live.inner.lock() {
+        state.history_view = Some((device_id.to_string(), Instant::now() + HISTORY_REPLY_WINDOW));
+        state.pending_snapshots.retain(|key, _| !key.ends_with(HISTORY_PARTS_KEY));
+    }
+    eprintln!("history: asking {} for its list", short_id(device_id));
+    send_message(peers, device_id, &json!({"kind": "history-request"}));
+}
+
+fn end_history_view(live: &Live, device_id: &str) {
+    if let Ok(mut state) = live.inner.lock() {
+        if state.history_view.as_ref().is_some_and(|(id, _)| id == device_id) {
+            state.history_view = None;
+        }
+    }
+}
+
+/// A device that does not answer in time, or disconnects first, ends the request.
+fn tick_history_view(app: &AppHandle, peers: &HashMap<String, PeerOut>, live: &Live) {
+    let late = live.inner.lock().ok().and_then(|mut state| {
+        let (id, deadline) = state.history_view.as_ref()?;
+        let offline = !peers.get(id).is_some_and(|peer| peer.ready);
+        if !offline && Instant::now() < *deadline {
+            return None;
+        }
+        let id = id.clone();
+        state.history_view = None;
+        Some((id, if offline { "offline" } else { "timeout" }))
+    });
+    if let Some((id, error)) = late {
+        eprintln!("history: no answer from {} ({error})", short_id(&id));
+        let _ = app.emit("remote-history", json!({"deviceId": id, "error": error}));
+    }
+}
+
+fn history_entries(db: &Db) -> Value {
+    json!(db
+        .history_for_sync()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| json!({"contentId": entry.content_id, "at": entry.at.to_rfc3339()}))
+        .collect::<Vec<_>>())
+}
+
+fn parse_history(entries: &Value) -> Vec<HistoryEntry> {
+    entries
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|item| {
+                    let content_id = item.get("contentId")?.as_str()?.to_string();
+                    let at = chrono::DateTime::parse_from_rfc3339(item.get("at")?.as_str()?).ok()?;
+                    Some(HistoryEntry { content_id, at: at.with_timezone(&chrono::Utc) })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Send: this computer's copy goes to one connected device, or to every connected device when
+/// `target` is None. The receiver applies it at once or asks first, as its overwrite setting says.
+fn send_sync(app: &AppHandle, db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, live: &Live, feature: &str, target: Option<&str>) {
+    if !crate::db::FEATURES.contains(&feature) {
+        return;
+    }
+    let mut to: Vec<(&String, &PeerOut)> = match target {
+        Some(device_id) => peers.get_key_value(device_id).filter(|(_, peer)| peer.ready).into_iter().collect(),
+        None => peers.iter().filter(|(_, peer)| peer.ready).collect(),
+    };
+    to.sort_by(|left, right| left.0.cmp(right.0));
+    if to.is_empty() {
+        match target {
+            Some(device_id) => eprintln!("sync {feature}: not sent, {} is not connected", short_id(device_id)),
+            None => eprintln!("sync {feature}: not sent, no device is connected"),
+        }
+        return;
+    }
+    let send_id = uuid::Uuid::new_v4().simple().to_string();
     let bodies = {
         let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
         if !data_sync_open(&guard) {
             eprintln!("sync {feature}: not sent, sync is off");
             return;
         }
-        let blocks = guard.block_flags(feature).unwrap_or(crate::db::BlockFlags { manual: false, source: false, all: false });
-        if blocks.manual || blocks.all {
-            eprintln!("sync {feature}: not sent, manual sync is blocked");
-            return;
-        }
-        if let Some(source) = guard.sync_source(feature).unwrap_or(None)
-            && source != material.device_id && !refresh
-        {
-            return;
-        }
-        // Unsent changes stay marked when no paired device is connected to receive them.
-        if peers.values().all(|peer| !peer.ready) {
-            eprintln!("sync {feature}: not sent, no device is connected");
-            return;
-        }
         let items = snapshot_items(&guard, feature);
         let count = items.as_array().map(|rows| rows.len()).unwrap_or(1);
-        let _ = guard.mark_dirty(feature, false);
-        eprintln!("sync {feature}: sending {count} item(s)");
-        snapshot_part_messages(feature, true, &items)
+        match target {
+            Some(device_id) => eprintln!("sync {feature}: sending {count} item(s) to {}", short_id(device_id)),
+            None => eprintln!("sync {feature}: sending {count} item(s) to {} device(s)", to.len()),
+        }
+        let mut parts = snapshot_part_messages(feature, &items);
+        for part in &mut parts {
+            if let Some(object) = part.as_object_mut() {
+                object.insert("sendId".into(), json!(send_id));
+            }
+        }
+        parts
     };
-    deliver_sync(peers, bodies);
-}
-
-/// A device that is its own sync source sends each local change. History in time-merge mode sends the trimmed list.
-fn auto_sync(db: &Arc<Mutex<Db>>, material: &IdentityMaterial, peers: &HashMap<String, PeerOut>, feature: &str) {
-    if peers.values().all(|peer| !peer.ready) {
-        return;
-    }
-    let Some(body) = db.lock().ok().and_then(|guard| auto_body(&guard, &material.device_id, feature)) else { return };
-    deliver_sync(peers, expand_sync_body(body));
-}
-
-fn auto_body(db: &Db, self_id: &str, feature: &str) -> Option<Value> {
-    if !data_sync_open(db) {
-        return None;
-    }
-    if feature == "history" {
-        return history_message(db);
-    }
-    // Auto send pushes this computer's edit out. It does not pull anyone else's copy.
-    let auto = db.setting_json("autoSend").unwrap_or(json!({}));
-    if auto.get(feature).and_then(|value| value.as_bool()) != Some(true) {
-        return None;
-    }
-    let blocks = db.block_flags(feature).ok()?;
-    if blocks.all {
-        return None;
-    }
-    // An empty source is the "This computer" row: this device publishes.
-    // A different device id means this computer is following that device.
-    match db.sync_source(feature) {
-        Ok(Some(id)) if id != self_id => return None,
-        Ok(_) => {}
-        Err(_) => return None,
-    }
-    let items = snapshot_items(db, feature);
-    let _ = db.mark_dirty(feature, false);
-    Some(json!({"kind": "snapshot", "feature": feature, "manual": false, "items": items}))
-}
-
-fn clear_pending(db: &Db, feature: &str) {
-    let mut waiting = db.setting_json("pendingSnapshots").unwrap_or(json!({}));
-    if let Some(map) = waiting.as_object_mut() {
-        if map.remove(feature).is_some() {
-            let _ = db.set_device_setting("pendingSnapshots", waiting);
+    if let Ok(mut state) = live.inner.lock() {
+        let deadline = Instant::now() + SEND_RESULT_WINDOW;
+        for (device_id, _) in &to {
+            state.send_waits.insert(
+                send_wait_key(device_id, &send_id),
+                SendWait { device_id: (*device_id).clone(), feature: feature.to_string(), deadline },
+            );
         }
     }
+    for (_, peer) in &to {
+        for body in &bodies {
+            send_json(peer, body);
+        }
+    }
+    let _ = app.emit("sync-sent", json!({"feature": feature, "count": to.len()}));
 }
 
-/// The follower chose between its unsynced local copy and the source's snapshot.
-fn resolve_pending(app: &AppHandle, db: &Arc<Mutex<Db>>, feature: &str, take: bool) {
-    let Ok(guard) = db.lock() else { return };
-    let waiting = guard.setting_json("pendingSnapshots").unwrap_or(json!({}));
-    let Some(item) = waiting.get(feature).cloned() else { return };
-    if take {
-        let items = item.get("items").cloned().unwrap_or(json!([]));
-        apply_snapshot_payload(&guard, feature, &items);
-        sync_appearance_window(app, &guard, feature);
-        let _ = guard.mark_dirty(feature, false);
+fn send_wait_key(device_id: &str, send_id: &str) -> String {
+    format!("{device_id}\0{send_id}")
+}
+
+/// Tells the device that pressed Send what happened to its copy here. Older senders have no send id
+/// and expect nothing back.
+fn send_result(peers: &HashMap<String, PeerOut>, device_id: &str, feature: &str, send_id: Option<&str>, status: &str, reason: Option<&str>) {
+    let Some(send_id) = send_id else { return };
+    send_message(peers, device_id, &json!({"kind": "sync-result", "feature": feature, "sendId": send_id, "status": status, "reason": reason}));
+}
+
+fn peer_name(db: &Db, device_id: &str) -> String {
+    db.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id).map(|peer| peer.display_name).unwrap_or_default()
+}
+
+/// A device answered one of our Sends. Only a Send this computer made to that device counts.
+fn take_send_result(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, device_id: &str, value: &Value) {
+    let send_id = value.get("sendId").and_then(|item| item.as_str()).unwrap_or("");
+    let status = value.get("status").and_then(|item| item.as_str()).unwrap_or("");
+    if !matches!(status, "applied" | "pending" | "rejected" | "declined" | "timeout") {
+        return;
     }
-    clear_pending(&guard, feature);
-    drop(guard);
-    let _ = app.emit("library-updated", json!({}));
+    let key = send_wait_key(device_id, send_id);
+    let feature = {
+        let Ok(mut state) = live.inner.lock() else { return };
+        if status == "pending" {
+            let Some(wait) = state.send_waits.get_mut(&key) else { return };
+            wait.deadline = Instant::now() + SEND_ASK_WINDOW;
+            wait.feature.clone()
+        } else {
+            let Some(wait) = state.send_waits.remove(&key) else { return };
+            wait.feature
+        }
+    };
+    let reason = value.get("reason").and_then(|item| item.as_str()).filter(|text| matches!(*text, "disabled" | "busy" | "incognito"));
+    let name = db.lock().map(|guard| {
+        if status != "pending" {
+            let outcome = match (status, reason) {
+                ("rejected", Some("incognito")) => "inIncognito",
+                ("rejected", Some(reason)) => reason,
+                ("rejected", None) => "disabled",
+                _ => status,
+            };
+            let _ = guard.add_notice("sendResult", device_id, &peer_name(&guard, device_id), &format!("{feature}:{outcome}"));
+        }
+        peer_name(&guard, device_id)
+    }).unwrap_or_default();
+    eprintln!("sync {feature} to {}: {status}{}", short_id(device_id), reason.map(|text| format!(" ({text})")).unwrap_or_default());
+    let _ = app.emit("sync-result", json!({"deviceId": device_id, "name": name, "feature": feature, "status": status, "reason": reason}));
+    let _ = app.emit("network-updated", json!({}));
+}
+
+/// A device that never reports back (an older version, or it disconnected) is shown as no response.
+fn expire_send_waits(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, peers: &HashMap<String, PeerOut>) {
+    let now = Instant::now();
+    let late: Vec<(String, String, &'static str)> = {
+        let Ok(mut state) = live.inner.lock() else { return };
+        if state.send_waits.is_empty() {
+            return;
+        }
+        let mut late = Vec::new();
+        state.send_waits.retain(|_, wait| {
+            let offline = !peers.get(&wait.device_id).is_some_and(|peer| peer.ready);
+            if offline || now >= wait.deadline {
+                late.push((wait.device_id.clone(), wait.feature.clone(), if offline { "offline" } else { "noResponse" }));
+                return false;
+            }
+            true
+        });
+        late
+    };
+    let names: Vec<String> = db.lock().map(|guard| {
+        late.iter().map(|(id, feature, status)| {
+            let name = peer_name(&guard, id);
+            let _ = guard.add_notice("sendResult", id, &name, &format!("{feature}:{status}"));
+            name
+        }).collect()
+    }).unwrap_or_default();
+    for (index, (device_id, feature, status)) in late.iter().enumerate() {
+        eprintln!("sync {feature} to {}: {status}", short_id(device_id));
+        let name = names.get(index).cloned().unwrap_or_default();
+        let _ = app.emit("sync-result", json!({"deviceId": device_id, "name": name, "feature": feature, "status": status}));
+    }
+    if !late.is_empty() {
+        let _ = app.emit("network-updated", json!({}));
+    }
 }
 
 /// Sends one message to a paired device that has said hello on its current connection.
@@ -3705,7 +3785,6 @@ fn say_hello(db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, device_id: &
 /// nothing changed here.
 fn accept_hello(
     db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
     peers: &mut HashMap<String, PeerOut>,
     published_holdings: &mut String,
     device_id: &str,
@@ -3730,11 +3809,8 @@ fn accept_hello(
             let revision = guard.our_holdings_revision().unwrap_or(0).max(1);
             bodies.extend(holdings_messages(revision, &rows));
         }
-        for feature in crate::db::FEATURES {
-            if let Some(body) = auto_body(&guard, &material.device_id, feature) {
-                bodies.extend(expand_sync_body(body));
-            }
-        }
+        // Favorites and appearance only move when someone presses Send or Override, and Recently
+        // Played only when another device opens it, so nothing else goes out on connect.
         bodies
     }).unwrap_or_default();
     for body in catch_up {
@@ -3756,12 +3832,6 @@ fn snapshot_items(db: &Db, feature: &str) -> Value {
             "miniTray": db.mini_flags().1,
             "closeAction": db.setting_string("closeAction").unwrap_or_default(),
         }),
-        "history" => json!(db
-            .history_for_sync()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|entry| json!({"contentId": entry.content_id, "at": entry.at.to_rfc3339()}))
-            .collect::<Vec<_>>()),
         _ => json!([]),
     }
 }
@@ -3776,21 +3846,6 @@ fn sync_appearance_window(app: &AppHandle, db: &Db, feature: &str) {
 
 fn apply_snapshot_payload(db: &Db, feature: &str, items: &Value) {
     match feature {
-        "history" => {
-            let entries = items
-                .as_array()
-                .map(|rows| {
-                    rows.iter()
-                        .filter_map(|item| {
-                            let content_id = item.get("contentId")?.as_str()?.to_string();
-                            let at = chrono::DateTime::parse_from_rfc3339(item.get("at")?.as_str()?).ok()?;
-                            Some(HistoryEntry { content_id, at: at.with_timezone(&chrono::Utc) })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let _ = merge_history_into_db(db, entries);
-        }
         "favorites" => {
             let ids = items.as_array().map(|rows| rows.iter().filter_map(|item| item.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
             let existing = db.content_member_refs("favorites", None).unwrap_or_default();

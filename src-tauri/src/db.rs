@@ -11,12 +11,12 @@ use uuid::Uuid;
 
 use crate::dbkey::{self, KEY_LEN};
 use crate::error::{AppError, AppResult};
-use crate::sync_logic::{merge_history, HistoryEntry, MemberRef};
+use crate::sync_logic::{HistoryEntry, MemberRef};
 
-pub const FEATURES: [&str; 3] = [
+/// What Send and Override copy between devices. Recently Played has its own Refresh.
+pub const FEATURES: [&str; 2] = [
     "favorites",
     "appearance",
-    "history",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,7 +255,8 @@ impl Db {
                 params![key, value],
             )?;
         }
-        self.drop_queue_sync()?;
+        self.drop_auto_sync()?;
+        self.split_overwrite_mode()?;
         let name = self.setting_string("displayName")?;
         if name.is_empty() {
             let host = whoami::fallible::hostname().unwrap_or_else(|_| "This computer".into());
@@ -279,23 +280,27 @@ impl Db {
         Ok(())
     }
 
-    /// The play queue stays on this computer. Drop leftovers from when it was synced.
-    fn drop_queue_sync(&self) -> AppResult<()> {
-        for key in ["dirty", "pendingSnapshots", "syncSources", "syncBlocks"] {
-            let mut map = self.setting_json(key)?;
-            let Some(object) = map.as_object_mut() else { continue };
-            let mut changed = object.remove("queue").is_some();
-            if key == "syncBlocks" {
-                for value in object.values_mut() {
-                    if value.as_object_mut().is_some_and(|flags| flags.remove("timestamp").is_some()) {
-                        changed = true;
-                    }
-                }
-            }
-            if changed {
-                self.set_device_setting(key, map)?;
-            }
-        }
+    /// Favorites and appearance sync only by hand now, and Recently Played only by Refresh. Drop the
+    /// settings that automatic sync left behind.
+    fn drop_auto_sync(&self) -> AppResult<()> {
+        self.conn.execute(
+            "DELETE FROM device_settings WHERE key IN ('dirty', 'pendingSnapshots', 'syncSources', 'syncBlocks', 'autoSend', 'conflictPolicy', 'historySync', 'historyStartup')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// The single "overwriteMode" (silent or ask) became one choice per feature. Carry the old choice over.
+    fn split_overwrite_mode(&self) -> AppResult<()> {
+        let old: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM device_settings WHERE key = 'overwriteMode'", [], |row| row.get(0))
+            .optional()?;
+        let Some(old) = old else { return Ok(()) };
+        let mode = if serde_json::from_str::<Value>(&old).ok().and_then(|value| value.as_str().map(str::to_string)).as_deref() == Some("ask") { "ask" } else { "silent" };
+        let policy: serde_json::Map<String, Value> = FEATURES.iter().map(|feature| (feature.to_string(), json!(mode))).collect();
+        self.set_device_setting("overwritePolicy", Value::Object(policy))?;
+        self.conn.execute("DELETE FROM device_settings WHERE key = 'overwriteMode'", [])?;
         Ok(())
     }
 
@@ -527,42 +532,6 @@ impl Db {
             params![local_file_id],
         )?;
         Ok(())
-    }
-
-    pub fn mark_dirty(&self, feature: &str, dirty: bool) -> AppResult<()> {
-        let mut map = self.setting_json("dirty")?;
-        if !map.is_object() {
-            map = json!({});
-        }
-        map[feature] = json!(dirty);
-        self.set_device_setting("dirty", map)
-    }
-
-    pub fn is_dirty(&self, feature: &str) -> AppResult<bool> {
-        Ok(self
-            .setting_json("dirty")?
-            .get(feature)
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false))
-    }
-
-    pub fn block_flags(&self, feature: &str) -> AppResult<BlockFlags> {
-        let all = self.setting_json("syncBlocks")?;
-        let item = all.get(feature).cloned().unwrap_or(json!({}));
-        Ok(BlockFlags {
-            manual: item.get("manual").and_then(|v| v.as_bool()).unwrap_or(false),
-            source: item.get("source").and_then(|v| v.as_bool()).unwrap_or(false),
-            all: item.get("all").and_then(|v| v.as_bool()).unwrap_or(false),
-        })
-    }
-
-    pub fn sync_source(&self, feature: &str) -> AppResult<Option<String>> {
-        let map = self.setting_json("syncSources")?;
-        Ok(map
-            .get(feature)
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string()))
     }
 
     pub fn exposure_for_new_folder_file(&self, grant_id: i64) -> AppResult<bool> {
@@ -1085,25 +1054,6 @@ impl Db {
         Ok(out)
     }
 
-    /// All or nothing: a failed write leaves the earlier history in place.
-    pub fn replace_synced_history(&self, entries: &[HistoryEntry]) -> AppResult<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM play_history WHERE content_id IS NOT NULL",
-            [],
-        )?;
-        {
-            let mut insert = tx.prepare(
-                "INSERT INTO play_history(content_id, local_file_id, played_at) VALUES(?1, NULL, ?2)",
-            )?;
-            for entry in entries {
-                insert.execute(params![entry.content_id, entry.at.to_rfc3339()])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn player_json(&self) -> AppResult<Value> {
         let text: Option<String> = self
             .conn
@@ -1347,15 +1297,6 @@ impl Db {
             "DELETE FROM peer_list_prefs WHERE device_id = ?1",
             params![device_id],
         )?;
-        let mut sources = self.setting_json("syncSources")?;
-        if let Some(map) = sources.as_object_mut() {
-            for value in map.values_mut() {
-                if value.as_str() == Some(device_id) {
-                    *value = Value::Null;
-                }
-            }
-        }
-        self.set_device_setting("syncSources", sources)?;
         Ok(())
     }
 
@@ -1404,10 +1345,15 @@ impl Db {
         Ok(())
     }
 
-    /// This computer's own policy for incoming manual overwrites: `silent` or `ask`.
-    pub fn overwrite_mode(&self) -> AppResult<String> {
-        let value = self.setting_json("overwriteMode")?;
-        Ok(if value.as_str() == Some("ask") { "ask" } else { "silent" }.into())
+    /// What this computer does when another device presses Send for `feature`: `silent` applies it,
+    /// `ask` asks first, `deny` refuses it. Override, asked for from here, is not affected.
+    pub fn overwrite_policy(&self, feature: &str) -> &'static str {
+        let value = self.setting_json("overwritePolicy").unwrap_or(Value::Null);
+        match value.get(feature).and_then(|item| item.as_str()) {
+            Some("ask") => "ask",
+            Some("deny") => "deny",
+            _ => "silent",
+        }
     }
 
     pub fn is_blocked(&self, device_id: &str) -> AppResult<bool> {
@@ -1468,9 +1414,10 @@ impl Db {
     }
 
     pub fn notices(&self) -> AppResult<Vec<NoticeRow>> {
-        // Block, unblock, and decline are local actions. Drop any already stored.
+        // Block, unblock, and decline are local actions. Drop any already stored, and the conflict
+        // notices that automatic sync used to leave.
         self.conn.execute(
-            "DELETE FROM notices WHERE kind IN ('blocked', 'unblocked', 'declined') OR (kind = 'disconnected' AND detail = 'incognito') OR (kind = 'sync' AND detail = 'queue') OR (kind = 'conflict' AND detail LIKE 'queue:%')",
+            "DELETE FROM notices WHERE kind IN ('blocked', 'unblocked', 'declined', 'conflict') OR (kind = 'disconnected' AND detail = 'incognito') OR (kind = 'sync' AND detail = 'queue')",
             [],
         )?;
         let mut stmt = self.conn.prepare(
@@ -1581,13 +1528,6 @@ pub struct HoldingInput {
     pub codec: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct BlockFlags {
-    pub manual: bool,
-    pub source: bool,
-    pub all: bool,
-}
-
 pub fn fts_query(query: &str) -> String {
     query
         .split_whitespace()
@@ -1611,12 +1551,8 @@ pub fn fts_query(query: &str) -> String {
 fn device_defaults() -> Vec<(&'static str, Value)> {
     vec![
         ("historyCap", json!(100)),
-        ("historySync", json!(false)),
-        ("historyStartup", json!(false)),
         ("historyPaused", json!(false)),
         ("incognito", json!(false)),
-        ("syncSources", json!({})),
-        ("dirty", json!({})),
         ("exposeDefault", json!("hide")),
         ("downloadFolder", json!("")),
         ("volume", json!(1.0)),
@@ -1624,22 +1560,18 @@ fn device_defaults() -> Vec<(&'static str, Value)> {
         ("relayHost", json!("")),
         ("relayPort", json!(22067)),
         ("relayDeviceId", json!("")),
-        ("autoSend", json!({})),
         ("displayName", json!("")),
         ("holdingsRevision", json!(0)),
-        ("pendingSnapshots", json!({})),
         ("closeAction", json!("")),
         ("miniTray", json!(true)),
         ("silenceSeconds", json!(60)),
-        ("conflictPolicy", json!("ask")),
-        ("overwriteMode", json!("silent")),
+        ("overwritePolicy", json!({"favorites": "silent", "appearance": "silent"})),
         ("listenPort", json!(0)),
         ("syncRequestDevice", json!("")),
         ("downloadHistory", json!([])),
         ("noticeRead", json!("visible")),
         ("noticeClear", json!("ask")),
         ("silenced", json!({})),
-        ("syncBlocks", json!({})),
     ]
 }
 
@@ -1834,14 +1766,6 @@ fn same_grant_path(left: &str, right: &str) -> bool {
     }
 }
 
-pub fn merge_history_into_db(db: &Db, remote: Vec<HistoryEntry>) -> AppResult<Vec<HistoryEntry>> {
-    let local = db.history_for_sync()?;
-    let cap = db.setting_i64("historyCap")?.max(1) as usize;
-    let merged = merge_history(local, remote, Utc::now(), cap);
-    db.replace_synced_history(&merged)?;
-    Ok(merged)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1933,6 +1857,46 @@ mod tests {
         db.end_removal("gone").unwrap();
         assert!(!db.is_removed("gone"));
         assert!(db.is_removed("other"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn automatic_sync_settings_and_conflict_notices_are_dropped() {
+        let (db, dir) = open_db("auto-sync");
+        for key in ["dirty", "pendingSnapshots", "syncSources", "syncBlocks", "autoSend", "conflictPolicy", "historySync", "historyStartup"] {
+            db.set_device_setting(key, json!({"favorites": true})).unwrap();
+        }
+        db.add_notice("conflict", "peer", "Laptop", "favorites:peer").unwrap();
+        db.add_notice("sync", "peer", "Laptop", "favorites").unwrap();
+        drop(db);
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
+        let settings = db.device_settings_map().unwrap();
+        for key in ["dirty", "pendingSnapshots", "syncSources", "syncBlocks", "autoSend", "conflictPolicy", "historySync", "historyStartup"] {
+            assert!(settings.get(key).is_none(), "{key} is still stored");
+        }
+        assert!(settings.get("overwritePolicy").is_some());
+        let kinds: Vec<String> = db.notices().unwrap().into_iter().map(|row| row.kind).collect();
+        assert_eq!(kinds, vec!["sync".to_string()]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_old_overwrite_mode_becomes_one_choice_per_feature() {
+        let (db, dir) = open_db("overwrite-mode");
+        assert_eq!(db.overwrite_policy("favorites"), "silent");
+        db.set_device_setting("overwriteMode", json!("ask")).unwrap();
+        drop(db);
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
+        assert_eq!(db.overwrite_policy("favorites"), "ask");
+        assert_eq!(db.overwrite_policy("appearance"), "ask");
+        assert!(db.device_settings_map().unwrap().get("overwriteMode").is_none());
+        db.set_device_setting("overwritePolicy", json!({"favorites": "deny", "appearance": "silent"})).unwrap();
+        drop(db);
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
+        assert_eq!(db.overwrite_policy("favorites"), "deny");
+        assert_eq!(db.overwrite_policy("appearance"), "silent");
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }

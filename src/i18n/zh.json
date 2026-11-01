@@ -299,9 +299,10 @@
     "rescanned": "音乐文件夹已扫描",
     "exposed": "已配对设备现在可以播放这些歌曲",
     "hidden": "这些歌曲已取消暴露",
-    "synced": "已发送到在线设备",
+    "synced": "已发给所有已连接设备，等待结果。",
     "requested": "已向 {{name}} 请求覆盖这台电脑的内容",
-    "syncDenied": "{{name}} 没有发来{{feature}}"
+    "syncDenied": "{{name}} 没有发来{{feature}}",
+    "sentTo": "已发给 {{name}}，等待结果。"
   },
   "notice": {
     "empty": "还没有通知。",
@@ -326,7 +327,6 @@
     "blocked": "已拉黑",
     "unblocked": "已取消拉黑",
     "sync": "收到了修改",
-    "conflict": "同步冲突",
     "overwrite": "覆写请求",
     "offlineTrack": "这首歌不在这台电脑上，现在也没有已配对的设备能播放。",
     "nothingPlayable": "这些歌曲都无法播放。",
@@ -337,14 +337,19 @@
       "full": "完全信任",
       "verify": "每次确认",
       "incognito": "打开了无痕模式",
-      "keep": "保留了这台电脑的副本",
-      "take": "采用了对方的副本",
-      "ask": "等待选择",
       "timeout": "一分钟内没有选择，没有覆写",
-      "cancel": "保留了这台电脑的副本"
+      "cancel": "已拒绝，没有更改",
+      "applied": "已更新",
+      "disabled": "不允许覆盖",
+      "busy": "待确认的请求太多",
+      "declined": "已拒绝",
+      "noResponse": "没有回复结果（超时）",
+      "offline": "回复前已断开",
+      "inIncognito": "处于无痕模式"
     },
     "removed": "已移除",
-    "removedYou": "移除了这台电脑"
+    "removedYou": "移除了这台电脑",
+    "sendResult": "发送结果"
   },
   "file": {
     "missing": "文件已不在磁盘上。",
@@ -404,8 +409,8 @@
     "trust": "信任",
     "trustFull": "完全信任",
     "trustVerify": "每次确认",
-    "overwriteSilent": "自动静默覆写",
-    "overwriteAsk": "确认后才覆写",
+    "overwriteSilent": "直接覆盖",
+    "overwriteAsk": "先询问",
     "disconnect": "断开",
     "block": "拉黑",
     "blockTitle": "拉黑 {{name}}？",
@@ -419,7 +424,8 @@
     "pasteHelp": "粘贴另一台电脑的配对文本。",
     "pastePlaceholder": "在此粘贴配对文本",
     "networkOff": "所有网络功能都已关闭，其他设备无法连到这台电脑。",
-    "incognitoOff": "已开启无痕模式，设备发现、同步和共享已暂停。"
+    "incognitoOff": "已开启无痕模式，设备发现、同步和共享已暂停。",
+    "overwriteDeny": "不允许"
   },
   "link": {
     "online": "在线",
@@ -473,13 +479,8 @@
   },
   "overwrite": {
     "body": "{{device}} 想用它的{{feature}}覆盖这台电脑。{{seconds}} 秒内不选择，就不会覆写。",
-    "keep": "保留我的",
-    "take": "采用对方的"
-  },
-  "conflict": {
-    "body": "{{device}} 上的{{feature}}有更新，而这台电脑上有尚未同步的修改。",
-    "keep": "保留本机",
-    "take": "改用来源"
+    "decline": "拒绝",
+    "accept": "接受"
   },
   "move": {
     "title": "这首歌的文件变了",
@@ -514,18 +515,6 @@
     "history": "最近播放"
   },
   "sync": {
-    "feature": "项目",
-    "source": "跟随",
-    "sourceHelp": "那台设备改了这项之后，自动获取它的副本。上面的“自动发送”是反方向：你的修改发出去。",
-    "everything": "全部功能",
-    "globalHelp": "套用到每一行，之后仍可单独修改",
-    "blockManual": "屏蔽手动",
-    "blockManualHelp": "这台不能用 Sync 或 Refresh 覆盖其他设备。其他设备发来的手动同步仍会应用到这台。",
-    "blockSource": "屏蔽跟随",
-    "blockSourceHelp": "不自动跟随指定设备，经中继连上时也不跟随。",
-    "blockAll": "全部屏蔽",
-    "blockAllHelp": "不再向外同步，也不再自动跟随。其他设备主动发来的手动同步仍可进入。",
-    "thisDevice": "这台电脑",
     "noneOnline": "没有在线的配对设备",
     "push": "同步给别人",
     "pull": "覆盖",
@@ -534,11 +523,10 @@
     "pullTitle": "用一台已连接设备上的{{feature}}覆盖这台电脑。",
     "requestNone": "未指定",
     "thatDevice": "那台设备",
-    "pushTitle": "把这台电脑的{{feature}}发给所有在线的配对设备。",
+    "pushTitle": "把这台电脑的{{feature}}发给一台已连接设备，或发给全部。",
     "pushIncognito": "无痕模式开着，不会发送。",
-    "pushBlocked": "设置里关掉了这项的手动同步。",
-    "dirty": "有尚未同步的修改",
-    "waiting": "等待选择"
+    "pushChoose": "发送到",
+    "pushAll": "所有已连接设备"
   },
   "settings": {
     "appearance": "外观",
@@ -578,10 +566,6 @@
     "revise": "待修改",
     "doNotUse": "不要使用",
     "notImplemented": "待完善且未测试",
-    "historySync": "同步最近播放",
-    "historySyncHelp": "一首歌播放完成后，这台电脑记下 UTC 时间并发送这次变化。另一台设备只有也打开了这个开关，才会按时间合并进来。两个时间完全一样时，随便排个先后。",
-    "historyStartup": "上线时合并",
-    "historyStartupHelp": "这台电脑上线后，向同样打开了同步的设备收集最近播放，按时间合并，再把结果发给所有设备。没打开同步的设备会静默忽略，不会记入通知。",
     "historyPause": "暂停记录",
     "historyPauseHelp": "这台电脑的最近播放不再记录播放完成的歌曲。",
     "incognito": "无痕模式",
@@ -589,11 +573,6 @@
     "silence": "拒绝后的静默时间",
     "silenceHelp": "拒绝配对请求后，对方在这段秒数内不能再发起连接。你仍然可以主动连接它。默认 60 秒。",
     "silenceInvalid": "请输入 1 到 86400 之间的秒数。",
-    "conflictPolicy": "同步发生冲突时",
-    "conflictPolicyHelp": "另一台设备发来修改，而这台电脑也有还没同步的修改时怎么处理。",
-    "conflictAsk": "每次询问",
-    "conflictKeep": "始终保留我的",
-    "conflictTake": "始终采用对方的",
     "notices": "通知",
     "noticeRead": "什么时候去掉未读标记",
     "noticeReadHelp": "铃铛上的数字是还没读的通知数量。",
@@ -607,8 +586,6 @@
     "noticeClearAll": "全部删除",
     "network": "网络",
     "networkIncognito": "已开启无痕模式。关闭后，发现附近设备、播放进度和中继会重新生效。",
-    "autoSend": "自动发送",
-    "autoSendHelp": "你在这台电脑上改了勾选的项目后，自动把这份内容发给所有在线的已配对设备。这不会把别人的修改拉过来。下面同步表里的“跟随”才是别人改了之后，自动获取到这台电脑。",
     "relay": "中继（strelaysrv）",
     "relayHelp": "通过你自己的中继连接不在同一网络的配对设备，四项都必须填写。",
     "relayHost": "中继地址",
@@ -617,7 +594,7 @@
     "relayIdHelp": "中继证书的标识，确保这台电脑只连接你的中继。",
     "relayToken": "中继 token",
     "sync": "同步",
-    "syncHelp": "发送会把这台电脑的副本推给在线设备。覆盖会用一台已连接设备替换这台电脑。表里的“跟随”会在那台设备之后再改时，自动获取它的副本。",
+    "syncHelp": "不会自动同步。发送会把这台电脑的副本发给一台已连接设备，或发给全部。覆盖会用一台已连接设备的副本替换这台电脑的。",
     "requestDevice": "默认从这台覆盖",
     "requestDeviceHelp": "覆盖时会标出这台设备。每次点击仍可以改选任何一台已经连接的设备。",
     "storage": "存储",
@@ -629,10 +606,10 @@
     "relayPortInvalid": "请输入 1 到 65535 之间的端口。",
     "deviceId": "设备标识",
     "about": "关于",
-    "overwriteMode": "他人覆盖本机时",
-    "overwriteModeHelp": "对任何已配对设备的“发送”生效。静默覆盖会直接接受,先询问会让你先确认。",
     "portBusy": "该端口已被占用,请换一个。",
-    "portFallback": "端口 {{saved}} 已被占用，当前暂时监听 {{port}}。保存的端口没有改，下次启动还会再试。"
+    "portFallback": "端口 {{saved}} 已被占用，当前暂时监听 {{port}}。保存的端口没有改，下次启动还会再试。",
+    "overwritePolicy": "其他设备发送{{feature}}时",
+    "overwritePolicyHelp": "每一项都可以选择其他已配对设备“发送”时怎么处理：直接覆盖、先询问或不允许。结果会告诉发送方。这台电脑自己发起的“覆盖”总是直接生效。"
   },
   "about": {
     "name": "声渡",
@@ -659,5 +636,27 @@
     "hoursMinutes": "{{hours}} 小时 {{minutes}} 分钟",
     "minutesSeconds": "{{minutes}} 分 {{seconds}} 秒",
     "seconds": "{{seconds}} 秒"
+  },
+  "recent": {
+    "source": "查看谁的最近播放",
+    "sourceHelp": "查看一台已连接设备的最近播放。只在这里显示，不会保存，也不会合并进这台电脑的列表。",
+    "thisDevice": "这台电脑",
+    "loading": "正在获取列表…",
+    "remoteEmpty": "那台设备还没有播放记录，或者其中的歌这里的曲库里都没有。",
+    "notHere_other": "{{count}} 首不在这里的曲库中",
+    "offline": "{{name}} 已断开，改为显示这台电脑。",
+    "noAnswer": "{{name}} 没有回应，改为显示这台电脑。",
+    "denied": "{{name}} 开着无痕模式，不分享列表，改为显示这台电脑。"
+  },
+  "syncResult": {
+    "applied": "{{name}} 已更新{{feature}}",
+    "pending": "{{name}} 正在询问是否覆盖{{feature}}",
+    "disabled": "{{name}} 不允许覆盖{{feature}}",
+    "busy": "{{name}} 待确认的请求太多，没有接收{{feature}}",
+    "declined": "{{name}} 拒绝了{{feature}}",
+    "timeout": "{{name}} 未响应（超时），{{feature}}没有改",
+    "noResponse": "{{name}} 没有回复结果（超时），可能是旧版本",
+    "offline": "{{name}} 在回复前断开了",
+    "incognito": "{{name}} 处于无痕模式，没有接收{{feature}}"
   }
 }

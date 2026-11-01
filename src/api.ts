@@ -65,20 +65,26 @@ export type Download = {
 export type DownloadQueueItem = { contentId: string; title: string };
 export type DownloadHistoryItem = { contentId: string; title: string; path: string; ok: boolean; at: string };
 export type DownloadFeed = { current: Download | null; queue: DownloadQueueItem[]; history: DownloadHistoryItem[] };
-export type Pending = { feature: Feature; source: string | null };
-export type Feature = "favorites" | "appearance" | "history";
-export type BlockFlags = { manual?: boolean; source?: boolean; all?: boolean };
+export type Feature = "favorites" | "appearance";
+export type OverwritePolicy = "silent" | "ask" | "deny";
+/** What one device did with a Send from this computer. `noResponse` and `offline` are decided here. */
+export type SyncResult = {
+  deviceId: string;
+  name: string;
+  feature: Feature;
+  status: "applied" | "pending" | "rejected" | "declined" | "timeout" | "noResponse" | "offline";
+  reason?: "disabled" | "busy" | "incognito" | null;
+};
+/** Another device's Recently Played, shown here and never stored. */
+export type RemoteHistory = { deviceId: string; entries?: { contentId: string; at: string }[]; error?: "offline" | "timeout" | "denied" };
 
 export type Settings = {
   showUnavailable?: boolean;
   historyCap?: number;
-  overwriteMode?: "silent" | "ask";
-  historySync?: boolean;
-  historyStartup?: boolean;
+  /** What this computer does when another device presses Send, per feature. */
+  overwritePolicy?: Partial<Record<Feature, OverwritePolicy>>;
   historyPaused?: boolean;
   incognito?: boolean;
-  syncSources?: Partial<Record<Feature, string>>;
-  syncBlocks?: Partial<Record<Feature | "global", BlockFlags>>;
   exposeDefault?: "expose" | "hide";
   downloadFolder?: string;
   volume?: number;
@@ -87,15 +93,12 @@ export type Settings = {
   relayDeviceId?: string;
   relayToken?: string;
   discovery?: boolean;
-  autoSend?: Partial<Record<Feature, boolean>>;
   syncRequestDevice?: string;
   displayName?: string;
   listenPort?: number;
   silenceSeconds?: number;
-  conflictPolicy?: "ask" | "keep" | "take";
   noticeRead?: "open" | "click" | "visible";
   noticeClear?: "ask" | "unpinned" | "all";
-  dirty?: Partial<Record<Feature, boolean>>;
   [key: string]: unknown;
 };
 
@@ -110,7 +113,6 @@ export type Bootstrap = {
   playlists: Playlist[];
   player: Partial<QueueState> & Record<string, unknown>;
   history: string[];
-  pending: Pending[];
   tracks: Track[];
   favoriteIds?: string[];
   listenPort: number;

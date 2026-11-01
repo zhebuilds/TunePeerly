@@ -1618,8 +1618,7 @@ body.resizing * {
   box-shadow: inset 0 0 0 1.6px var(--faint);
 }
 
-.check.on,
-.check.mixed {
+.check.on {
   background: var(--accent);
   box-shadow: none;
 }
@@ -1628,13 +1627,6 @@ body.resizing * {
   width: 15px;
   height: 15px;
   stroke-width: 3;
-}
-
-.check .dash {
-  width: 10px;
-  height: 2.4px;
-  border-radius: 2px;
-  background: var(--on-accent);
 }
 
 .slider {
@@ -3697,88 +3689,22 @@ body.resizing * {
   background: var(--hover);
 }
 
-.sync-table {
-  overflow-x: auto;
-  margin: 8px -8px 0;
-  padding: 0 8px;
-}
-
-.sync-table.disabled .sync-row:not(.global) {
-  opacity: 0.6;
-}
-
-.sync-head,
-.sync-row {
-  display: grid;
-  grid-template-columns: minmax(150px, 1.2fr) minmax(170px, 1.4fr) repeat(3, 84px) 168px;
-  align-items: center;
-  gap: 8px;
-  min-width: 860px;
-}
-
-.sync-head {
-  font-size: 12px;
-  color: var(--muted);
-  font-weight: 600;
-  padding: 8px 10px;
-}
-
-.sync-head span:nth-child(n + 3):nth-child(-n + 5) {
-  text-align: center;
-  cursor: help;
-}
-
-.sync-row {
-  padding: 10px;
-  border-top: 1px solid var(--line);
-}
-
-.sync-row.global {
-  border-top: 0;
-  background: var(--card);
-  border-radius: var(--r-md);
-}
-
-.sync-row.global + .sync-row {
-  border-top: 0;
-}
-
-.sync-follow {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 4px;
-  min-width: 0;
-}
-
-.sync-name {
+.sync-feature-controls {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-weight: 600;
-  min-width: 0;
+  gap: 10px;
   flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
-.sync-check {
-  display: flex;
-  justify-content: center;
+.recent-source {
+  display: inline-flex;
+  align-items: center;
 }
 
-.sync-row .select .select-button {
-  min-width: 0;
-  width: 100%;
-}
-
-.sync-row .select {
-  width: 100%;
-}
-
-.dirty-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--warn);
+.recent-source.loading {
+  opacity: 0.7;
+  cursor: progress;
 }
 
 .pair-code {
@@ -4637,7 +4563,7 @@ button.device-name:hover {
   color: var(--bad);
 }
 
-.banners .banner.conflict > svg {
+.banners .banner.ask > svg {
   color: var(--accent-text);
 }
 

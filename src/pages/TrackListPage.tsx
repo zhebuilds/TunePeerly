@@ -1,7 +1,8 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { api, type Track } from "../api";
+import { api, type RemoteHistory, type Track } from "../api";
 import { useApp, type Route } from "../app/model";
 import { Cover, LikedCover } from "../components/Cover";
 import { Select } from "../components/controls";
@@ -9,7 +10,7 @@ import { ActionBar, PageHeader } from "../components/PageHeader";
 import { SyncButton } from "../components/SyncButton";
 import { TrackTable, type Columns } from "../components/TrackTable";
 import { tintFor, totalText } from "../lib/format";
-import { albumParts, covers, filterText, folderName, sortTracks, type Sort } from "../lib/library";
+import { albumParts, covers, filterText, folderName, sortTracks, trackKey, type Sort } from "../lib/library";
 import { transport } from "../player/clock";
 import { Icons } from "../ui/icons";
 
@@ -45,7 +46,20 @@ export function TrackListPage({ route }: { route: Route }) {
     setSharingOpen(false);
   }, [routeKey]);
 
-  const info = usePageInfo(route);
+  const online = (app.boot?.links ?? []).filter((link) => link.state === "online" && link.deviceId !== app.boot?.deviceId);
+  const [viewing, setViewing] = useState("");
+  const viewed = route.name === "recent" ? viewing : "";
+  const remote = useRemoteHistory(viewed, () => setViewing(""));
+  const local = usePageInfo(route);
+  const info: PageInfo = viewed
+    ? {
+        ...local,
+        tracks: remote.tracks,
+        contextId: `recent-device:${viewed}`,
+        extraMeta: remote.missing > 0 ? <span className="muted">{t("recent.notHere", { count: remote.missing })}</span> : undefined,
+        empty: remote.loading ? t("recent.loading") : <EmptyHint icon={<Icons.clock />} title={t("empty.recentTitle")} body={t("recent.remoteEmpty")} />,
+      }
+    : local;
   const [sort, setSortState] = useState<Sort>(() => sorts.get(routeKey) ?? info.defaultSort);
   useEffect(() => setSortState(sorts.get(routeKey) ?? info.defaultSort), [routeKey]);
   const setSort = (value: Sort) => {
@@ -108,6 +122,19 @@ export function TrackListPage({ route }: { route: Route }) {
           </>
         )}
         {route.name === "liked" && <SyncButton feature="favorites" />}
+        {route.name === "recent" && (online.length > 0 || viewed) && (
+          <span className={`recent-source${remote.loading ? " loading" : ""}`} title={t("recent.sourceHelp")}>
+            <Select
+              label={t("recent.source")}
+              value={viewed}
+              onChange={setViewing}
+              options={[
+                { value: "", label: t("recent.thisDevice") },
+                ...online.map((link) => ({ value: link.deviceId, label: link.name || link.deviceId.slice(0, 7) })),
+              ]}
+            />
+          </span>
+        )}
         {playlist && (
           <>
             <button type="button" className={`icon-btn lg${sharingOpen ? " on" : ""}`} aria-label={t("playlist.sharing")} title={t("playlist.sharing")} onClick={() => setSharingOpen((value) => !value)}>
@@ -293,6 +320,58 @@ function LibrarySharingPanel() {
       </div>
     </div>
   );
+}
+
+/** Another connected device's Recently Played, asked for when chosen and shown read-only. Nothing is
+ * stored or merged here. If that device goes offline, the page goes back to this computer's list. */
+function useRemoteHistory(deviceId: string, back: () => void) {
+  const { t } = useTranslation();
+  const app = useApp();
+  const [reply, setReply] = useState<RemoteHistory | null>(null);
+  const link = app.boot?.links.find((item) => item.deviceId === deviceId);
+  const name = link?.name || deviceId.slice(0, 7);
+  const gone = Boolean(deviceId) && link?.state !== "online";
+  const backRef = useRef(back);
+  backRef.current = back;
+
+  useEffect(() => {
+    setReply(null);
+    if (!deviceId) return;
+    let live = true;
+    const stop = listen<RemoteHistory>("remote-history", (event) => {
+      if (live && event.payload.deviceId === deviceId) setReply(event.payload);
+    });
+    void stop.then(() => (live ? api.network("view-history", { deviceId }) : null)).catch(app.say);
+    return () => {
+      live = false;
+      void stop.then((off) => off()).catch(() => {});
+    };
+  }, [deviceId]);
+
+  useEffect(() => {
+    if (!deviceId) return;
+    const error = reply?.error;
+    if (!gone && !error) return;
+    app.toast(error === "denied" ? t("recent.denied", { name }) : error === "timeout" ? t("recent.noAnswer", { name }) : t("recent.offline", { name }));
+    backRef.current();
+  }, [deviceId, gone, reply?.error]);
+
+  return useMemo(() => {
+    const seen = new Set<string>();
+    const tracks: Track[] = [];
+    let missing = 0;
+    for (const entry of reply?.entries ?? []) {
+      const track = app.index.get({ contentId: entry.contentId });
+      if (!track) {
+        missing += 1;
+        continue;
+      }
+      if (seen.has(trackKey(track))) continue;
+      seen.add(trackKey(track));
+      tracks.push(track);
+    }
+    return { tracks, missing, loading: Boolean(deviceId) && !reply };
+  }, [reply, app.index, deviceId]);
 }
 
 function usePageInfo(route: Route): PageInfo {

@@ -37,12 +37,9 @@ const VISIBLE_BANNERS = 3;
 export function Banners() {
   const { t } = useTranslation();
   const app = useApp();
-  const pending = app.boot?.pending ?? [];
   const asks = app.overwriteAsks;
-  const sourceName = (id: string | null) => (id ? app.boot?.links.find((link) => link.deviceId === id)?.name ?? id.slice(0, 7) : "");
   const rows = [
     ...asks.map((ask) => ({ key: `ask-${ask.id}`, kind: "ask" as const, ask })),
-    ...pending.map((item) => ({ key: `conflict-${item.feature}`, kind: "conflict" as const, item })),
     ...app.alerts.map((item) => ({ key: `alert-${item.id}`, kind: "alert" as const, item })),
   ].slice(0, VISIBLE_BANNERS);
   if (rows.length === 0) return null;
@@ -52,32 +49,15 @@ export function Banners() {
         if (row.kind === "ask") {
           const ask = row.ask;
           return (
-            <div key={row.key} className="banner conflict" role="alert">
+            <div key={row.key} className="banner ask" role="alert">
               <Icons.sync />
               <span>{t("overwrite.body", { feature: t(`feature.${ask.feature}`), device: ask.name || ask.deviceId.slice(0, 7), seconds: ask.remaining })}</span>
               <div className="button-row">
                 <button type="button" className="btn ghost small" onClick={() => void api.network("resolve-overwrite", { id: ask.id, accept: false }).then(app.scheduleRefresh).catch(app.say)}>
-                  {t("overwrite.keep")}
+                  {t("overwrite.decline")}
                 </button>
                 <button type="button" className="btn primary small" onClick={() => void api.network("resolve-overwrite", { id: ask.id, accept: true }).then(app.scheduleRefresh).catch(app.say)}>
-                  {t("overwrite.take")}
-                </button>
-              </div>
-            </div>
-          );
-        }
-        if (row.kind === "conflict") {
-          const item = row.item;
-          return (
-            <div key={row.key} className="banner conflict" role="alert">
-              <Icons.sync />
-              <span>{t("conflict.body", { feature: t(`feature.${item.feature}`), device: sourceName(item.source) })}</span>
-              <div className="button-row">
-                <button type="button" className="btn ghost small" onClick={() => void api.network("resolve", { feature: item.feature, take: false }).then(app.scheduleRefresh).catch(app.say)}>
-                  {t("conflict.keep")}
-                </button>
-                <button type="button" className="btn primary small" onClick={() => void api.network("resolve", { feature: item.feature, take: true }).then(app.scheduleRefresh).catch(app.say)}>
-                  {t("conflict.take")}
+                  {t("overwrite.accept")}
                 </button>
               </div>
             </div>

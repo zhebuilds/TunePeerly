@@ -1,7 +1,7 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
-//! Snapshot and history rules. These functions do not read the network.
+//! Snapshot and playback-source rules. These functions do not read the network.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
@@ -28,42 +28,6 @@ pub fn apply_member_snapshot(existing: &[MemberRef], snapshot: &[String]) -> Vec
 pub struct MemberRef {
     pub content_id: Option<String>,
     pub local_file_id: Option<String>,
-}
-
-pub fn merge_history(
-    local: Vec<HistoryEntry>,
-    remote: Vec<HistoryEntry>,
-    now: DateTime<Utc>,
-    cap: usize,
-) -> Vec<HistoryEntry> {
-    // Latest time per song, looked up by id so long histories are not compared pairwise.
-    let mut latest: std::collections::HashMap<String, DateTime<Utc>> = std::collections::HashMap::new();
-    for entry in local.into_iter().chain(remote) {
-        let at = clamp_future(entry.at, now);
-        latest
-            .entry(entry.content_id)
-            .and_modify(|existing| {
-                if at > *existing {
-                    *existing = at;
-                }
-            })
-            .or_insert(at);
-    }
-    let mut merged: Vec<HistoryEntry> = latest
-        .into_iter()
-        .map(|(content_id, at)| HistoryEntry { content_id, at })
-        .collect();
-    merged.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.content_id.cmp(&b.content_id)));
-    merged.truncate(cap);
-    merged
-}
-
-fn clamp_future(at: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
-    if at > now + Duration::minutes(5) {
-        now
-    } else {
-        at
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,72 +135,6 @@ mod tests {
         assert!(next.iter().any(|item| item.local_file_id.as_deref() == Some("file")));
         assert!(next.iter().any(|item| item.content_id.as_deref() == Some("new")));
         assert!(!next.iter().any(|item| item.content_id.as_deref() == Some("old")));
-    }
-
-    #[test]
-    fn history_merges_by_latest_utc_and_clamps_the_future() {
-        let now = DateTime::parse_from_rfc3339("2026-10-18T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let local = vec![HistoryEntry {
-            content_id: "a".into(),
-            at: now - Duration::minutes(10),
-        }];
-        let remote = vec![
-            HistoryEntry {
-                content_id: "a".into(),
-                at: now - Duration::minutes(2),
-            },
-            HistoryEntry {
-                content_id: "b".into(),
-                at: now + Duration::minutes(30),
-            },
-        ];
-        let merged = merge_history(local, remote, now, 100);
-        assert_eq!(merged[0].content_id, "b");
-        assert_eq!(merged[0].at, now);
-        assert_eq!(merged[1].content_id, "a");
-        assert_eq!(merged[1].at, now - Duration::minutes(2));
-    }
-
-    #[test]
-    fn long_histories_keep_the_latest_time_per_song() {
-        let now = DateTime::parse_from_rfc3339("2026-10-18T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let local: Vec<HistoryEntry> = (0..5000)
-            .map(|index| HistoryEntry { content_id: format!("{:05}", index % 2500), at: now - Duration::minutes(index) })
-            .collect();
-        let remote = vec![HistoryEntry { content_id: "02499".into(), at: now - Duration::seconds(1) }];
-        let merged = merge_history(local, remote, now, 3000);
-        assert_eq!(merged.len(), 2500);
-        assert_eq!(merged[0].content_id, "00000");
-        assert_eq!(merged[0].at, now);
-        assert_eq!(merged[1].content_id, "02499");
-        assert_eq!(merged[1].at, now - Duration::seconds(1));
-        assert!(merged.windows(2).all(|pair| pair[0].at >= pair[1].at));
-        assert_eq!(merge_history(merged.clone(), Vec::new(), now, 10).len(), 10);
-    }
-
-    #[test]
-    fn equal_history_timestamps_keep_one_order_without_error() {
-        let now = DateTime::parse_from_rfc3339("2026-10-18T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let same = now - Duration::minutes(5);
-        let merged = merge_history(
-            vec![
-                HistoryEntry { content_id: "b".into(), at: same },
-                HistoryEntry { content_id: "a".into(), at: same },
-            ],
-            vec![HistoryEntry { content_id: "a".into(), at: same }],
-            now,
-            100,
-        );
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].content_id, "a");
-        assert_eq!(merged[1].content_id, "b");
-        assert_eq!(merged[0].at, same);
     }
 
     #[test]

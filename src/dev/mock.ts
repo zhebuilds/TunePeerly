@@ -122,8 +122,6 @@ const settings: Record<string, unknown> = {
   showUnavailable: true,
   historyCap: 100,
   incognito: false,
-  syncSources: { favorites: "dev-studio" },
-  syncBlocks: {},
   exposeDefault: "hide",
   downloadFolder: "",
   volume: 0.8,
@@ -132,10 +130,8 @@ const settings: Record<string, unknown> = {
   relayDeviceId: "",
   relayToken: "",
   discovery: true,
-  autoSend: {},
   displayName: "Desk PC",
   listenPort: 22000,
-  dirty: {},
 };
 
 const state = {
@@ -143,7 +139,6 @@ const state = {
   language: params.get("lang") === "zh" ? "zh" : "en",
   player: {} as Record<string, unknown>,
   history: tracks.slice(0, 9).filter((track) => track.playable).map(key),
-  pending: params.has("conflict") ? [{ feature: "favorites", source: "dev-studio" }] : [],
   offer: params.has("offer")
     ? { deviceId: "dev-new", name: "Living Room", role: (params.get("offer") === "enter" ? "outgoing" : "incoming") as "incoming" | "outgoing", code: params.get("offer") === "enter" ? null : "042137", expiresAt: Date.now() + 90_000, status: "", triesLeft: 3, lockedUntil: null, trust: "full" }
     : (null as Bootstrap["offer"]),
@@ -230,7 +225,6 @@ function bootstrap(): Bootstrap {
     playlists: structuredClone(playlists),
     player: structuredClone(state.player),
     history: [...state.history],
-    pending: structuredClone(state.pending) as Bootstrap["pending"],
     tracks: orderedLibrary(),
     favoriteIds: orderedLibrary().map((track) => track.contentId).filter((id): id is string => Boolean(id && tracks.find((item) => item.contentId === id)?.favorite)),
     listenPort: params.has("portbusy") ? 22111 : 22000,
@@ -388,7 +382,12 @@ async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<
         if (op === "clear-unpinned") state.notices = state.notices?.filter((item) => item.pinned);
         if (op === "clear-all") state.notices = [];
       }
-      if (action === "resolve") state.pending = state.pending.filter((item) => item.feature !== (args.payload as { feature: string }).feature);
+      if (action === "view-history") {
+        const deviceId = String((args.payload as { deviceId?: string }).deviceId ?? "");
+        const entries = tracks.slice(3, 12).filter((track) => track.contentId).map((track, index) => ({ contentId: String(track.contentId), at: new Date(Date.now() - index * 600_000).toISOString() }));
+        setTimeout(() => emit("remote-history", { deviceId, entries }), 300);
+        return null;
+      }
       if (action === "download") {
         state.download = { seq: Date.now(), contentId: String(args.payload), state: "started", detail: "" };
         setTimeout(() => {

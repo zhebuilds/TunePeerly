@@ -58,15 +58,6 @@ fn bootstrap(state: State<'_, AppState>) -> AppResult<Value> {
     let blocks = db.blocks()?;
     let notices = db.notices()?;
     let nearby: Vec<_> = live.nearby.iter().filter(|item| !blocks.iter().any(|row| row.device_id == item.device_id)).cloned().collect();
-    let pending = db.setting_json("pendingSnapshots")?;
-    let pending = pending
-        .as_object()
-        .map(|map| {
-            map.iter()
-                .map(|(feature, item)| json!({"feature": feature, "source": item.get("source").cloned().unwrap_or(Value::Null)}))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     Ok(json!({
         "deviceId": state.material.device_id,
         "certId": state.material.cert_id,
@@ -78,7 +69,6 @@ fn bootstrap(state: State<'_, AppState>) -> AppResult<Value> {
         "playlists": db.playlists()?,
         "player": db.player_json()?,
         "history": db.history_keys()?,
-        "pending": pending,
         "tracks": catalog::library(&db, &online)?,
         "favoriteIds": db.favorite_content_ids()?,
         "listenPort": live.listen_port,
@@ -186,13 +176,7 @@ fn record_history(state: State<'_, AppState>, content_id: Option<String>, local_
     if db.setting_bool("incognito").unwrap_or(false) || db.setting_bool("historyPaused").unwrap_or(false) {
         return Ok(());
     }
-    db.record_history_local(content_id.as_deref(), local_file_id.as_deref())?;
-    let sync = db.setting_bool("historySync").unwrap_or(false);
-    drop(db);
-    if sync {
-        let _ = state.net.tx.send(net::Cmd::AutoSync("history".into()));
-    }
-    Ok(())
+    db.record_history_local(content_id.as_deref(), local_file_id.as_deref())
 }
 
 #[tauri::command(async)]
@@ -269,11 +253,7 @@ fn remote_failure(state: State<'_, AppState>, content_id: String, device_id: Str
 #[tauri::command(async)]
 fn toggle_favorite(state: State<'_, AppState>, content_id: Option<String>, local_file_id: Option<String>) -> AppResult<bool> {
     let db = state.db.lock().unwrap_or_else(PoisonError::into_inner);
-    let added = db.toggle_favorite(content_id.as_deref(), local_file_id.as_deref())?;
-    db.mark_dirty("favorites", true)?;
-    drop(db);
-    let _ = state.net.tx.send(net::Cmd::AutoSync("favorites".into()));
-    Ok(added)
+    db.toggle_favorite(content_id.as_deref(), local_file_id.as_deref())
 }
 
 #[tauri::command(async)]
@@ -402,17 +382,10 @@ fn update_setting(app: AppHandle, state: State<'_, AppState>, key: String, value
     if key == "theme" || key == "language" {
         let text = value.as_str().unwrap_or("").to_string();
         db.set_synced(&key, &text)?;
-        db.mark_dirty("appearance", true)?;
-        drop(db);
-        let _ = state.net.tx.send(net::Cmd::AutoSync("appearance".into()));
         return Ok(());
     }
     let mini_key = key == "miniPlayer" || key == "miniTray";
-    let appearance = mini_key || key == "closeAction";
     db.set_device_setting(&key, value)?;
-    if appearance {
-        db.mark_dirty("appearance", true)?;
-    }
     if key == "historyCap" {
         db.trim_history()?;
     }
@@ -420,9 +393,6 @@ fn update_setting(app: AppHandle, state: State<'_, AppState>, key: String, value
     drop(db);
     if mini_key {
         desktop::sync_mini(&app, on_minimize, in_tray);
-    }
-    if appearance {
-        let _ = state.net.tx.send(net::Cmd::AutoSync("appearance".into()));
     }
     if NETWORK_KEYS.contains(&key.as_str()) {
         let _ = state.net.tx.send(net::Cmd::Apply);
@@ -488,15 +458,12 @@ fn network_command(state: State<'_, AppState>, action: String, payload: Value) -
         },
         "sync" => net::Cmd::Sync {
             feature: payload.get("feature").and_then(|v| v.as_str()).unwrap_or("favorites").to_string(),
-            refresh: payload.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false),
+            target: payload.get("deviceId").and_then(|v| v.as_str()).filter(|id| !id.is_empty()).map(str::to_string),
         },
+        "view-history" => net::Cmd::ViewHistory(payload.get("deviceId").and_then(|v| v.as_str()).unwrap_or("").to_string()),
         "request-sync" => net::Cmd::RequestSync {
             feature: payload.get("feature").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             device_id: payload.get("deviceId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        },
-        "resolve" => net::Cmd::Resolve {
-            feature: payload.get("feature").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            take: payload.get("take").and_then(|v| v.as_bool()).unwrap_or(false),
         },
         "download" => net::Cmd::Download(text()),
         "activity" => net::Cmd::Activity {
@@ -580,10 +547,7 @@ fn move_membership(state: State<'_, AppState>, previous: String, next: String, a
         rusqlite::params![next, previous],
     )?;
     db.retarget_library_order(&previous, &next)?;
-    db.mark_dirty("favorites", true)?;
     tx.commit()?;
-    drop(db);
-    let _ = state.net.tx.send(net::Cmd::AutoSync("favorites".into()));
     Ok(())
 }
 
@@ -716,7 +680,6 @@ impl BackgroundWork {
             let _ = self.app.emit("library-updated", json!({}));
         }
         let mut changed = false;
-        let mut hashed = false;
         let mut last_emit = Instant::now();
         loop {
             let (playing, serving, current, buffer_enough) = self
@@ -729,16 +692,11 @@ impl BackgroundWork {
             let hash = self.hash_step(playing, serving, current.as_deref(), buffer_enough);
             let did_work = covered || hash;
             changed |= did_work;
-            hashed |= hash;
             if changed && (!did_work || last_emit.elapsed() > Duration::from_secs(3)) {
                 let _ = self.app.emit("library-updated", json!({}));
                 let _ = self.tx.send(net::Cmd::Publish);
-                if hashed {
-                    let _ = self.tx.send(net::Cmd::AutoSync("favorites".into()));
-                }
                 last_emit = Instant::now();
                 changed = false;
-                hashed = false;
             }
             if !did_work {
                 std::thread::sleep(Duration::from_millis(1500));

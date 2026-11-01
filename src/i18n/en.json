@@ -303,9 +303,10 @@
     "rescanned": "Music folders scanned",
     "exposed": "Paired devices can now play these songs",
     "hidden": "These songs are no longer exposed",
-    "synced": "Sent to online devices",
+    "synced": "Sent to all connected devices. Waiting for their results.",
     "requested": "Asked {{name}} to replace this computer's copy",
-    "syncDenied": "{{name}} did not send {{feature}}"
+    "syncDenied": "{{name}} did not send {{feature}}",
+    "sentTo": "Sent to {{name}}. Waiting for the result."
   },
   "notice": {
     "empty": "No notifications yet.",
@@ -330,7 +331,6 @@
     "blocked": "Blocked",
     "unblocked": "Unblocked",
     "sync": "Received changes",
-    "conflict": "Sync conflict",
     "overwrite": "Overwrite request",
     "offlineTrack": "This song isn't on this computer, and no paired device can play it right now.",
     "nothingPlayable": "None of these songs can be played.",
@@ -341,14 +341,19 @@
       "full": "Full trust",
       "verify": "Ask each time",
       "incognito": "Incognito turned on",
-      "keep": "Kept this computer's copy",
-      "take": "Used their copy",
-      "ask": "Waiting for a choice",
       "timeout": "No choice within a minute, so nothing was overwritten",
-      "cancel": "Kept this computer's copy"
+      "cancel": "Declined, nothing changed",
+      "applied": "Updated",
+      "disabled": "Doesn't allow overwriting",
+      "busy": "Too many questions waiting",
+      "declined": "Declined",
+      "noResponse": "No result (timed out)",
+      "offline": "Disconnected before answering",
+      "inIncognito": "In incognito"
     },
     "removed": "Removed",
-    "removedYou": "Removed this computer"
+    "removedYou": "Removed this computer",
+    "sendResult": "Send result"
   },
   "file": {
     "missing": "The file is gone from disk.",
@@ -408,8 +413,8 @@
     "trust": "Trust",
     "trustFull": "Full trust",
     "trustVerify": "Ask each time",
-    "overwriteSilent": "Silent overwrite",
-    "overwriteAsk": "Ask before overwrite",
+    "overwriteSilent": "Overwrite directly",
+    "overwriteAsk": "Ask first",
     "disconnect": "Disconnect",
     "block": "Block",
     "blockTitle": "Block {{name}}?",
@@ -423,7 +428,8 @@
     "pasteHelp": "Paste the pairing text from the other computer.",
     "pastePlaceholder": "Paste pairing text here",
     "networkOff": "All network features are off. This computer is not reachable.",
-    "incognitoOff": "Incognito is on. Discovery, sync and sharing are paused."
+    "incognitoOff": "Incognito is on. Discovery, sync and sharing are paused.",
+    "overwriteDeny": "Don't allow"
   },
   "link": {
     "online": "Online",
@@ -479,13 +485,8 @@
   },
   "overwrite": {
     "body": "{{device}} wants to replace this computer's {{feature}}. It is left unchanged if you don't choose within {{seconds}} seconds.",
-    "keep": "Keep mine",
-    "take": "Use theirs"
-  },
-  "conflict": {
-    "body": "{{feature}} changed on {{device}}, and this computer has changes that weren't synced.",
-    "keep": "Keep mine",
-    "take": "Use theirs"
+    "decline": "Decline",
+    "accept": "Accept"
   },
   "move": {
     "title": "This song's file changed",
@@ -520,18 +521,6 @@
     "history": "Recently Played"
   },
   "sync": {
-    "feature": "What",
-    "source": "Follow",
-    "sourceHelp": "After that device changes this, get its copy automatically. Auto send, above, is the other direction: your edits go out.",
-    "everything": "All features",
-    "globalHelp": "Applies to every row; rows can still differ",
-    "blockManual": "No manual",
-    "blockManualHelp": "This computer can't overwrite others with Sync or Refresh. Manual syncs from others still apply here.",
-    "blockSource": "No following",
-    "blockSourceHelp": "Don't follow the chosen device automatically, on LAN or through the relay.",
-    "blockAll": "Stop all",
-    "blockAllHelp": "Stop syncing out and stop following. Manual syncs from others can still come in.",
-    "thisDevice": "This computer",
     "noneOnline": "No paired device is online",
     "push": "Send",
     "pull": "Override",
@@ -540,11 +529,10 @@
     "pullTitle": "Replace this computer's {{feature}} with the copy from a connected device.",
     "requestNone": "None",
     "thatDevice": "That device",
-    "pushTitle": "Send this computer's {{feature}} to every paired device that is online.",
+    "pushTitle": "Send this computer's {{feature}} to a connected device, or to all of them.",
     "pushIncognito": "Incognito is on, so nothing is sent.",
-    "pushBlocked": "Manual sync for this is turned off in Settings.",
-    "dirty": "Has changes that weren't synced",
-    "waiting": "Needs your choice"
+    "pushChoose": "Send to",
+    "pushAll": "All connected devices"
   },
   "settings": {
     "appearance": "Appearance",
@@ -584,10 +572,6 @@
     "revise": "To be revised",
     "doNotUse": "Do not use",
     "notImplemented": "Not completed yet, not tested",
-    "historySync": "Sync recently played",
-    "historySyncHelp": "When a song finishes, this computer stamps it in UTC and sends the change. Another device updates its list only when it has this on too. The same timestamp on two songs is ordered either way.",
-    "historyStartup": "Merge when this computer comes online",
-    "historyStartupHelp": "On startup, collect Recently Played from every paired device that also syncs it, merge by time, then send that list. Devices with sync off ignore it quietly, with no notification.",
     "historyPause": "Pause recording",
     "historyPauseHelp": "Recently Played on this computer does not record songs that finish.",
     "incognito": "Incognito",
@@ -595,11 +579,6 @@
     "silence": "Silence after a decline",
     "silenceHelp": "After you decline a pairing request, that device cannot try again for this many seconds. You can still connect to it. Default is 60.",
     "silenceInvalid": "Enter a number of seconds from 1 to 86400.",
-    "conflictPolicy": "When a sync conflicts",
-    "conflictPolicyHelp": "Shown when another device sends changes and this computer also has unsynced changes.",
-    "conflictAsk": "Ask me",
-    "conflictKeep": "Always keep mine",
-    "conflictTake": "Always use theirs",
     "notices": "Notifications",
     "noticeRead": "When a notification is marked read",
     "noticeReadHelp": "The number on the bell counts notifications that are still unread.",
@@ -613,8 +592,6 @@
     "noticeClearAll": "Delete all",
     "network": "Network",
     "networkIncognito": "Incognito is on. Discovery, playback position, and the relay apply again once it is off.",
-    "autoSend": "Auto send",
-    "autoSendHelp": "After you change a selected item on this computer, send that copy to every paired device that is online. This does not pull their changes. Follow, in Sync below, is what gets their copy.",
     "relay": "Relay (strelaysrv)",
     "relayHelp": "Connect to paired devices outside your network through your own relay. All four fields are required.",
     "relayHost": "Relay address",
@@ -623,7 +600,7 @@
     "relayIdHelp": "The relay's certificate ID, so this computer only talks to your relay.",
     "relayToken": "Relay token",
     "sync": "Sync",
-    "syncHelp": "Send pushes this computer's copy to devices that are online. Override replaces this computer with one connected device. Follow, in the table, gets that device's later changes automatically.",
+    "syncHelp": "Nothing syncs on its own. Send pushes this computer's copy to one connected device or to all of them. Override replaces this computer's copy with one connected device's.",
     "requestDevice": "Default device to get from",
     "requestDeviceHelp": "Override starts with this device marked. Each click still lets you pick any device that is connected.",
     "storage": "Storage",
@@ -635,10 +612,10 @@
     "relayPortInvalid": "Enter a port between 1 and 65535.",
     "deviceId": "Device ID",
     "about": "About",
-    "overwriteMode": "When others overwrite this computer",
-    "overwriteModeHelp": "Applies to Send from any paired device. Choose Silent to accept it at once, or Ask to confirm first.",
     "portBusy": "That port is already in use. Pick another one.",
-    "portFallback": "Port {{saved}} is already in use. Listening on {{port}} for now. The saved port is unchanged and will be tried again next start."
+    "portFallback": "Port {{saved}} is already in use. Listening on {{port}} for now. The saved port is unchanged and will be tried again next start.",
+    "overwritePolicy": "When another device sends {{feature}}",
+    "overwritePolicyHelp": "For each item, choose what a Send from another paired device does here: overwrite directly, ask first, or don't allow. The sender is told the result. Override, asked for from this computer, always applies."
   },
   "about": {
     "name": "TunePeerly",
@@ -665,5 +642,28 @@
     "hoursMinutes": "{{hours}} hr {{minutes}} min",
     "minutesSeconds": "{{minutes}} min {{seconds}} sec",
     "seconds": "{{seconds}} sec"
+  },
+  "recent": {
+    "source": "Whose Recently Played",
+    "sourceHelp": "View a connected device's Recently Played. It is shown here only: not saved or merged into this computer's list.",
+    "thisDevice": "This computer",
+    "loading": "Getting the list…",
+    "remoteEmpty": "Nothing played on that device yet, or none of it is in the library here.",
+    "notHere_one": "{{count}} song not in the library here",
+    "notHere_other": "{{count}} songs not in the library here",
+    "offline": "{{name}} is no longer connected. Showing this computer.",
+    "noAnswer": "{{name}} didn't answer. Showing this computer.",
+    "denied": "{{name}} is in incognito and doesn't share its list. Showing this computer."
+  },
+  "syncResult": {
+    "applied": "{{name}}: {{feature}} updated",
+    "pending": "{{name}} is asking whether to overwrite {{feature}}",
+    "disabled": "{{name}} doesn't allow overwriting {{feature}}",
+    "busy": "{{name}} has too many questions waiting, so {{feature}} was not taken",
+    "declined": "{{name}} declined {{feature}}",
+    "timeout": "{{name}} didn't answer (timed out); {{feature}} not changed",
+    "noResponse": "{{name}} sent no result (timed out). It may run an older version.",
+    "offline": "{{name}} disconnected before answering",
+    "incognito": "{{name}} is in incognito, so {{feature}} was not taken"
   }
 }

@@ -2,7 +2,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type MemberRef, type OverwriteAsk, type Settings, type Track } from "../api";
+import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type MemberRef, type OverwriteAsk, type Settings, type SyncResult, type Track } from "../api";
 import i18n from "../i18n";
 import { albumParts, filterText, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
 import {
@@ -85,6 +85,12 @@ function normalizeQueue(raw: Record<string, unknown> | undefined): QueueState {
     future: refs(raw.future),
     positionSec: Number(raw.positionSec) > 0 ? Number(raw.positionSec) : 0,
   };
+}
+
+/** Lists that cannot be rebuilt from their id, so their track keys are saved for the next launch:
+ * a search, the problem list, or another device's Recently Played. */
+function keptList(contextId: string): boolean {
+  return contextId === "search" || contextId === "problems" || contextId.startsWith("recent-device:");
 }
 
 function sameRoute(left: Route, right: Route): boolean {
@@ -279,7 +285,7 @@ function useModel() {
         volumeRef.current = level;
         engine.setVolume(level, false);
         const index = new TrackIndex(next.tracks);
-        const keys = (state.contextId === "search" || state.contextId === "problems") && Array.isArray(next.player.contextKeys) ? next.player.contextKeys : null;
+        const keys = keptList(state.contextId) && Array.isArray(next.player.contextKeys) ? next.player.contextKeys : null;
         const rebuilt = keys ? keys.map((key) => index.get({ key: String(key) })).filter((track): track is Track => !!track) : null;
         context.current = { id: state.contextId, tracks: rebuilt && rebuilt.length > 0 ? rebuilt : null };
         engine.cue(index.get(state.current) ?? null, state.positionSec);
@@ -310,6 +316,12 @@ function useModel() {
       listen<OverwriteAsk[]>("overwrite-asks", (event) => {
         if (!disposed) setOverwriteAsks(Array.isArray(event.payload) ? event.payload.slice(0, 3) : []);
       }),
+      listen<SyncResult>("sync-result", (event) => {
+        if (disposed) return;
+        const row = event.payload;
+        const key = row.status === "rejected" ? (row.reason === "busy" || row.reason === "incognito" ? row.reason : "disabled") : row.status;
+        toast(t(`syncResult.${key}`, { name: row.name || row.deviceId.slice(0, 7), feature: t(`feature.${row.feature}`, { defaultValue: row.feature }) }));
+      }),
       listen<{ feature?: string; name?: string }>("sync-denied", (event) => {
         if (disposed) return;
         const feature = event.payload.feature ? t(`feature.${event.payload.feature}`, { defaultValue: event.payload.feature }) : "";
@@ -339,9 +351,8 @@ function useModel() {
     const trimmed = state.past.length > PAST_LIMIT ? { ...state, past: state.past.slice(-PAST_LIMIT) } : state;
     queueRef.current = trimmed;
     setQueueState(trimmed);
-    // A search or problem list cannot be rebuilt from its id, so keep its track keys for the next launch.
     const saved: Record<string, unknown> = { ...trimmed, positionSec: position };
-    if ((trimmed.contextId === "search" || trimmed.contextId === "problems") && context.current.id === trimmed.contextId && context.current.tracks) {
+    if (keptList(trimmed.contextId) && context.current.id === trimmed.contextId && context.current.tracks) {
       saved.contextKeys = context.current.tracks.slice(0, 2000).map(trackKey);
     }
     void api.savePlayer(saved as unknown as QueueState).catch(() => {});
@@ -386,6 +397,7 @@ function useModel() {
         return visible.slice().sort((a, b) => b.addedAt.localeCompare(a.addedAt) || a.title.localeCompare(b.title));
       case "search":
       case "problems":
+      case "recent-device":
         return [];
       default:
         return visible;
