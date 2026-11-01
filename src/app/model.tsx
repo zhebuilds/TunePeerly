@@ -327,6 +327,10 @@ function useModel() {
         const feature = event.payload.feature ? t(`feature.${event.payload.feature}`, { defaultValue: event.payload.feature }) : "";
         toast(t("toast.syncDenied", { name: event.payload.name || t("sync.thatDevice"), feature }));
       }),
+      listen<{ deviceId: string; name?: string }>("unpaired", (event) => {
+        if (disposed) return;
+        toast(t("toast.unpairedYou", { name: event.payload.name || event.payload.deviceId.slice(0, 7) }));
+      }),
       listen<{ current: DownloadFeed["current"]; queue: DownloadFeed["queue"]; history: DownloadFeed["history"] | null }>("download-updated", (event) => {
         if (disposed) return;
         const row = event.payload;
@@ -685,9 +689,7 @@ function useModel() {
     scheduleRefresh();
   }, [say, scheduleRefresh, t, toast]);
 
-  const navigate = useCallback((target: Route) => {
-    // The relay settings moved from Settings to the Devices page; old links still land on them.
-    const next: Route = target.name === "settings" && target.id === "relay" ? { name: "devices", id: "relay" } : target;
+  const navigate = useCallback((next: Route) => {
     const state = nav.current;
     if (sameRoute(state.stack[state.index], next)) return;
     state.stack = [...state.stack.slice(0, state.index + 1), next].slice(-60);

@@ -1,9 +1,9 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, type Link } from "../api";
 import { useApp } from "../app/model";
-import { CommitInput, DoNotUse, NotImplemented, Revise, Row, Select, Switch } from "../components/controls";
+import { CommitInput, DoNotUse, NotImplemented, Row, Select, Switch } from "../components/controls";
 import { unpairedNearby } from "../lib/devices";
 import { Icons } from "../ui/icons";
 
@@ -20,14 +20,6 @@ export function DevicesPage() {
   const app = useApp();
   const boot = app.boot;
   const [refreshing, setRefreshing] = useState(false);
-  const relayRef = useRef<HTMLElement | null>(null);
-  // Old links to Settings → relay land here with id "relay" (see navigate in model.tsx).
-  useEffect(() => {
-    if (app.route.name !== "devices" || app.route.id !== "relay") return;
-    // Wait a frame: the app scrolls back to the top on every route change after this effect runs.
-    const frame = window.requestAnimationFrame(() => relayRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
-    return () => window.cancelAnimationFrame(frame);
-  }, [app.route.name, app.route.id, Boolean(boot)]);
   if (!boot) return null;
 
   const settings = app.settings;
@@ -78,7 +70,7 @@ export function DevicesPage() {
       )}
 
       <section className="panel">
-        <h2>{t("devices.paired")}<Revise /></h2>
+        <h2>{t("devices.paired")}</h2>
         {boot.links.length === 0 ? (
           <p className="muted">{t("devices.noPaired")}</p>
         ) : (
@@ -132,7 +124,6 @@ export function DevicesPage() {
       <section className="panel">
         <h2>
           {t("devices.nearby")}
-          <Revise />
           {settings.discovery && !networkOff && <span className="scanning" aria-hidden="true" />}
           <span className="panel-switch" title={t("devices.discoveryHelp")}>
             {settings.discovery && !networkOff && (
@@ -191,7 +182,7 @@ export function DevicesPage() {
         )}
       </section>
 
-      <section className="panel" ref={relayRef}>
+      <section className="panel">
         <h2><span className="setting-title-line">{t("relay.server")}<NotImplemented /><DoNotUse /></span></h2>
         {settings.incognito && (
           <div className="banner warn">

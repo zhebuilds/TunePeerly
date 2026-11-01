@@ -21,9 +21,8 @@ pub struct IdentityVerifier {
 
 #[derive(Debug)]
 enum Pin {
-    /// Any device key except these SHA-256 hashes of removed devices' keys; the caller decides
-    /// from the device id afterwards.
-    AnyDevice(Vec<[u8; 32]>),
+    /// Any device key; the caller decides from the device id afterwards.
+    AnyDevice,
     /// SHA-256 of the device's SubjectPublicKeyInfo.
     Device([u8; 32]),
     /// strelaysrv id: SHA-256 of the relay's certificate.
@@ -34,13 +33,8 @@ impl IdentityVerifier {
     pub fn peer(provider: Arc<rustls::crypto::CryptoProvider>, expected_key_hash: Option<[u8; 32]>) -> Self {
         Self {
             provider,
-            pin: expected_key_hash.map_or(Pin::AnyDevice(Vec::new()), Pin::Device),
+            pin: expected_key_hash.map_or(Pin::AnyDevice, Pin::Device),
         }
-    }
-
-    /// Accepts any device key except those of removed devices, which fail the TLS handshake.
-    pub fn any_peer_except(provider: Arc<rustls::crypto::CryptoProvider>, removed_key_hashes: Vec<[u8; 32]>) -> Self {
-        Self { provider, pin: Pin::AnyDevice(removed_key_hashes) }
     }
 
     pub fn relay(provider: Arc<rustls::crypto::CryptoProvider>, expected_cert_id: [u8; 32]) -> Self {
@@ -54,13 +48,7 @@ impl IdentityVerifier {
         let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
             .map_err(|err| Error::General(err.to_string()))?;
         match &self.pin {
-            Pin::AnyDevice(removed) => {
-                let hash = Sha256::digest(cert.public_key().raw);
-                if removed.iter().any(|item| item.as_slice() == hash.as_slice()) {
-                    return Err(Error::General("this device was removed".into()));
-                }
-                Ok(())
-            }
+            Pin::AnyDevice => Ok(()),
             Pin::Device(expected) => {
                 if Sha256::digest(cert.public_key().raw).as_slice() != expected {
                     return Err(Error::General("peer key does not match the pinned key".into()));
