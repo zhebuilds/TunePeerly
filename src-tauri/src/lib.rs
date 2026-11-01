@@ -3,7 +3,6 @@ mod desktop;
 mod catalog;
 mod media;
 mod config;
-mod connect;
 mod db;
 mod dbkey;
 mod error;
@@ -504,14 +503,6 @@ fn network_command(state: State<'_, AppState>, action: String, payload: Value) -
             playing: payload.get("playing").and_then(|v| v.as_bool()).unwrap_or(false),
             local_file_id: payload.get("localFileId").and_then(|v| v.as_str()).map(str::to_string),
             buffer_enough: payload.get("bufferEnough").and_then(|v| v.as_bool()).unwrap_or(false),
-        },
-        "connect" => net::Cmd::Connect {
-            kind: payload.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            to: payload.get("to").and_then(|v| v.as_str()).map(str::to_string),
-            body: payload.get("body").cloned().unwrap_or(Value::Null),
-        },
-        "connect-mode" => net::Cmd::ConnectMode {
-            detached: payload.get("detached").and_then(|v| v.as_bool()).unwrap_or(false),
         },
         "close-route" => net::Cmd::CloseRoutes,
         _ => net::Cmd::Apply,

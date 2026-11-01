@@ -6,7 +6,7 @@ pub const MAX_PAYLOAD: usize = 32 * 1024;
 #[derive(Debug, Clone)]
 pub enum Frame {
     Keepalive,
-    /// One JSON app message: sync, history, holdings, snapshots, connect commands, hello.
+    /// One JSON app message: sync, history, holdings, snapshots, hello.
     Message(Vec<u8>),
     AudioReq {
         id: u64,

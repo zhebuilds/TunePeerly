@@ -72,7 +72,7 @@ export function NowPlayingPage() {
           <div className="now-foot">
             <div className="now-badges">
               <span className={`badge ${track.badge}`}>{t(`badge.${track.badge}`)}</span>
-              {app.remote ? <span className="badge connect">{t("connect.playingOn", { name: app.remote.name })}</span> : app.engine.remoteDevice && <span className="badge remote">{t("now.from", { name: app.boot?.links.find((link) => link.deviceId === app.engine.remoteDevice)?.name ?? "" })}</span>}
+              {app.engine.remoteDevice && <span className="badge remote">{t("now.from", { name: app.boot?.links.find((link) => link.deviceId === app.engine.remoteDevice)?.name ?? "" })}</span>}
               {failed && app.failure && <span className="badge error">{t(app.failure.reason, { defaultValue: t("notice.playbackFailed") })}</span>}
             </div>
             <div className="now-mascot">

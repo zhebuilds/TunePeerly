@@ -72,7 +72,6 @@ export const Icons = {
   broadcast: (p: IconProps) => <Line {...p}><circle cx="12" cy="12" r="2" /><path d="M16.2 7.8a6 6 0 0 1 0 8.4" /><path d="M7.8 16.2a6 6 0 0 1 0-8.4" /><path d="M19 5a10 10 0 0 1 0 14" /><path d="M5 19a10 10 0 0 1 0-14" /></Line>,
   sync: (p: IconProps) => <Line {...p}><path d="M20 11a8 8 0 0 0-14.3-4.3L4 9" /><path d="M4 4v5h5" /><path d="M4 13a8 8 0 0 0 14.3 4.3L20 15" /><path d="M20 20v-5h-5" /></Line>,
   copy: (p: IconProps) => <Line {...p}><rect x="8.5" y="8.5" width="11" height="11" rx="2" /><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" /></Line>,
-  unlink: (p: IconProps) => <Line {...p}><path d="M9.5 14.5 8 16a3.5 3.5 0 0 1-5-5l1.5-1.5" /><path d="M14.5 9.5 16 8a3.5 3.5 0 0 1 5 5l-1.5 1.5" /><path d="m4 4 16 16" /></Line>,
   link: (p: IconProps) => <Line {...p}><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1 1" /><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1-1" /></Line>,
   wifi: (p: IconProps) => <Line {...p}><path d="M2.5 8.8a14 14 0 0 1 19 0M5.5 12.2a9.5 9.5 0 0 1 13 0M8.6 15.5a5 5 0 0 1 6.8 0" /><path d="M12 19h.01" /></Line>,
   globe: (p: IconProps) => <Line {...p}><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18" /></Line>,

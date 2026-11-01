@@ -1703,11 +1703,6 @@ body.resizing * {
   color: var(--info);
 }
 
-.badge.connect {
-  background: var(--accent-soft);
-  color: var(--accent-text);
-}
-
 .badge.unavailable {
   background: var(--hover);
   color: var(--faint);
@@ -3840,14 +3835,25 @@ body.resizing * {
 }
 
 .device-text {
+  display: flex;
+  flex-direction: column;
   flex: 1;
   min-width: 0;
 }
 
 .device-name {
+  overflow: hidden;
   font-weight: 600;
-  font-size: 15px;
+  font-size: 13.5px;
   text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-switch-label {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
 }
 
 button.device-name:hover {
@@ -4356,280 +4362,6 @@ button.device-name:hover {
   position: fixed;
   inset: 0;
   z-index: 90;
-}
-
-/* ---------- Devices ---------- */
-/*
- * Spotify Connect's "Playing on" strip, in orange. Dark text: #ff8a3d on #1c1206 is about 8.5:1, where
- * white on it would be only about 2.3:1. The same in both themes, like the original.
- */
-:root {
-  --connect: #ff8a3d;
-  --connect-hover: #ff9b57;
-  --on-connect: #1c1206;
-  /* Orange used as text or icon colour on light surfaces; the bright fill is too pale there. */
-  --connect-text: #b84a00;
-}
-
-:root[data-theme="dark"] {
-  --connect-text: var(--connect);
-}
-
-/*
- * While the strip shows, the player grows by its height and the strip takes the last row in the flow.
- * --player-h grows with it, so the page, the queue panel, the now playing page and toasts all end
- * above the player instead of under the strip.
- */
-:root.connect-shown {
-  --player-h: 110px;
-}
-
-.player-bar.linked {
-  grid-template-rows: minmax(0, 1fr) 26px;
-  row-gap: 0;
-}
-
-.player-bar.linked > .player-left,
-.player-bar.linked > .player-center,
-.player-bar.linked > .player-right {
-  grid-row: 1;
-}
-
-.connect-strip {
-  grid-column: 1 / -1;
-  grid-row: 2;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  min-width: 0;
-  height: 26px;
-  /* Edge to edge: cancel the player's side padding. */
-  margin: 0 -12px 0 -8px;
-  padding: 0 24px;
-  background: var(--connect);
-  color: var(--on-connect);
-  font-size: 12.5px;
-  font-weight: 700;
-  white-space: nowrap;
-  transition: background 0.12s;
-}
-
-.connect-strip:hover {
-  background: var(--connect-hover);
-}
-
-.connect-strip:focus-visible {
-  outline: 2px solid var(--on-connect);
-  outline-offset: -4px;
-}
-
-.connect-strip svg {
-  width: 16px;
-  height: 16px;
-  flex: none;
-}
-
-.connect-strip-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  height: 100%;
-}
-
-.connect-strip-label span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.icon-btn.link-on {
-  color: var(--connect-text);
-}
-
-.icon-btn.link-solo {
-  color: var(--muted);
-  background: var(--hover);
-}
-
-.device-picker {
-  position: relative;
-  display: flex;
-}
-
-/* Laid out like Spotify's "Connect to a device". */
-.device-popover {
-  position: absolute;
-  right: -48px;
-  bottom: calc(100% + 14px);
-  z-index: 60;
-  width: 300px;
-  max-width: calc(100vw - 24px);
-  padding: 16px 8px 8px;
-  border-radius: var(--r-md);
-  background: var(--elev);
-  box-shadow: var(--shadow), inset 0 0 0 1px var(--line);
-  animation: pop 0.1s ease-out;
-}
-
-.device-title {
-  margin: 0 8px 12px;
-  font-size: 16px;
-  font-weight: 700;
-}
-
-.device-current {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin: 0 0 6px;
-  padding: 10px 8px;
-  border-radius: var(--r-sm);
-  background: color-mix(in srgb, var(--connect) 12%, transparent);
-}
-
-.device-current-icon {
-  display: grid;
-  place-items: center;
-  width: 40px;
-  height: 40px;
-  flex: none;
-  color: var(--connect-text);
-}
-
-.device-current-icon svg {
-  width: 28px;
-  height: 28px;
-}
-
-.eq.device-eq {
-  height: 20px;
-  gap: 3px;
-}
-
-.eq.device-eq i {
-  width: 3.5px;
-  background: var(--connect-text);
-}
-
-.device-caption {
-  color: var(--text);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.device-current .device-name {
-  color: var(--connect-text);
-  font-size: 14px;
-}
-
-.device-section {
-  margin: 10px 8px 4px;
-  color: var(--text);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.device-popover ul {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.device-row {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  width: 100%;
-  padding: 8px;
-  border-radius: var(--r-sm);
-  text-align: left;
-}
-
-.device-row:hover:not(:disabled) {
-  background: var(--hover);
-}
-
-.device-row.solo:disabled {
-  opacity: 0.55;
-}
-
-.device-icon {
-  display: grid;
-  place-items: center;
-  width: 40px;
-  height: 28px;
-  flex: none;
-  color: var(--muted);
-}
-
-.device-icon svg {
-  width: 22px;
-  height: 22px;
-}
-
-.device-row:hover:not(:disabled) .device-icon {
-  color: var(--text);
-}
-
-.device-text {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-width: 0;
-}
-
-.device-name {
-  overflow: hidden;
-  font-size: 13.5px;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.device-state {
-  color: var(--muted);
-  font-size: 12px;
-}
-
-/* One quiet row: a label and a small switch. On plays only here; off joins the other devices. */
-.device-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin: 6px 4px 0;
-  padding: 10px 4px 4px;
-  border-top: 1px solid var(--line);
-}
-
-.device-switch-label {
-  color: var(--muted);
-  font-size: 12.5px;
-  font-weight: 600;
-}
-
-.device-foot .switch {
-  width: 34px;
-  height: 20px;
-}
-
-.device-foot .switch.on {
-  background: var(--connect);
-}
-
-.device-foot .switch span {
-  width: 14px;
-  height: 14px;
-}
-
-.device-foot .switch.on span {
-  transform: translateX(14px);
-}
-
-.device-empty {
-  margin: 6px 8px 4px;
 }
 
 .menu {

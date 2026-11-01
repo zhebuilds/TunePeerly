@@ -185,15 +185,6 @@ pub struct LiveInner {
     pub sync_requests: HashMap<String, Instant>,
     /// Sync requests this computer answered recently, keyed like `sync_requests`.
     pub sync_replies: HashMap<String, Instant>,
-    /// Last device-control report seen from each device, as (epoch, seq).
-    pub connect_seen: HashMap<String, (u64, u64)>,
-    /// Device-control messages counted per sender and kind.
-    pub connect_rate: HashMap<String, crate::connect::RateWindow>,
-    /// Number of the last device-control report this computer sent.
-    pub connect_seq: u64,
-    /// This computer left device control to play on its own. Kept in memory only, so every start
-    /// joins the group again.
-    pub connect_detached: bool,
 }
 
 pub enum Cmd {
@@ -215,10 +206,6 @@ pub enum Cmd {
     Resolve { feature: String, take: bool },
     Download(String),
     Activity { playing: bool, local_file_id: Option<String>, buffer_enough: bool },
-    /// A device-control message from the player. Reports go to every device, the rest to `to`.
-    Connect { kind: String, to: Option<String>, body: Value },
-    /// Leaves device control to play on its own, or joins it again.
-    ConnectMode { detached: bool },
     CloseRoutes,
     /// Announces this device at once and collects the Nearby list again; does nothing while discovery is off.
     RefreshNearby,
@@ -504,16 +491,6 @@ async fn run(
                             guard.playing = playing;
                             guard.current_local = local_file_id;
                             guard.buffer_enough = buffer_enough;
-                        }
-                    }
-                    Cmd::Connect { kind, to, body } => {
-                        send_connect(&db, &live, &peers, &kind, to.as_deref(), &body);
-                    }
-                    Cmd::ConnectMode { detached } => {
-                        let changed = live.inner.lock().map(|mut state| std::mem::replace(&mut state.connect_detached, detached) != detached).unwrap_or(false);
-                        // The others forget this computer at once instead of waiting for it to go quiet.
-                        if changed && detached {
-                            send_connect(&db, &live, &peers, "connect-leave", None, &json!({"v": crate::connect::VERSION}));
                         }
                     }
                     Cmd::CloseRoutes => bus.close_routes(),
@@ -2896,8 +2873,6 @@ fn handle_frame(
             if value.get("kind").and_then(Value::as_str) == Some("hello") {
                 accept_hello(db, material, peers, published_holdings, device_id, &value);
                 publish(app, db, live, peers);
-            } else if refuse_detached_connect(db, peers, live, device_id, &value) {
-                // A control for a computer that plays on its own: refused above.
             } else if !reply_sync_request(db, peers, live, device_id, &value)
                 && !reply_history_request(db, peers, device_id, &value)
             {
@@ -3296,38 +3271,8 @@ fn apply_message(
             let _ = guard.add_notice("sync", device_id, &name, &feature);
             eprintln!("sync {feature} from {}: applied", short_id(device_id));
         }
-        kind if crate::connect::KINDS.contains(&kind) => {
-            // Like a private session: an incognito computer neither shows nor obeys other devices.
-            if !data_sync_open(&guard) || guard.is_blocked(device_id).unwrap_or(true) {
-                return;
-            }
-            drop(guard);
-            let Some(body) = crate::connect::sanitize(kind, value) else { return };
-            let Ok(mut state) = live.inner.lock() else { return };
-            // A computer that left plays on its own: no reports, controls or transfers get through.
-            if crate::connect::inbound(state.connect_detached, kind) != crate::connect::Inbound::Forward {
-                return;
-            }
-            let (rate_key, max) = if kind == "connect-state" {
-                (format!("{device_id}:state"), crate::connect::STATE_RATE)
-            } else {
-                (format!("{device_id}:cmd"), crate::connect::COMMAND_RATE)
-            };
-            if !crate::connect::allow(&mut state.connect_rate, &rate_key, Instant::now(), max) {
-                return;
-            }
-            if kind == "connect-state" {
-                let epoch = body.get("epoch").and_then(Value::as_u64).unwrap_or(0);
-                let seq = body.get("seq").and_then(Value::as_u64).unwrap_or(0);
-                if !crate::connect::fresh_state(&mut state.connect_seen, device_id, epoch, seq) {
-                    return;
-                }
-            }
-            drop(state);
-            let _ = app.emit("connect", json!({"from": device_id, "kind": kind, "body": body}));
-            return;
-        }
-        // Messages this version does not know change nothing, so the library is not reloaded.
+        // Messages this version does not know change nothing, so the library is not reloaded. This
+        // includes the device-control messages ("connect-*") that older versions still send.
         _ => return,
     }
     drop(guard);
@@ -3722,84 +3667,6 @@ fn resolve_pending(app: &AppHandle, db: &Arc<Mutex<Db>>, feature: &str, take: bo
     clear_pending(&guard, feature);
     drop(guard);
     let _ = app.emit("library-updated", json!({}));
-}
-
-/// A control or transfer that reached this computer while it plays on its own is answered with a
-/// refusal here, so it never reaches the player and the sender is not left waiting. True when the
-/// message was one of those.
-fn refuse_detached_connect(
-    db: &Arc<Mutex<Db>>,
-    peers: &HashMap<String, PeerOut>,
-    live: &Live,
-    device_id: &str,
-    value: &Value,
-) -> bool {
-    if !live.inner.lock().map(|state| state.connect_detached).unwrap_or(false) {
-        return false;
-    }
-    let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
-    if crate::connect::inbound(true, kind) != crate::connect::Inbound::Refuse {
-        return false;
-    }
-    let allowed = db.lock().ok().is_some_and(|guard| data_sync_open(&guard) && !guard.is_blocked(device_id).unwrap_or(true));
-    if !allowed {
-        return true;
-    }
-    let within = live.inner.lock().is_ok_and(|mut state| {
-        crate::connect::allow(&mut state.connect_rate, &format!("{device_id}:cmd"), Instant::now(), crate::connect::COMMAND_RATE)
-    });
-    if !within {
-        return true;
-    }
-    if let Some(answer) = crate::connect::refusal(kind, value).and_then(|body| crate::connect::sanitize("connect-ack", &body)) {
-        send_message(peers, device_id, &answer);
-    }
-    true
-}
-
-/// A random number for this run of the app, so devices can tell a restart from an old report.
-fn connect_epoch() -> u64 {
-    static EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *EPOCH.get_or_init(|| rand::random::<u32>() as u64)
-}
-
-fn send_connect(
-    db: &Arc<Mutex<Db>>,
-    live: &Live,
-    peers: &HashMap<String, PeerOut>,
-    kind: &str,
-    to: Option<&str>,
-    body: &Value,
-) {
-    let open = db.lock().ok().is_some_and(|guard| data_sync_open(&guard));
-    if !open || peers.values().all(|peer| !peer.ready) {
-        return;
-    }
-    let detached = live.inner.lock().map(|state| state.connect_detached).unwrap_or(false);
-    if !crate::connect::outbound_allowed(detached, kind) {
-        return;
-    }
-    let Some(mut message) = crate::connect::sanitize(kind, body) else {
-        eprintln!("connect: {kind} not sent, malformed");
-        return;
-    };
-    if kind == "connect-leave" {
-        broadcast(peers, &message);
-        return;
-    }
-    if kind == "connect-state" {
-        let seq = live.inner.lock().map(|mut state| {
-            state.connect_seq += 1;
-            state.connect_seq
-        });
-        let Ok(seq) = seq else { return };
-        message["epoch"] = json!(connect_epoch());
-        message["seq"] = json!(seq);
-        broadcast(peers, &message);
-        return;
-    }
-    let Some(to) = to.filter(|id| crate::connect::is_device_id(id)) else { return };
-    send_message(peers, to, &message);
 }
 
 /// Sends one message to a paired device that has said hello on its current connection.

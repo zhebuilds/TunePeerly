@@ -24,43 +24,6 @@ import {
   type QueueState,
   type TrackRef,
 } from "../player/advance";
-import {
-  ACK_TIMEOUT_MS,
-  CONNECT_VERSION,
-  HEARTBEAT_PAUSED_MS,
-  HEARTBEAT_PLAYING_MS,
-  MAX_PAST,
-  MAX_REFS,
-  MAX_STATE_QUEUE,
-  acceptsInbound,
-  addOverlay,
-  commandId,
-  contextIdFrom,
-  contextKindOf,
-  extrapolate,
-  forgetDevice,
-  isContentId,
-  isFresh,
-  isPortableContext,
-  nextClaim,
-  pickAction,
-  pickActive,
-  receiveState,
-  safeName,
-  settleOverlay,
-  throttle,
-  viewOf,
-  windowAround,
-  type ConnectAck,
-  type ConnectCommand,
-  type ConnectMeta,
-  type ConnectState,
-  type ConnectTransfer,
-  type Overlay,
-  type RemoteEntry,
-  type RemoteView,
-} from "../player/connect";
-import { clock, transport } from "../player/clock";
 import { PlaybackEngine, type EngineEvents } from "../player/engine";
 
 export type RouteName =
@@ -93,66 +56,6 @@ export type DialogState =
 export type Toast = { id: number; text: string };
 
 const emptyQueue: QueueState = { order: "manual", repeat: "off", contextId: "library", past: [], current: null, future: [], positionSec: 0 };
-
-/** A song another device reported, shown with what this computer knows about it. */
-function metaTrack(meta: ConnectMeta, deviceId: string, favoriteIds: ReadonlySet<string>): Track {
-  return {
-    contentId: meta.contentId,
-    localFileId: null,
-    title: meta.title,
-    artist: meta.artist,
-    album: meta.album,
-    trackNumber: null,
-    durationMs: meta.durationMs,
-    folder: "",
-    fileName: "",
-    addedAt: "",
-    favorite: favoriteIds.has(meta.contentId),
-    exposed: false,
-    badge: "remote",
-    accessStatus: "",
-    metadataStatus: "",
-    playbackStatus: "",
-    reasonKey: null,
-    video: false,
-    coverUrl: null,
-    absolutePath: null,
-    holderIds: [deviceId],
-    playable: false,
-    dimmed: false,
-  };
-}
-
-function metaOf(track: Track | null | undefined): ConnectMeta | null {
-  if (!track?.contentId) return null;
-  return { contentId: track.contentId, title: track.title, artist: track.artist, album: track.album, durationMs: track.durationMs ?? null };
-}
-
-function idRef(contentId: string): TrackRef {
-  return { key: contentId, contentId, localFileId: null };
-}
-
-/** This computer's claim on being the active device, kept across restarts. */
-function savedClaim(): number {
-  try {
-    const value = Number(window.localStorage.getItem("connectClaim"));
-    return Number.isSafeInteger(value) && value > 0 ? value : 0;
-  } catch {
-    return 0;
-  }
-}
-
-function saveClaim(value: number) {
-  try {
-    window.localStorage.setItem("connectClaim", String(value));
-  } catch {
-    /* storage unavailable: the claim lasts until restart */
-  }
-}
-
-/** A row of the device picker. `detached`: the device plays on its own, outside device control. */
-export type ConnectDevice = { deviceId: string; name: string; self: boolean; active: boolean; detached: boolean };
-export type RemotePlayback = RemoteView & { name: string };
 
 const PAST_LIMIT = 200;
 
@@ -237,36 +140,12 @@ function useModel() {
   const [muted, setMuted] = useState(false);
   const [lyrics, setLyrics] = useState<{ key: string; text: string } | null>(null);
   const [failure, setFailure] = useState<{ key: string; reason: string } | null>(null);
-  const [remotes, setRemotes] = useState<Record<string, RemoteEntry>>({});
-  const [activeId, setActiveId] = useState("");
-  const [overlay, setOverlay] = useState<Overlay | null>(null);
-  /** This computer left device control to play on its own. Not saved: every start joins again. */
-  const [detached, setDetached] = useState(false);
-  /** Other devices that said they play on their own, until they report again. */
-  const [detachedPeers, setDetachedPeers] = useState<ReadonlySet<string>>(() => new Set());
   const [downloadFeed, setDownloadFeed] = useState<DownloadFeed | null>(null);
   const [search, setSearch] = useState("");
 
   const queueRef = useRef(queue);
   const volumeRef = useRef(1);
   const mutedRef = useRef(false);
-  const remotesRef = useRef(remotes);
-  const activeRef = useRef("");
-  const overlayRef = useRef(overlay);
-  overlayRef.current = overlay;
-  const detachedRef = useRef(false);
-  /** Rejoined with music playing here: it becomes the active one once the others' claims are known. */
-  const claimOnJoinRef = useRef<number | undefined>(undefined);
-  const detachedPeersRef = useRef<ReadonlySet<string>>(detachedPeers);
-  const claimRef = useRef(savedClaim());
-  /** The highest claim seen from any device, kept when a device that left is forgotten. */
-  const claimFloorRef = useRef(0);
-  /** Ids of the latest commands this computer carried out for other devices. */
-  const doneRef = useRef<string[]>([]);
-  const pendingRef = useRef(new Map<string, { timer: number; transfer: boolean }>());
-  const connectIn = useRef<((from: string, kind: string, body: unknown) => void) | null>(null);
-  const publishTimer = useRef<number | undefined>(undefined);
-  const lastPublish = useRef({ at: 0, signature: "" });
   const bootRef = useRef(boot);
   bootRef.current = boot;
   const membersRef = useRef(members);
@@ -445,10 +324,6 @@ function useModel() {
           history: row.history ?? prev?.history ?? [],
         }));
       }),
-      listen<{ from: string; kind: string; body: unknown }>("connect", (event) => {
-        if (disposed || !event.payload || typeof event.payload.from !== "string") return;
-        connectIn.current?.(event.payload.from, String(event.payload.kind ?? ""), event.payload.body);
-      }),
     ]).catch(() => [] as (() => void)[]);
     return () => {
       disposed = true;
@@ -460,13 +335,6 @@ function useModel() {
     };
   }, [refresh, scheduleRefresh, t, toast, engine]);
 
-  const publishRef = useRef<() => void>(() => {});
-  /** Sends this computer's playback to the other devices soon, once a burst of changes settles. */
-  const schedulePublish = useCallback(() => {
-    window.clearTimeout(publishTimer.current);
-    publishTimer.current = window.setTimeout(() => publishRef.current(), 60);
-  }, []);
-
   const commit = useCallback((state: QueueState, position: number = engine.position) => {
     const trimmed = state.past.length > PAST_LIMIT ? { ...state, past: state.past.slice(-PAST_LIMIT) } : state;
     queueRef.current = trimmed;
@@ -477,8 +345,7 @@ function useModel() {
       saved.contextKeys = context.current.tracks.slice(0, 2000).map(trackKey);
     }
     void api.savePlayer(saved as unknown as QueueState).catch(() => {});
-    schedulePublish();
-  }, [engine, schedulePublish]);
+  }, [engine]);
 
   const contextTracks = useCallback((id: string): Track[] => {
     const all = bootRef.current?.tracks ?? [];
@@ -564,7 +431,7 @@ function useModel() {
     loadLyrics(track);
   }, [engine, loadLyrics]);
 
-  const playListLocal = useCallback((list: Track[], at: number, contextId: string, shuffle = false) => {
+  const playList = useCallback((list: Track[], at: number, contextId: string, shuffle = false) => {
     const chosen = list[at];
     if (!chosen) return;
     if (!chosen.playable) {
@@ -578,7 +445,7 @@ function useModel() {
     startCurrent(state);
   }, [commit, setNotice, startCurrent, t]);
 
-  const playAllLocal = useCallback((list: Track[], contextId: string, shuffle = false) => {
+  const playAll = useCallback((list: Track[], contextId: string, shuffle = false) => {
     const playable = list.filter((track) => track.playable);
     if (playable.length === 0) {
       setNotice(t("notice.nothingPlayable"));
@@ -591,10 +458,10 @@ function useModel() {
       startCurrent(state);
       return;
     }
-    playListLocal(list, list.indexOf(playable[0]), contextId, false);
-  }, [commit, playListLocal, setNotice, startCurrent, t]);
+    playList(list, list.indexOf(playable[0]), contextId, false);
+  }, [commit, playList, setNotice, startCurrent, t]);
 
-  const shuffleLibraryLocal = useCallback(() => {
+  const shuffleLibrary = useCallback(() => {
     const pool = (bootRef.current?.tracks ?? []).filter(shufflable);
     if (pool.length === 0) {
       setNotice(t("notice.nothingPlayable"));
@@ -606,7 +473,7 @@ function useModel() {
     startCurrent(state);
   }, [commit, setNotice, startCurrent, t]);
 
-  const nextLocal = useCallback(() => {
+  const next = useCallback(() => {
     const state = queueRef.current;
     const target = nextOrWrap(state, rebuildPool(state).map(refOf), Math.random);
     if (!target.current) return;
@@ -621,7 +488,7 @@ function useModel() {
     startCurrent(target);
   }, [commit, rebuildPool, startCurrent]);
 
-  const previousLocal = useCallback(() => {
+  const previous = useCallback(() => {
     const state = queueRef.current;
     if (!state.current) return;
     const target = previousState(state, engine.position, rebuildPool(state).map(refOf));
@@ -633,11 +500,11 @@ function useModel() {
     startCurrent(target);
   }, [commit, engine, rebuildPool, startCurrent]);
 
-  const toggleLocal = useCallback(() => {
+  const toggle = useCallback(() => {
     const state = queueRef.current;
     if (!state.current) {
-      if (state.future.length > 0) nextLocal();
-      else playAllLocal(library, "library");
+      if (state.future.length > 0) next();
+      else playAll(library, "library");
       return;
     }
     const track = indexRef.current.get(state.current);
@@ -648,29 +515,15 @@ function useModel() {
       engine.cue(track, resume);
     }
     engine.toggle();
-  }, [engine, library, nextLocal, playAllLocal]);
+  }, [engine, library, next, playAll]);
 
-  const jumpLocal = useCallback((at: number) => {
+  const jump = useCallback((at: number) => {
     const target = jumpTo(queueRef.current, at);
     commit(target, 0);
     startCurrent(target);
   }, [commit, startCurrent]);
 
-  /** Queue changes without messages; the device that asked shows them. */
-  const localQueue = useMemo(() => ({
-    playNext: (items: Track[]) => commit(playNext(queueRef.current, items.map(refOf))),
-    add: (items: Track[]) => commit(addToQueue(queueRef.current, items.map(refOf))),
-    insert: (at: number, items: Track[]) => {
-      const state = queueRef.current;
-      const position = Math.max(0, Math.min(at, state.future.length));
-      commit({ ...state, future: [...state.future.slice(0, position), ...items.map(refOf), ...state.future.slice(position)] });
-    },
-    remove: (at: number) => commit(removeAt(queueRef.current, at)),
-    move: (from: number, to: number) => commit(moveInQueue(queueRef.current, from, to)),
-    clear: () => commit({ ...queueRef.current, future: [] }),
-  }), [commit]);
-
-  const shuffleLocal = useCallback(() => {
+  const shuffle = useCallback(() => {
     const state = queueRef.current;
     const pool = context.current.id === state.contextId && context.current.tracks ? context.current.tracks : contextTracks(state.contextId);
     const next = toggleShuffle(state, pool.filter((track) => track.playable).map(refOf), Math.random);
@@ -680,7 +533,7 @@ function useModel() {
     }
   }, [commit, contextTracks, engine, startCurrent]);
 
-  const setVolumeLocal = useCallback((value: number) => {
+  const setVolume = useCallback((value: number) => {
     const level = Math.min(1, Math.max(0, value));
     setVolumeState(level);
     setMuted(false);
@@ -689,15 +542,13 @@ function useModel() {
     engine.setVolume(level, false);
     window.clearTimeout(volumeTimer.current);
     volumeTimer.current = window.setTimeout(() => void api.updateSetting("volume", level).catch(() => {}), 400);
-    schedulePublish();
-  }, [engine, schedulePublish]);
+  }, [engine]);
 
-  const muteLocal = useCallback((value: boolean) => {
+  const mute = useCallback((value: boolean) => {
     setMuted(value);
     mutedRef.current = value;
     engine.setVolume(volumeRef.current, value);
-    schedulePublish();
-  }, [engine, schedulePublish]);
+  }, [engine]);
 
   const patchBoot = useCallback((patch: (value: Bootstrap) => Bootstrap) => {
     setBoot((value) => (value ? patch(value) : value));
@@ -713,9 +564,6 @@ function useModel() {
       patchBoot((item) => ({ ...item, settings: { ...item.settings, [key]: value } }));
     }
     if (key === "incognito" && value === true) {
-      // Like a private session: the other devices stop seeing this one before nothing more is shared.
-      publishRef.current();
-      leaveConnect.current();
       if (engine.remoteDevice) {
         engine.halt();
         setNotice(t("notice.incognitoStopped"));
@@ -724,7 +572,6 @@ function useModel() {
     try {
       await api.updateSetting(key, value);
       if (key === "incognito") void api.network("close-route").catch(() => {});
-      if (key === "incognito" && value === false) rejoinConnect.current();
       if (key === "showUnavailable" || key === "historyCap" || key === "incognito") scheduleRefresh();
     } catch (error) {
       // Undo only this setting, so a refresh that landed in the meantime is kept.
@@ -983,705 +830,40 @@ function useModel() {
   }, [applyPlayingOrder, say, scheduleRefresh]);
 
 
-  // ---- Devices: one active playback device across paired computers, as in Spotify Connect.
-  const selfId = useCallback(() => bootRef.current?.deviceId ?? "", []);
-  const incognito = useCallback(() => Boolean(bootRef.current?.settings.incognito), []);
-  const onlineIds = useCallback(
-    () => new Set((bootRef.current?.links ?? []).filter((link) => link.state === "online").map((link) => link.deviceId)),
-    [],
-  );
-  const deviceName = useCallback((deviceId: string) => bootRef.current?.links.find((link) => link.deviceId === deviceId)?.name || t("connect.otherDevice"), [t]);
-  /** The active device when it is another one; `null` while this computer plays. */
-  const remoteTarget = useCallback((): string | null => {
-    const active = activeRef.current;
-    const self = selfId();
-    return active && self && active !== self && !incognito() && !detachedRef.current ? active : null;
-  }, [incognito, selfId]);
-
-  const contextNameOf = useCallback((contextId: string): string => {
-    const [kind, ...rest] = contextId.split(":");
-    const value = rest.join(":");
-    switch (kind) {
-      case "playlist":
-        return bootRef.current?.playlists.find((item) => item.id === value)?.name ?? "";
-      case "album":
-        return albumParts(value).album;
-      case "artist":
-      case "remote":
-        return value;
-      case "folder":
-        return safeName(value);
-      case "device":
-        return bootRef.current?.links.find((link) => link.deviceId === value)?.name ?? "";
-      default:
-        return "";
-    }
-  }, []);
-
-  const publishNow = useCallback(() => {
-    window.clearTimeout(publishTimer.current);
-    if (incognito() || detachedRef.current || !selfId()) return;
-    const state = queueRef.current;
-    const track = engine.current ?? indexRef.current.get(state.current) ?? null;
-    // Queue positions are counted the same on both sides, so the list stops at the first song without an id.
-    const future: ConnectMeta[] = [];
-    for (const ref of state.future) {
-      if (future.length >= MAX_STATE_QUEUE) break;
-      const meta = metaOf(indexRef.current.get(ref));
-      if (!meta) break;
-      future.push(meta);
-    }
-    const body: ConnectState = {
-      v: CONNECT_VERSION,
-      claim: claimRef.current,
-      playing: engine.playing,
-      positionSec: Math.max(0, engine.position || 0),
-      volume: volumeRef.current,
-      muted: mutedRef.current,
-      track: metaOf(track),
-      queue: { future, order: state.order, repeat: state.repeat, contextKind: contextKindOf(state.contextId), contextName: contextNameOf(state.contextId) },
-      done: doneRef.current.slice(-16),
-    };
-    lastPublish.current = { at: performance.now(), signature: publishSignature() };
-    void api.network("connect", { kind: "connect-state", body }).catch(() => {});
-  }, [contextNameOf, engine, incognito, selfId]);
-  publishRef.current = publishNow;
-
-  /** What other devices see; a change is sent at once instead of waiting for the next report. */
-  const publishSignature = () => {
-    const state = queueRef.current;
-    return [
-      engine.current?.contentId ?? state.current?.contentId ?? "",
-      engine.playing,
-      claimRef.current,
-      volumeRef.current,
-      mutedRef.current,
-      state.order,
-      state.repeat,
-      state.contextId,
-      state.future.slice(0, MAX_STATE_QUEUE).map((item) => item.key).join(","),
-    ].join("|");
-  };
-
-  const sendConnect = useCallback((kind: string, to: string | null, body: unknown) => {
-    void api.network("connect", { kind, to, body }).catch(() => {});
-  }, []);
-
-  const reevaluateRef = useRef<() => void>(() => {});
-
-  const claim = useCallback(() => {
-    claimRef.current = nextClaim(claimRef.current, remotesRef.current, claimFloorRef.current);
-    saveClaim(claimRef.current);
-    reevaluateRef.current();
-    publishNow();
-  }, [publishNow]);
-
-  /** The active device went away: its song and queue continue here, paused where it was. */
-  const takeOver = useCallback((entry: RemoteEntry, now: number) => {
-    const position = extrapolate(entry, now);
-    const resolve = (contentId: string) => indexRef.current.get(idRef(contentId));
-    const track = entry.track ? resolve(entry.track.contentId) : undefined;
-    if (track) {
-      const futureTracks = entry.queue.future.map((item) => resolve(item.contentId)).filter((item): item is Track => Boolean(item));
-      const contextId = contextIdFrom(entry.queue.contextKind, entry.queue.contextName);
-      context.current = { id: contextId, tracks: isPortableContext(entry.queue.contextKind) ? null : [track, ...futureTracks] };
-      const state: QueueState = { ...queueRef.current, order: entry.queue.order, repeat: entry.queue.repeat, contextId, current: refOf(track), future: futureTracks.map(refOf), positionSec: position };
-      setFailure(null);
-      commit(state, position);
-      engine.cue(track, position);
-      loadLyrics(track);
-    }
-    claimRef.current = nextClaim(claimRef.current, remotesRef.current, claimFloorRef.current);
-    saveClaim(claimRef.current);
-    toast(t("connect.fallback", { name: deviceName(entry.deviceId) }));
-    publishNow();
-  }, [commit, deviceName, engine, loadLyrics, publishNow, t, toast]);
-
-  const reevaluate = useCallback(() => {
-    const self = selfId();
-    if (!self) return;
-    const now = performance.now();
-    const online = incognito() || detachedRef.current ? new Set<string>() : onlineIds();
-    const next = pickActive(self, claimRef.current, remotesRef.current, online, now);
-    const before = activeRef.current || self;
-    if (next === before) {
-      if (!activeRef.current) {
-        activeRef.current = next;
-        setActiveId(next);
-      }
-      return;
-    }
-    activeRef.current = next;
-    setActiveId(next);
-    setOverlay(null);
-    if (next !== self) {
-      // Only one device plays: another one took over.
-      if (engine.playing) engine.pause();
-      return;
-    }
-    const gone = remotesRef.current[before];
-    if (gone && !incognito() && !detachedRef.current && (!online.has(before) || !isFresh(gone, now))) takeOver(gone, now);
-  }, [engine, incognito, onlineIds, selfId, takeOver]);
-  reevaluateRef.current = reevaluate;
-
-  const setRemoteEntries = useCallback((next: Record<string, RemoteEntry>) => {
-    remotesRef.current = next;
-    setRemotes(next);
-  }, []);
-
-  /** Incognito: forget the other devices without taking over their playback. */
-  const leaveConnect = useRef<() => void>(() => {});
-  leaveConnect.current = () => {
-    setRemoteEntries({});
-    activeRef.current = selfId();
-    setActiveId(selfId());
-    setOverlay(null);
-  };
-  const rejoinConnect = useRef<() => void>(() => {});
-  rejoinConnect.current = () => {
-    if (detachedRef.current) return;
-    if (engine.playing) claim();
-    else publishNow();
-  };
-
-  const finishPending = useCallback((id: string) => {
-    const pending = pendingRef.current.get(id);
-    if (pending) window.clearTimeout(pending.timer);
-    pendingRef.current.delete(id);
-    return pending;
-  }, []);
-
-  /** Sends a control to the active device and shows its effect until the device confirms it. */
-  const sendCommand = useCallback((target: string, command: ConnectCommand, patch?: Omit<Overlay, "ids" | "at">) => {
-    const id = commandId();
-    sendConnect("connect-cmd", target, { v: CONNECT_VERSION, id, ...command });
-    if (patch) {
-      setOverlay((value) => addOverlay(value, id, patch, performance.now()));
-      window.setTimeout(() => setOverlay((value) => settleOverlay(value, [], performance.now())), ACK_TIMEOUT_MS + 50);
-    }
-    const timer = window.setTimeout(() => {
-      const pending = finishPending(id);
-      if (pending?.transfer) setNotice(t("connect.noResponse", { name: deviceName(target) }));
-    }, ACK_TIMEOUT_MS);
-    pendingRef.current.set(id, { timer, transfer: command.op === "transfer" });
-  }, [deviceName, finishPending, sendConnect, setNotice, t]);
-
-  /** Moves this computer's playback to another device, which becomes the active one. */
-  const transferTo = useCallback((target: string) => {
-    if (target === selfId() || incognito() || detachedRef.current) return;
-    if (detachedPeersRef.current.has(target)) {
-      setNotice(t("connect.detachedThere"));
-      return;
-    }
-    const state = queueRef.current;
-    const ids = (items: TrackRef[]) => items.map((item) => indexRef.current.get(item)?.contentId ?? item.contentId).filter(isContentId);
-    const currentTrack = indexRef.current.get(state.current);
-    const id = commandId();
-    const body: ConnectTransfer = {
-      v: CONNECT_VERSION,
-      id,
-      positionSec: Math.max(0, engine.position || state.positionSec || 0),
-      playing: engine.playing,
-      queue: {
-        past: ids(state.past).slice(-MAX_PAST),
-        current: currentTrack?.contentId ?? null,
-        future: ids(state.future).slice(0, MAX_REFS),
-        order: state.order,
-        repeat: state.repeat,
-        contextKind: contextKindOf(state.contextId),
-        contextName: contextNameOf(state.contextId),
-      },
-    };
-    sendConnect("connect-transfer", target, body);
-    const timer = window.setTimeout(() => {
-      if (finishPending(id)) setNotice(t("connect.noResponse", { name: deviceName(target) }));
-    }, ACK_TIMEOUT_MS * 2);
-    pendingRef.current.set(id, { timer, transfer: true });
-  }, [contextNameOf, deviceName, engine, finishPending, incognito, selfId, sendConnect, setNotice, t]);
-
-  const markDetachedPeers = useCallback((update: (set: Set<string>) => void) => {
-    const next = new Set(detachedPeersRef.current);
-    update(next);
-    if (next.size === detachedPeersRef.current.size && [...next].every((id) => detachedPeersRef.current.has(id))) return;
-    detachedPeersRef.current = next;
-    setDetachedPeers(next);
-  }, []);
-
-  /**
-   * Leaves device control: this computer keeps its own song and queue and plays on its own, and the
-   * others forget it. Used both by a computer that was only a remote and by the active one ("play
-   * only here"); the device that is playing elsewhere keeps playing.
-   */
-  const detach = useCallback(() => {
-    const self = selfId();
-    if (!self || incognito() || detachedRef.current) return;
-    const wasRemote = remoteTarget() !== null;
-    window.clearTimeout(claimOnJoinRef.current);
-    claimOnJoinRef.current = undefined;
-    detachedRef.current = true;
-    setDetached(true);
-    // The backend says "connect-leave" and from now on refuses controls and drops reports.
-    void api.network("connect-mode", { detached: true }).catch(() => {});
-    for (const pending of pendingRef.current.values()) window.clearTimeout(pending.timer);
-    pendingRef.current.clear();
-    setRemoteEntries({});
-    activeRef.current = self;
-    setActiveId(self);
-    setOverlay(null);
-    toast(t(wasRemote ? "connect.detachedRemote" : "connect.detachedSolo"));
-  }, [incognito, remoteTarget, selfId, setRemoteEntries, t, toast]);
-
-  /**
-   * Joins device control again. Music playing here becomes the group's playback when `claimHere`;
-   * otherwise this computer reports itself and follows whichever device is active.
-   */
-  const rejoin = useCallback(async (claimHere: boolean) => {
-    if (!detachedRef.current) return;
-    detachedRef.current = false;
-    setDetached(false);
-    // Waits until the backend lets reports out again, so the first one is not dropped.
-    await api.network("connect-mode", { detached: false }).catch(() => {});
-    publishNow();
-    if (!claimHere || !engine.playing) return;
-    // The claims of the others were forgotten while detached, so this one is taken after their
-    // answers to the report above arrive, or after a moment when nobody answers.
-    window.clearTimeout(claimOnJoinRef.current);
-    claimOnJoinRef.current = window.setTimeout(() => {
-      claimOnJoinRef.current = undefined;
-      if (engine.playing && !detachedRef.current) claim();
-    }, 1500);
-  }, [claim, engine, publishNow]);
-
-  /** The device picker: choosing a device moves playback there, or joins again while detached. */
-  const pickDevice = useCallback((target: string) => {
-    const action = pickAction({
-      self: selfId(),
-      target,
-      active: activeRef.current || selfId(),
-      detached: detachedRef.current,
-      detachedPeers: detachedPeersRef.current,
-      hasTrack: Boolean(queueRef.current.current),
-      playing: engine.playing,
-    });
-    switch (action.kind) {
-      case "unavailable":
-        setNotice(t("connect.detachedThere"));
-        return;
-      case "transfer":
-        transferTo(action.to);
-        return;
-      case "remoteTransfer":
-        sendCommand(action.via, { op: "transfer", to: action.to });
-        return;
-      case "rejoin":
-        void rejoin(action.claim);
-        return;
-      case "rejoinTransfer":
-        void (async () => {
-          detachedRef.current = false;
-          setDetached(false);
-          await api.network("connect-mode", { detached: false }).catch(() => {});
-          transferTo(action.to);
-        })();
-        return;
-      default:
-        return;
-    }
-  }, [engine, rejoin, selfId, sendCommand, setNotice, t, transferTo]);
-
-  const resolveIds = useCallback((ids: string[]) => ids.map((id) => indexRef.current.get(idRef(id))).filter((item): item is Track => Boolean(item)), []);
-
-  /** Carries out a control another device sent. The answer is `null` when it worked, or a message key. */
-  const runCommand = useCallback((from: string, body: Record<string, unknown>): string | null => {
-    const op = String(body.op ?? "");
-    if (op === "transfer") {
-      const to = String(body.to ?? "");
-      if (to !== selfId()) transferTo(to);
-      return null;
-    }
-    // Whoever sent this sees this computer as the active device; make that true here too.
-    if (activeRef.current !== selfId()) claim();
-    const at = Number(body.at ?? 0);
-    const sameAt = (index: number) => queueRef.current.future[index] && indexRef.current.get(queueRef.current.future[index])?.contentId === body.contentId;
-    switch (op) {
-      case "toggle":
-        toggleLocal();
-        return null;
-      case "play":
-        if (!engine.playing) toggleLocal();
-        return null;
-      case "pause":
-        engine.pause();
-        return null;
-      case "next":
-        nextLocal();
-        return null;
-      case "prev":
-        previousLocal();
-        return null;
-      case "seek":
-        engine.seek(Number(body.sec) || 0);
-        return null;
-      case "skip":
-        engine.skip(Number(body.delta) || 0);
-        return null;
-      case "volume":
-        setVolumeLocal(Number(body.level));
-        return null;
-      case "mute":
-        muteLocal(Boolean(body.muted));
-        return null;
-      case "repeat":
-        commit({ ...queueRef.current, repeat: body.mode === "list" || body.mode === "one" ? body.mode : "off" });
-        return null;
-      case "shuffle":
-        shuffleLocal();
-        return null;
-      case "shuffleLibrary":
-        shuffleLibraryLocal();
-        return null;
-      case "clear":
-        localQueue.clear();
-        return null;
-      case "playList": {
-        const ids = Array.isArray(body.refs) ? body.refs.filter(isContentId) : [];
-        const chosenId = ids[Number(body.index) || 0];
-        const list = resolveIds(ids);
-        const chosen = list.findIndex((track) => track.contentId === chosenId);
-        if (chosen < 0 || !list[chosen].playable) return list[chosen]?.reasonKey ?? "notice.offlineTrack";
-        playListLocal(list, chosen, contextIdFrom(String(body.contextKind ?? ""), String(body.contextName ?? "")), Boolean(body.shuffle));
-        return null;
-      }
-      case "add":
-      case "playNext":
-      case "insert": {
-        const list = resolveIds(Array.isArray(body.refs) ? body.refs.filter(isContentId) : []);
-        if (list.length === 0) return "connect.notHere";
-        if (op === "add") localQueue.add(list);
-        else if (op === "playNext") localQueue.playNext(list);
-        else localQueue.insert(at, list);
-        return null;
-      }
-      case "remove":
-        if (!sameAt(at)) return "connect.queueChanged";
-        localQueue.remove(at);
-        return null;
-      case "jump":
-        if (!sameAt(at)) return "connect.queueChanged";
-        jumpLocal(at);
-        return null;
-      case "move": {
-        const fromAt = Number(body.from ?? 0);
-        if (!sameAt(fromAt)) return "connect.queueChanged";
-        localQueue.move(fromAt, Number(body.to ?? 0));
-        return null;
-      }
-      default:
-        void from;
-        return "connect.failed";
-    }
-  }, [claim, commit, engine, jumpLocal, localQueue, muteLocal, nextLocal, playListLocal, previousLocal, resolveIds, selfId, setVolumeLocal, shuffleLibraryLocal, shuffleLocal, toggleLocal, transferTo]);
-
-  /** Playback moved here from another device. */
-  const receiveTransfer = useCallback((body: ConnectTransfer): string | null => {
-    const queueIn = body.queue;
-    const track = queueIn.current ? indexRef.current.get(idRef(queueIn.current)) : undefined;
-    if (queueIn.current && (!track || !track.playable)) return track?.reasonKey ?? "notice.offlineTrack";
-    claimRef.current = nextClaim(claimRef.current, remotesRef.current, claimFloorRef.current);
-    saveClaim(claimRef.current);
-    reevaluateRef.current();
-    if (track) {
-      const past = resolveIds(queueIn.past);
-      const future = resolveIds(queueIn.future);
-      const contextId = contextIdFrom(queueIn.contextKind, queueIn.contextName);
-      context.current = { id: contextId, tracks: isPortableContext(queueIn.contextKind) ? null : [...past, track, ...future] };
-      const state: QueueState = { order: queueIn.order, repeat: queueIn.repeat, contextId, past: past.map(refOf), current: refOf(track), future: future.map(refOf), positionSec: body.positionSec };
-      setFailure(null);
-      commit(state, body.positionSec);
-      if (body.playing) void engine.start(track, body.positionSec, true);
-      else engine.cue(track, body.positionSec);
-      loadLyrics(track);
-    }
-    publishNow();
-    return null;
-  }, [commit, engine, loadLyrics, publishNow, resolveIds]);
-
-  const rememberDone = useCallback((id: string) => {
-    doneRef.current = [...doneRef.current.filter((item) => item !== id), id].slice(-16);
-  }, []);
-
-  connectIn.current = (from, kind, raw) => {
-    if (incognito() || !raw || typeof raw !== "object" || from === selfId()) return;
-    if (!acceptsInbound(detachedRef.current, kind)) return;
-    const body = raw as Record<string, unknown>;
-    if (kind === "connect-leave") {
-      // That device plays on its own now: it is no longer active here and cannot be controlled.
-      markDetachedPeers((set) => set.add(from));
-      if (from in remotesRef.current) {
-        setRemoteEntries(forgetDevice(remotesRef.current, from));
-        if (activeRef.current === from) setOverlay(null);
-        reevaluate();
-      }
-      return;
-    }
-    if (kind === "connect-state") {
-      const state = body as unknown as ConnectState;
-      const now = performance.now();
-      const known = from in remotesRef.current;
-      claimFloorRef.current = Math.max(claimFloorRef.current, Number(state.claim) || 0);
-      const entry = receiveState(remotesRef.current[from], from, state, now);
-      if (entry === remotesRef.current[from]) return;
-      markDetachedPeers((set) => set.delete(from));
-      setRemoteEntries({ ...remotesRef.current, [from]: entry });
-      if (claimOnJoinRef.current !== undefined) {
-        window.clearTimeout(claimOnJoinRef.current);
-        claimOnJoinRef.current = undefined;
-        // Taken before the active device is worked out, so the music playing here is not paused first.
-        if (engine.playing) {
-          claim();
-          return;
-        }
-      }
-      // A device that just joined (or rejoined) learns who is playing without waiting for the next report.
-      if (!known) schedulePublish();
-      if (activeRef.current === from && overlayRef.current) setOverlay(settleOverlay(overlayRef.current, state.done ?? [], now));
-      reevaluate();
-      return;
-    }
-    if (kind === "connect-ack") {
-      const ack = body as unknown as ConnectAck;
-      const pending = finishPending(ack.id);
-      if (ack.ok) {
-        // The other device took over; stop here at once rather than when its report arrives.
-        if (pending?.transfer && !remoteTarget() && engine.playing) engine.pause();
-        return;
-      }
-      setOverlay(null);
-      if (ack.reason === "connect.detachedThere") {
-        markDetachedPeers((set) => set.add(from));
-        if (from in remotesRef.current) setRemoteEntries(forgetDevice(remotesRef.current, from));
-        reevaluate();
-      }
-      setNotice(t(ack.reason ?? "connect.failed", { defaultValue: t("connect.failed") }));
-      return;
-    }
-    const id = typeof body.id === "string" ? body.id : "";
-    if (!id) return;
-    const reason = kind === "connect-cmd" ? runCommand(from, body) : kind === "connect-transfer" ? receiveTransfer(body as unknown as ConnectTransfer) : "connect.failed";
-    rememberDone(id);
-    const ack: ConnectAck = reason ? { v: CONNECT_VERSION, id, ok: false, reason } : { v: CONNECT_VERSION, id, ok: true };
-    sendConnect("connect-ack", from, ack);
-    schedulePublish();
-  };
-
-  // Reports: changes go out within a second, and a quiet device repeats itself so it is not taken for gone.
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (incognito() || detachedRef.current || onlineIds().size === 0) return;
-      const now = performance.now();
-      const signature = publishSignature();
-      const quiet = now - lastPublish.current.at >= (engine.playing ? HEARTBEAT_PLAYING_MS : HEARTBEAT_PAUSED_MS);
-      if (quiet || signature !== lastPublish.current.signature) publishNow();
-      reevaluate();
-    }, 1000);
-    return () => window.clearInterval(timer);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [engine, incognito, onlineIds, publishNow, reevaluate]);
-
-  // Detaching is not saved: a reloaded window makes sure the backend takes part again too.
-  useEffect(() => {
-    void api.network("connect-mode", { detached: false }).catch(() => {});
-  }, []);
-
-  // A device that just connected learns at once who is playing; the second report covers a slow handshake.
-  const onlineKey = (boot?.links ?? []).filter((link) => link.state === "online").map((link) => link.deviceId).sort().join(",");
-  useEffect(() => {
-    reevaluate();
-    if (!onlineKey) return;
-    const first = window.setTimeout(() => publishNow(), 2000);
-    const second = window.setTimeout(() => publishNow(), 6000);
-    return () => {
-      window.clearTimeout(first);
-      window.clearTimeout(second);
-    };
-  }, [onlineKey, publishNow, reevaluate]);
-
-  // Controls go to the active device. Each one acts here while this computer is the active device.
-  const throttledSeek = useMemo(() => throttle<{ target: string; sec: number }>(({ target, sec }) => sendCommand(target, { op: "seek", sec }, { positionSec: sec })), [sendCommand]);
-  const throttledVolume = useMemo(() => throttle<{ target: string; level: number }>(({ target, level }) => sendCommand(target, { op: "volume", level }, { volume: level, muted: false })), [sendCommand]);
-  const remoteEntryNow = () => {
-    const target = remoteTarget();
-    const entry = target ? remotesRef.current[target] : undefined;
-    return target && entry ? { target, view: viewOf(entry, overlayRef.current) } : null;
-  };
-
-  const toggle = useCallback(() => {
-    const remote = remoteEntryNow();
-    if (remote) sendCommand(remote.target, { op: "toggle" }, { playing: !remote.view.playing });
-    else toggleLocal();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sendCommand, toggleLocal]);
+  const toggleMute = useCallback(() => mute(!mutedRef.current), [mute]);
   const play = useCallback(() => {
-    const remote = remoteEntryNow();
-    if (remote) sendCommand(remote.target, { op: "play" }, { playing: true });
-    else if (!engine.playing) toggleLocal();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [engine, sendCommand, toggleLocal]);
-  const pause = useCallback(() => {
-    const remote = remoteEntryNow();
-    if (remote) sendCommand(remote.target, { op: "pause" }, { playing: false });
-    else engine.pause();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [engine, sendCommand]);
-  const seek = useCallback((sec: number) => {
-    const target = remoteTarget();
-    if (target) throttledSeek({ target, sec: Math.max(0, sec) });
-    else engine.seek(sec);
-  }, [engine, remoteTarget, throttledSeek]);
-  const skip = useCallback((delta: number) => {
-    const remote = remoteEntryNow();
-    if (remote) sendCommand(remote.target, { op: "skip", delta }, { positionSec: Math.max(0, extrapolate(remote.view, performance.now()) + delta) });
-    else engine.skip(delta);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [engine, sendCommand]);
-  const next = useCallback(() => {
-    const target = remoteTarget();
-    if (target) sendCommand(target, { op: "next" });
-    else nextLocal();
-  }, [nextLocal, remoteTarget, sendCommand]);
-  const previous = useCallback(() => {
-    const target = remoteTarget();
-    if (target) sendCommand(target, { op: "prev" });
-    else previousLocal();
-  }, [previousLocal, remoteTarget, sendCommand]);
-  const toggleShuffleRouted = useCallback(() => {
-    const target = remoteTarget();
-    if (target) sendCommand(target, { op: "shuffle" });
-    else shuffleLocal();
-  }, [remoteTarget, sendCommand, shuffleLocal]);
-  const cycleRepeat_ = useCallback(() => {
-    const remote = remoteEntryNow();
-    if (remote) sendCommand(remote.target, { op: "repeat", mode: cycleRepeat(remote.view.queue.repeat) });
-    else commit({ ...queueRef.current, repeat: cycleRepeat(queueRef.current.repeat) });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [commit, sendCommand]);
-  const setVolume = useCallback((value: number) => {
-    const level = Math.min(1, Math.max(0, value));
-    const target = remoteTarget();
-    if (target) throttledVolume({ target, level });
-    else setVolumeLocal(level);
-  }, [remoteTarget, setVolumeLocal, throttledVolume]);
-  const toggleMute = useCallback(() => {
-    const remote = remoteEntryNow();
-    if (remote) sendCommand(remote.target, { op: "mute", muted: !remote.view.muted }, { muted: !remote.view.muted });
-    else muteLocal(!mutedRef.current);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [muteLocal, sendCommand]);
-
-  const sendList = useCallback((target: string, list: Track[], at: number, contextId: string, shuffle: boolean) => {
-    const chosen = list[at];
-    if (!chosen?.contentId) {
-      setNotice(t(chosen?.reasonKey ?? "notice.offlineTrack"));
-      return;
-    }
-    const withIds = list.filter((track, position) => position === at || Boolean(track.contentId));
-    const cut = windowAround(withIds, withIds.indexOf(chosen), MAX_REFS);
-    sendCommand(target, {
-      op: "playList",
-      refs: cut.items.map((track) => track.contentId as string),
-      index: cut.index,
-      shuffle,
-      contextKind: contextKindOf(contextId),
-      contextName: contextNameOf(contextId),
-    }, { playing: true });
-  }, [contextNameOf, sendCommand, setNotice, t]);
-
-  const playList = useCallback((list: Track[], at: number, contextId: string, shuffle = false) => {
-    const target = remoteTarget();
-    if (target) sendList(target, list, at, contextId, shuffle);
-    else playListLocal(list, at, contextId, shuffle);
-  }, [playListLocal, remoteTarget, sendList]);
-
-  const playAll = useCallback((list: Track[], contextId: string, shuffle = false) => {
-    const target = remoteTarget();
-    if (!target) {
-      playAllLocal(list, contextId, shuffle);
-      return;
-    }
-    const playable = list.filter((track) => track.playable && track.contentId);
-    if (playable.length === 0) {
-      setNotice(t("notice.nothingPlayable"));
-      return;
-    }
-    sendList(target, playable, shuffle ? Math.floor(Math.random() * playable.length) : 0, contextId, shuffle);
-  }, [playAllLocal, remoteTarget, sendList, setNotice, t]);
-
-  const shuffleLibrary = useCallback(() => {
-    const target = remoteTarget();
-    if (target) sendCommand(target, { op: "shuffleLibrary" }, { playing: true });
-    else shuffleLibraryLocal();
-  }, [remoteTarget, sendCommand, shuffleLibraryLocal]);
-
-  const jump = useCallback((at: number) => {
-    const remote = remoteEntryNow();
-    if (!remote) {
-      jumpLocal(at);
-      return;
-    }
-    const item = remote.view.queue.future[at];
-    if (item) sendCommand(remote.target, { op: "jump", at, contentId: item.contentId }, { playing: true });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jumpLocal, sendCommand]);
+    if (!engine.playing) toggle();
+  }, [engine, toggle]);
+  const pause = useCallback(() => engine.pause(), [engine]);
+  const seek = useCallback((sec: number) => engine.seek(sec), [engine]);
+  const skip = useCallback((delta: number) => engine.skip(delta), [engine]);
+  const cycleRepeatMode = useCallback(() => {
+    commit({ ...queueRef.current, repeat: cycleRepeat(queueRef.current.repeat) });
+  }, [commit]);
 
   const queueActions = useMemo(() => {
-    const ids = (items: Track[]) => items.map((track) => track.contentId).filter(isContentId).slice(0, MAX_REFS);
-    const routed = (items: Track[], send: (target: string, refs: string[]) => void, local: () => void) => {
-      const target = remoteTarget();
-      if (!target) {
-        local();
-        return true;
-      }
-      const refs = ids(items);
-      if (refs.length === 0) {
-        setNotice(t("notice.offlineTrack"));
-        return false;
-      }
-      send(target, refs);
-      return true;
-    };
     const queuedToast = (items: Track[]) => toast(items.length === 1 ? t("toast.queued") : t("toast.queuedMany", { count: items.length }));
-    const byIndex = (at: number, send: (target: string, contentId: string) => void, local: () => void) => {
-      const remote = remoteEntryNow();
-      if (!remote) {
-        local();
-        return;
-      }
-      const item = remote.view.queue.future[at];
-      if (item) send(remote.target, item.contentId);
-    };
     return {
       playNext: (items: Track[]) => {
-        if (routed(items, (target, refs) => sendCommand(target, { op: "playNext", refs }), () => localQueue.playNext(items))) {
-          toast(items.length === 1 ? t("toast.playNext") : t("toast.playNextMany", { count: items.length }));
-        }
+        commit(playNext(queueRef.current, items.map(refOf)));
+        toast(items.length === 1 ? t("toast.playNext") : t("toast.playNextMany", { count: items.length }));
       },
       add: (items: Track[]) => {
-        if (routed(items, (target, refs) => sendCommand(target, { op: "add", refs }), () => localQueue.add(items))) queuedToast(items);
+        commit(addToQueue(queueRef.current, items.map(refOf)));
+        queuedToast(items);
       },
       insert: (at: number, items: Track[]) => {
-        if (routed(items, (target, refs) => sendCommand(target, { op: "insert", at: Math.max(0, at), refs }), () => localQueue.insert(at, items))) queuedToast(items);
+        const state = queueRef.current;
+        const position = Math.max(0, Math.min(at, state.future.length));
+        commit({ ...state, future: [...state.future.slice(0, position), ...items.map(refOf), ...state.future.slice(position)] });
+        queuedToast(items);
       },
-      remove: (at: number) => byIndex(at, (target, contentId) => sendCommand(target, { op: "remove", at, contentId }), () => localQueue.remove(at)),
-      move: (from: number, to: number) => byIndex(from, (target, contentId) => sendCommand(target, { op: "move", from, to: Math.max(0, to), contentId }), () => localQueue.move(from, to)),
-      clear: () => {
-        const target = remoteTarget();
-        if (target) sendCommand(target, { op: "clear" });
-        else localQueue.clear();
-      },
+      remove: (at: number) => commit(removeAt(queueRef.current, at)),
+      move: (from: number, to: number) => commit(moveInQueue(queueRef.current, from, to)),
+      clear: () => commit({ ...queueRef.current, future: [] }),
       jump,
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jump, localQueue, remoteTarget, sendCommand, setNotice, t, toast]);
+  }, [commit, jump, t, toast]);
 
   handlers.current = {
     ended: () => {
@@ -1727,20 +909,11 @@ function useModel() {
       patchBoot((item) => ({ ...item, history: [key, ...item.history.filter((value) => value !== key)] }));
       void api.recordHistory(track.contentId, track.localFileId).catch(() => {});
     },
-    paused: (_track, position) => {
-      void api.saveProgress(position).catch(() => {});
-      schedulePublish();
-    },
-    seeked: (_track, position) => {
-      void api.saveProgress(position).catch(() => {});
-      schedulePublish();
-    },
+    paused: (_track, position) => void api.saveProgress(position).catch(() => {}),
+    seeked: (_track, position) => void api.saveProgress(position).catch(() => {}),
     progress: (position) => void api.saveProgress(position).catch(() => {}),
     activity: (playing, track, bufferEnough) => {
       void api.network("activity", { playing, localFileId: track?.localFileId ?? null, bufferEnough }).catch(() => {});
-      // Playback that starts here makes this the active device, and every other device pauses.
-      if (playing && !bootRef.current?.settings.incognito && !detachedRef.current && (claimRef.current === 0 || activeRef.current !== selfId())) claim();
-      schedulePublish();
     },
     playable: (track) => {
       if (track.playbackStatus !== "playable") void api.playbackResult(track.localFileId, track.contentId, "playable", null).catch(() => {});
@@ -1748,94 +921,21 @@ function useModel() {
   };
 
   useEffect(() => {
-    const flush = () => {
-      void api.saveProgress(engine.position).catch(() => {});
-      schedulePublish();
-    };
+    const flush = () => void api.saveProgress(engine.position).catch(() => {});
     window.addEventListener("beforeunload", flush);
     return () => window.removeEventListener("beforeunload", flush);
-  }, [engine, schedulePublish]);
+  }, [engine]);
 
-  const favoriteIds = useMemo(() => new Set(boot?.favoriteIds ?? []), [boot?.favoriteIds]);
-  const selfDevice = boot?.deviceId ?? "";
-  const remoteEntry = activeId && activeId !== selfDevice && !settings.incognito && !detached ? remotes[activeId] : undefined;
-  const remoteName = remoteEntry ? (boot?.links.find((link) => link.deviceId === remoteEntry.deviceId)?.name || t("connect.otherDevice")) : "";
-  const remote: RemotePlayback | null = useMemo(
-    () => (remoteEntry ? { ...viewOf(remoteEntry, overlay), name: remoteName } : null),
-    [remoteEntry, overlay, remoteName],
-  );
-  /** Songs of the active device's queue, shown with this computer's copy when there is one. */
-  const remoteTracks = useMemo(() => {
-    const map = new Map<string, Track>();
-    if (!remote) return map;
-    for (const meta of [remote.track, ...remote.queue.future]) {
-      if (!meta || map.has(meta.contentId)) continue;
-      map.set(meta.contentId, index.get(idRef(meta.contentId)) ?? metaTrack(meta, remote.deviceId, favoriteIds));
-    }
-    return map;
-  }, [remote, index, favoriteIds]);
-  const lookup = useCallback((ref: TrackRef | null | undefined): Track | undefined => {
-    if (!ref) return undefined;
-    return index.get(ref) ?? (ref.contentId ? remoteTracks.get(ref.contentId) : undefined);
-  }, [index, remoteTracks]);
-  const lookupRef = useRef(lookup);
-  lookupRef.current = lookup;
-  const shown = remote ? (remote.track ? remoteTracks.get(remote.track.contentId) ?? null : null) : current ?? null;
-  const shownQueue: QueueState = useMemo(() => {
-    if (!remote) return queue;
-    return {
-      order: remote.queue.order,
-      repeat: remote.queue.repeat,
-      contextId: contextIdFrom(remote.queue.contextKind, remote.queue.contextName),
-      past: [],
-      current: remote.track ? idRef(remote.track.contentId) : null,
-      future: remote.queue.future.map((item) => idRef(item.contentId)),
-      positionSec: 0,
-    };
-  }, [remote, queue]);
-  const shownQueueRef = useRef(shownQueue);
-  shownQueueRef.current = shownQueue;
-
-  // Every progress bar and play button shows the active device while another device plays.
-  useEffect(() => {
-    if (!remote) {
-      clock.show(null);
-      transport.show(null);
-      return;
-    }
-    const duration = remote.track?.durationMs ? remote.track.durationMs / 1000 : 0;
-    const tick = () => clock.show({ position: extrapolate(remote, performance.now()), duration });
-    tick();
-    transport.show({ playing: remote.playing });
-    if (!remote.playing) return;
-    const timer = window.setInterval(tick, 250);
-    return () => window.clearInterval(timer);
-  }, [remote]);
-  useEffect(() => () => {
-    clock.show(null);
-    transport.show(null);
-  }, []);
-
-  const devices: ConnectDevice[] = useMemo(() => {
-    const active = remote ? remote.deviceId : selfDevice;
-    const list: ConnectDevice[] = [{ deviceId: selfDevice, name: t("connect.thisComputer"), self: true, active: active === selfDevice, detached }];
-    if (settings.incognito) return list;
-    for (const link of boot?.links ?? []) {
-      if (link.state !== "online" || link.deviceId === selfDevice) continue;
-      const apart = detachedPeers.has(link.deviceId);
-      list.push({ deviceId: link.deviceId, name: link.name || t("connect.otherDevice"), self: false, active: !detached && !apart && link.deviceId === active, detached: apart });
-    }
-    return list;
-  }, [boot?.links, detached, detachedPeers, remote, selfDevice, settings.incognito, t]);
-
+  const shown = current ?? null;
+  const lookup = useCallback((ref: TrackRef | null | undefined): Track | undefined => (ref ? index.get(ref) : undefined), [index]);
   useEffect(() => {
     loadLyrics(shown ?? undefined);
   }, [shown, loadLyrics, lyricsEpoch]);
 
   const findTracks = useCallback((text: string, scope: "all" | "queue" | string) => {
     if (scope === "queue") {
-      const state = shownQueueRef.current;
-      return filterText([state.current, ...state.future].map((item) => lookupRef.current(item)).filter((item): item is Track => Boolean(item)), text);
+      const state = queueRef.current;
+      return filterText([state.current, ...state.future].map((item) => indexRef.current.get(item)).filter((item): item is Track => Boolean(item)), text);
     }
     if (scope.startsWith("playlist:")) return filterText(indexRef.current.members(membersRef.current[scope.slice(9)] ?? []), text);
     return null;
@@ -1851,20 +951,13 @@ function useModel() {
     recent,
     index,
     members,
-    queue: shownQueue,
+    queue,
     current: shown,
     shown,
     lookup,
     engine,
-    volume: remote ? remote.volume : volume,
-    muted: remote ? remote.muted : muted,
-    remote,
-    devices,
-    activeId: remote ? remote.deviceId : selfId(),
-    transferTo: pickDevice,
-    detached,
-    detach,
-    rejoin,
+    volume,
+    muted,
     lyrics,
     failure,
     downloadFeed,
@@ -1906,8 +999,8 @@ function useModel() {
     next,
     previous,
     queueActions,
-    toggleShuffle: toggleShuffleRouted,
-    cycleRepeat: cycleRepeat_,
+    toggleShuffle: shuffle,
+    cycleRepeat: cycleRepeatMode,
     setVolume,
     toggleMute,
     setSetting,

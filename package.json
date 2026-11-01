@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test src/player/advance.test.ts src/player/connect.test.ts src/lib/lrc.test.ts src/lib/devices.test.ts",
+    "test": "node --experimental-strip-types --test src/player/advance.test.ts src/lib/lrc.test.ts src/lib/devices.test.ts",
     "tauri": "tauri"
   },
   "dependencies": {

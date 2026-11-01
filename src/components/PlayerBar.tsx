@@ -4,7 +4,6 @@ import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { useApp } from "../app/model";
 import { coverSrc, Cover } from "./Cover";
-import { ConnectStrip, DevicePicker, useConnectStrip } from "./DevicePicker";
 import { clockText } from "../lib/format";
 import { displayTitle, trackKey } from "../lib/library";
 import { clock, transport } from "../player/clock";
@@ -17,28 +16,16 @@ export function PlayerBar() {
   const track = app.shown;
   const order = app.queue.order;
   const repeat = app.queue.repeat;
-  const failed = Boolean(!app.remote && track && app.failure?.key === trackKey(track));
-  // The badge names the device the sound comes from: the active device, or the one streaming to this computer.
-  const remoteName = app.remote
-    ? app.remote.name
-    : app.engine.remoteDevice
-      ? app.boot?.links.find((link) => link.deviceId === app.engine.remoteDevice)?.name
-      : null;
+  const failed = Boolean(track && app.failure?.key === trackKey(track));
+  // The badge names the device streaming to this computer, if any.
+  const remoteName = app.engine.remoteDevice ? app.boot?.links.find((link) => link.deviceId === app.engine.remoteDevice)?.name : null;
   const showPlaying = playing;
 
   useMediaSession();
   useDesktopNowPlaying();
-  // The device list opens from its button and from the "Playing on" strip under the player.
-  const [pickerOpen, setPickerOpen] = useState(false);
-  // The "Playing on" strip takes a row of its own; the page, panels and toasts make room through --player-h.
-  const strip = useConnectStrip();
-  useEffect(() => {
-    document.documentElement.classList.toggle("connect-shown", strip);
-    return () => document.documentElement.classList.remove("connect-shown");
-  }, [strip]);
 
   return (
-    <footer className={`player-bar${app.remote ? " remote" : ""}${strip ? " linked" : ""}`}>
+    <footer className="player-bar">
       <div className="player-left">
         {track ? (
           <>
@@ -99,14 +86,12 @@ export function PlayerBar() {
         <button type="button" className={`icon-btn${app.queueOpen ? " on" : ""}`} aria-label={t("player.queue")} title={t("player.queue")} aria-pressed={app.queueOpen} onClick={() => app.setQueueOpen(!app.queueOpen)}>
           <Icons.queue />
         </button>
-        <DevicePicker open={pickerOpen} setOpen={setPickerOpen} />
         <Volume />
         <button type="button" className={`icon-btn notice-btn${app.noticesOpen ? " on" : ""}`} aria-label={t("player.notices")} title={t("player.notices")} aria-pressed={app.noticesOpen} onClick={() => app.setNoticesOpen(!app.noticesOpen)}>
           <Icons.bell />
           {app.unreadNotices > 0 && <span className="notice-badge">{app.unreadNotices > 99 ? "99+" : app.unreadNotices}</span>}
         </button>
       </div>
-      <ConnectStrip open={pickerOpen} setOpen={setPickerOpen} />
     </footer>
   );
 }
@@ -214,7 +199,6 @@ function useDesktopNowPlaying() {
       artist: track?.artist ?? "",
       album: track?.album ?? "",
       coverPath: cover,
-      // The system controls show and steer the active device, wherever it is.
       playing: Boolean(track) && playing,
       favorite: Boolean(track?.favorite),
       duration,

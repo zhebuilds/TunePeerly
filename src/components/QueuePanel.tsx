@@ -14,7 +14,6 @@ export function QueuePanel() {
   const { t } = useTranslation();
   const app = useApp();
   const { playing } = useSyncExternalStore(transport.subscribe, transport.get);
-  // While another device plays, this is that device's queue.
   const future = app.queue.future.map((ref) => ({ ref, track: app.lookup(ref) }));
   const contextLabel = useContextLabel(app.queue.contextId);
 
@@ -148,8 +147,6 @@ function useContextLabel(contextId: string): string {
       return t("nav.search");
     case "added":
       return t("home.added");
-    case "remote":
-      return value || t("connect.theirQueue");
     default:
       return t("nav.allMusic");
   }
