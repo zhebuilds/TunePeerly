@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::dbkey::{self, KEY_LEN};
 use crate::error::{AppError, AppResult};
 use crate::sync_logic::{merge_history, HistoryEntry, MemberRef};
 
@@ -70,13 +71,94 @@ pub struct Db {
     pub cache_dir: PathBuf,
 }
 
+/// The library database, encrypted with the key in `db.key` beside it.
+/// A database that key cannot open (the key file lost, or sealed under another Windows account) is
+/// renamed aside with its key file and a new library starts, so the app still opens and the old
+/// file stays recoverable by whoever has the right key.
+fn open_encrypted(database: &Path) -> AppResult<Connection> {
+    let key_file = database.with_file_name(dbkey::KEY_NAME);
+    let key = match dbkey::load_or_create(&key_file) {
+        Ok(key) => key,
+        Err(err) if database.exists() => {
+            set_aside(database, &key_file, &err.to_string())?;
+            dbkey::load_or_create(&key_file)?
+        }
+        Err(err) => return Err(err),
+    };
+    match unlock(database, &key) {
+        Err(AppError::Sql(err)) if err.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase) => {
+            set_aside(database, &key_file, &err.to_string())?;
+            unlock(database, &dbkey::load_or_create(&key_file)?)
+        }
+        other => other,
+    }
+}
+
+fn unlock(database: &Path, key: &[u8; KEY_LEN]) -> AppResult<Connection> {
+    // A raw 256-bit key in SQLCipher's `x'…'` form skips its passphrase KDF; the key is random already.
+    let key = format!("x'{}'", data_encoding::HEXUPPER.encode(key));
+    let mut header = [0u8; 16];
+    let plain = std::fs::File::open(database).and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header)).is_ok()
+        && &header == b"SQLite format 3\0";
+    if plain {
+        encrypt_plain(database, &key)?;
+    }
+    let conn = Connection::open(database)?;
+    conn.pragma_update(None, "key", &key)?;
+    // A wrong key only shows on the first read.
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
+    Ok(conn)
+}
+
+/// A library from before encryption. SQLCipher cannot encrypt a file in place, so the data is
+/// exported into an encrypted copy, which then replaces the plain file.
+fn encrypt_plain(database: &Path, key: &str) -> AppResult<()> {
+    let copy = beside(database, ".encrypting");
+    if copy.exists() {
+        std::fs::remove_file(&copy)?;
+    }
+    {
+        let plain = Connection::open(database)?;
+        // Folds any WAL into the main file first, so the export sees every committed row.
+        plain.pragma_update(None, "journal_mode", "DELETE")?;
+        let version: i64 = plain.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        plain.execute("ATTACH DATABASE ?1 AS encrypted KEY ?2", rusqlite::params![copy.to_string_lossy(), key])?;
+        plain.query_row("SELECT sqlcipher_export('encrypted')", [], |_| Ok(()))?;
+        plain.execute_batch(&format!("PRAGMA encrypted.user_version = {version}; DETACH DATABASE encrypted;"))?;
+    }
+    for stale in [beside(database, "-wal"), beside(database, "-shm")] {
+        if stale.exists() {
+            std::fs::remove_file(stale)?;
+        }
+    }
+    std::fs::rename(&copy, database)?;
+    Ok(())
+}
+
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn set_aside(database: &Path, key_file: &Path, reason: &str) -> AppResult<()> {
+    let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+    eprintln!("database {} cannot be opened ({reason}); starting a new library and keeping the old one beside it", database.display());
+    for path in [database.to_path_buf(), beside(database, "-wal"), beside(database, "-shm"), key_file.to_path_buf()] {
+        if path.exists() {
+            std::fs::rename(&path, beside(&path, &format!(".unreadable-{stamp}")))?;
+        }
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(database: &Path, app_dir: PathBuf, cache_dir: PathBuf) -> AppResult<Self> {
         if let Some(parent) = database.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::create_dir_all(cache_dir.join("covers"))?;
-        let conn = Connection::open(database)?;
+        let conn = open_encrypted(database)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -92,13 +174,27 @@ impl Db {
     }
 
     fn migrate(&self) -> AppResult<()> {
+        // Pairings made under the retired Signal identity pinned keys this device no longer has.
+        // Drop them with that identity, so the device gets a new TLS key and pairs again.
+        let signal_era: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'signal_state')",
+            [],
+            |row| row.get(0),
+        )?;
+        if signal_era {
+            self.conn.execute_batch("DROP TABLE signal_state; DROP TABLE IF EXISTS peers;")?;
+        }
         self.conn.execute_batch(SCHEMA)?;
         self.add_column_if_missing("local_files", "cover_checked", "INTEGER NOT NULL DEFAULT 0")?;
         // Time and size of the `.lrc` next to the song, so a lyrics file added later is noticed.
         self.add_column_if_missing("local_files", "lyrics_stamp", "TEXT")?;
-        self.add_column_if_missing("peers", "trust", "TEXT NOT NULL DEFAULT 'full'")?;
         self.add_column_if_missing("notices", "read", "INTEGER NOT NULL DEFAULT 1")?;
         self.add_column_if_missing("notices", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
+        // Left over from removals that were shared between devices; a removal is local now.
+        self.drop_column_if_present("peers", "paired_at")?;
+        self.drop_column_if_present("removed_devices", "removed_by")?;
+        // Left over from the retired safety-number check; pairing checks a code now.
+        self.drop_column_if_present("peers", "safety_number")?;
         // Tables and switches left behind when sync revisions, the mailbox, and the old on/off toggles were removed.
         self.conn.execute_batch(
             "DROP TABLE IF EXISTS mailbox_acks;
@@ -128,6 +224,18 @@ impl Db {
         if !names.iter().any(|name| name == column) {
             self.conn
                 .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))?;
+        }
+        Ok(())
+    }
+
+    fn drop_column_if_present(&self, table: &str, column: &str) -> AppResult<()> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if names.iter().any(|name| name == column) {
+            self.conn
+                .execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))?;
         }
         Ok(())
     }
@@ -270,20 +378,20 @@ impl Db {
         Ok(Value::Object(out))
     }
 
-    pub fn signal_blob(&self, key: &str) -> AppResult<Option<Vec<u8>>> {
+    pub fn identity_blob(&self, key: &str) -> AppResult<Option<Vec<u8>>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT value FROM signal_state WHERE key = ?1",
+                "SELECT value FROM device_identity WHERE key = ?1",
                 params![key],
                 |row| row.get(0),
             )
             .optional()?)
     }
 
-    pub fn set_signal_blob(&self, key: &str, value: &[u8]) -> AppResult<()> {
+    pub fn set_identity_blob(&self, key: &str, value: &[u8]) -> AppResult<()> {
         self.conn.execute(
-            "INSERT INTO signal_state(key, value) VALUES(?1, ?2)
+            "INSERT INTO device_identity(key, value) VALUES(?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
@@ -1189,17 +1297,15 @@ impl Db {
 
     pub fn peers(&self) -> AppResult<Vec<PeerRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT device_id, identity_public, cert_der, cert_id, display_name, safety_number, trust FROM peers",
+            "SELECT device_id, public_key, cert_id, display_name, trust FROM peers",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(PeerRow {
                 device_id: row.get(0)?,
-                identity_public: row.get(1)?,
-                cert_der: row.get(2)?,
-                cert_id: row.get(3)?,
-                display_name: row.get(4)?,
-                safety_number: row.get(5)?,
-                trust: row.get(6)?,
+                public_key: row.get(1)?,
+                cert_id: row.get(2)?,
+                display_name: row.get(3)?,
+                trust: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1207,22 +1313,18 @@ impl Db {
 
     pub fn upsert_peer(&self, peer: &PeerRow) -> AppResult<()> {
         self.conn.execute(
-            "INSERT INTO peers(device_id, identity_public, cert_der, cert_id, display_name, safety_number, trust)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO peers(device_id, public_key, cert_id, display_name, trust)
+             VALUES(?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(device_id) DO UPDATE SET
-               identity_public = excluded.identity_public,
-               cert_der = excluded.cert_der,
+               public_key = excluded.public_key,
                cert_id = excluded.cert_id,
                display_name = excluded.display_name,
-               safety_number = excluded.safety_number,
                trust = excluded.trust",
             params![
                 peer.device_id,
-                peer.identity_public,
-                peer.cert_der,
+                peer.public_key,
                 peer.cert_id,
                 peer.display_name,
-                peer.safety_number,
                 peer.trust
             ],
         )?;
@@ -1255,6 +1357,45 @@ impl Db {
         }
         self.set_device_setting("syncSources", sources)?;
         Ok(())
+    }
+
+    /// Pairing with the code again lets a removed device back in.
+    pub fn end_removal(&self, device_id: &str) -> AppResult<()> {
+        self.conn.execute("DELETE FROM removed_devices WHERE device_id = ?1", params![device_id])?;
+        Ok(())
+    }
+
+    /// Keeps a device removed on this computer out, here only.
+    pub fn record_removal(&self, device_id: &str, name: &str, at_ms: i64) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO removed_devices(device_id, name, removed_at) VALUES(?1, ?2, ?3)
+             ON CONFLICT(device_id) DO UPDATE SET name = excluded.name, removed_at = excluded.removed_at",
+            params![device_id, name, at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// When the device was removed, if it is still kept out.
+    pub fn removed_at(&self, device_id: &str) -> AppResult<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT removed_at FROM removed_devices WHERE device_id = ?1", params![device_id], |row| row.get(0))
+            .optional()?)
+    }
+
+    pub fn is_removed(&self, device_id: &str) -> bool {
+        self.removed_at(device_id).ok().flatten().is_some()
+    }
+
+    /// Removed devices, newest first.
+    pub fn removals(&self) -> AppResult<Vec<RemovalRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT device_id, name, removed_at FROM removed_devices ORDER BY removed_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RemovalRow { device_id: row.get(0)?, name: row.get(1)?, removed_at: row.get(2)? })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn set_peer_trust(&self, device_id: &str, trust: &str) -> AppResult<()> {
@@ -1390,12 +1531,21 @@ impl Db {
 #[derive(Debug, Clone)]
 pub struct PeerRow {
     pub device_id: String,
-    pub identity_public: Vec<u8>,
-    pub cert_der: Vec<u8>,
+    /// DER SubjectPublicKeyInfo of the device's TLS key; the device id is its hash.
+    pub public_key: Vec<u8>,
+    /// strelaysrv id of the device's certificate, used to meet it through a relay.
     pub cert_id: String,
     pub display_name: String,
-    pub safety_number: String,
     pub trust: String,
+}
+
+/// A device removed on this computer. Its key is deleted here and this computer refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalRow {
+    pub device_id: String,
+    pub name: String,
+    /// Milliseconds since 1970.
+    pub removed_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1614,12 +1764,15 @@ CREATE TABLE IF NOT EXISTS peer_list_prefs (
 );
 CREATE TABLE IF NOT EXISTS peers (
     device_id TEXT PRIMARY KEY,
-    identity_public BLOB NOT NULL,
-    cert_der BLOB NOT NULL,
+    public_key BLOB NOT NULL,
     cert_id TEXT NOT NULL,
     display_name TEXT NOT NULL,
-    safety_number TEXT NOT NULL,
     trust TEXT NOT NULL DEFAULT 'full'
+);
+CREATE TABLE IF NOT EXISTS removed_devices (
+    device_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    removed_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS blocks (
     device_id TEXT PRIMARY KEY,
@@ -1634,7 +1787,7 @@ CREATE TABLE IF NOT EXISTS notices (
     name TEXT NOT NULL,
     detail TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS signal_state (
+CREATE TABLE IF NOT EXISTS device_identity (
     key TEXT PRIMARY KEY,
     value BLOB NOT NULL
 );
@@ -1698,6 +1851,120 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
         (db, dir)
+    }
+
+    fn put_marker(db: &Db, value: &str) {
+        db.conn.execute("INSERT OR REPLACE INTO device_settings (key, value) VALUES ('marker', ?1)", [value]).unwrap();
+    }
+
+    fn marker(db: &Db) -> Option<String> {
+        db.conn.query_row("SELECT value FROM device_settings WHERE key = 'marker'", [], |row| row.get(0)).optional().unwrap()
+    }
+
+    fn not_a_database(conn: &Connection) -> bool {
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .is_err_and(|err| err.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase))
+    }
+
+    #[test]
+    fn the_library_file_is_encrypted_and_opens_only_with_its_key() {
+        let (db, dir) = open_db("encrypted");
+        let cipher: String = db.conn.query_row("PRAGMA cipher_version", [], |row| row.get(0)).unwrap();
+        assert!(!cipher.is_empty());
+        put_marker(&db, "plain-marker-1234");
+        drop(db);
+        let file = dir.join("library.db");
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(!bytes.starts_with(b"SQLite format 3\0"));
+        assert!(!bytes.windows(17).any(|part| part == b"plain-marker-1234"));
+        assert!(not_a_database(&Connection::open(&file).unwrap()));
+        let other = Connection::open(&file).unwrap();
+        other.pragma_update(None, "key", format!("x'{}'", "ab".repeat(KEY_LEN))).unwrap();
+        assert!(not_a_database(&other));
+        let db = Db::open(&file, dir.clone(), dir.join("cache")).unwrap();
+        assert_eq!(marker(&db).as_deref(), Some("plain-marker-1234"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_old_safety_number_column_is_dropped_and_pairings_kept() {
+        let (db, dir) = open_db("safety-number");
+        db.conn.execute_batch(
+            "DROP TABLE peers;
+             CREATE TABLE peers (device_id TEXT PRIMARY KEY, public_key BLOB NOT NULL, cert_id TEXT NOT NULL,
+               display_name TEXT NOT NULL, safety_number TEXT NOT NULL, trust TEXT NOT NULL DEFAULT 'full');
+             INSERT INTO peers VALUES ('dev', x'01', '', 'Old', '', 'full');",
+        ).unwrap();
+        drop(db);
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
+        let mut stmt = db.conn.prepare("PRAGMA table_info(peers)").unwrap();
+        let names = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(!names.iter().any(|name| name == "safety_number"));
+        drop(stmt);
+        let peers = db.peers().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].display_name, "Old");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn removals_stay_local_and_older_shared_removal_columns_are_dropped() {
+        let (db, dir) = open_db("removals");
+        db.conn.execute_batch(
+            "DROP TABLE removed_devices;
+             CREATE TABLE removed_devices (device_id TEXT PRIMARY KEY, name TEXT NOT NULL, removed_at INTEGER NOT NULL, removed_by TEXT NOT NULL);
+             INSERT INTO removed_devices VALUES ('gone', 'Laptop', 5, 'someone');
+             ALTER TABLE peers ADD COLUMN paired_at INTEGER NOT NULL DEFAULT 0;",
+        ).unwrap();
+        drop(db);
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
+        let columns = |table: &str| -> Vec<String> {
+            let mut stmt = db.conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert!(!columns("removed_devices").contains(&"removed_by".to_string()));
+        assert!(!columns("peers").contains(&"paired_at".to_string()));
+        assert!(db.is_removed("gone"));
+        db.record_removal("gone", "Laptop", 9).unwrap();
+        db.record_removal("other", "Tower", 7).unwrap();
+        let rows = db.removals().unwrap();
+        assert_eq!(rows.iter().map(|row| (row.device_id.as_str(), row.removed_at)).collect::<Vec<_>>(), vec![("gone", 9), ("other", 7)]);
+        db.end_removal("gone").unwrap();
+        assert!(!db.is_removed("gone"));
+        assert!(db.is_removed("other"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_plain_library_is_encrypted_on_first_open() {
+        let dir = std::env::temp_dir().join(format!("tunepeerly-db-plain-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("library.db");
+        let plain = Connection::open(&file).unwrap();
+        plain.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE device_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO device_settings VALUES ('marker', 'kept');").unwrap();
+        drop(plain);
+        assert!(std::fs::read(&file).unwrap().starts_with(b"SQLite format 3\0"));
+        let db = Db::open(&file, dir.clone(), dir.join("cache")).unwrap();
+        assert_eq!(marker(&db).as_deref(), Some("kept"));
+        drop(db);
+        assert!(!std::fs::read(&file).unwrap().starts_with(b"SQLite format 3\0"));
+        assert!(!dir.join("library.db.encrypting").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_library_without_its_key_is_set_aside_not_wiped() {
+        let (db, dir) = open_db("lost-key");
+        put_marker(&db, "old");
+        drop(db);
+        std::fs::remove_file(dir.join(dbkey::KEY_NAME)).unwrap();
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
+        assert_eq!(marker(&db), None);
+        let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|entry| entry.ok()?.file_name().into_string().ok()).collect();
+        assert!(aside.iter().any(|name| name.starts_with("library.db.unreadable-")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
