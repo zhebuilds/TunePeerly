@@ -542,6 +542,20 @@ fn android_import(app: AppHandle, state: State<'_, AppState>, folder: bool) -> A
     import_paths(app, state, vec![dir.to_string_lossy().into_owned()], "directory".into())
 }
 
+/// Android plays songs with a native player; the page sends it its commands here, one at a time.
+#[cfg(target_os = "android")]
+#[tauri::command(async)]
+fn android_audio(args: Value) -> AppResult<()> {
+    android::audio(&args)
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+fn android_audio(args: Value) -> AppResult<()> {
+    let _ = args;
+    Err(AppError::Message("android only".into()))
+}
+
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
 fn android_import(folder: bool) -> AppResult<Value> {
@@ -632,7 +646,8 @@ pub fn run() {
             quit_app,
             hide_to_tray,
             set_tray_menu,
-            android_import
+            android_import,
+            android_audio
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| fatal(&format!("{err}")));

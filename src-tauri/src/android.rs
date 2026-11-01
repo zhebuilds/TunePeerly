@@ -78,3 +78,8 @@ struct Ignored {}
 pub fn playback(track: &DesktopTrack) {
     let _ = call::<Ignored>("playback", track);
 }
+
+/// A command for the phone's own player (`NativeAudio.kt`), which plays the songs on Android.
+pub fn audio(args: &serde_json::Value) -> AppResult<()> {
+    call::<Ignored>("audio", args).map(|_| ())
+}
