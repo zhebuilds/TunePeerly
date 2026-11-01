@@ -1,4 +1,6 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
+#[cfg(target_os = "android")]
+mod android;
 mod desktop;
 mod catalog;
 mod media;
@@ -422,6 +424,7 @@ fn network_command(state: State<'_, AppState>, action: String, payload: Value) -
             buffer_enough: payload.get("bufferEnough").and_then(|v| v.as_bool()).unwrap_or(false),
         },
         "close-route" => net::Cmd::CloseRoutes,
+        "network-changed" => net::Cmd::NetworkChanged,
         _ => net::Cmd::Apply,
     };
     state.net.tx.send(cmd).map_err(|_| AppError::Message("network stopped".into()))?;
@@ -517,6 +520,35 @@ fn set_tray_menu(app: AppHandle, show: String, quit: String, name: String) {
     desktop::set_tray_tooltip(&app, &name);
 }
 
+/// Covers sit in the app's internal cache, outside the `$APPCACHE` the config allows, and downloads go
+/// to the app's own music folder because Android has no folder a picker could hand back as a path.
+#[cfg(target_os = "android")]
+fn android_folders(app: &AppHandle, db: &Db, cache: &Path, app_dir: &Path) {
+    let _ = app.asset_protocol_scope().allow_directory(cache.join("covers"), true);
+    let downloads = config::android_downloads_dir(app_dir);
+    if std::fs::create_dir_all(&downloads).is_ok() {
+        let _ = db.set_device_setting("downloadFolder", json!(downloads.to_string_lossy()));
+    }
+}
+
+/// Opens the system picker, copies the chosen songs into the app's music folder and imports that folder.
+#[cfg(target_os = "android")]
+#[tauri::command(async)]
+fn android_import(app: AppHandle, state: State<'_, AppState>, folder: bool) -> AppResult<Value> {
+    let dir = config::android_imported_dir(&state.db.lock().unwrap_or_else(PoisonError::into_inner).app_dir);
+    if android::pick(folder, &dir)? == 0 {
+        return Ok(json!([]));
+    }
+    import_paths(app, state, vec![dir.to_string_lossy().into_owned()], "directory".into())
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+fn android_import(folder: bool) -> AppResult<Value> {
+    let _ = folder;
+    Err(AppError::Message("android only".into()))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
@@ -525,16 +557,23 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
         desktop::show_main(app);
     }));
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android::init());
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data = app.path().data_dir().unwrap_or_else(|err| fatal(&format!("data folder: {err}")));
+            #[cfg(not(target_os = "android"))]
             let cache = config::cache_dir();
+            #[cfg(target_os = "android")]
+            let cache = config::android_cache_dir(&data);
             let app_dir = config::app_dir(&data);
             let database = config::database_path(&app_dir);
             let db = Db::open(&database, app_dir.clone(), cache.clone())
                 .unwrap_or_else(|err| fatal(&format!("database {}: {err}", database.display())));
+            #[cfg(target_os = "android")]
+            android_folders(app.handle(), &db, &cache, &app_dir);
             for grant in db.grants().unwrap_or_default() {
                 if Path::new(&grant.path).exists() {
                     allow_grant(app.handle(), &grant.kind, &grant.path);
@@ -592,7 +631,8 @@ pub fn run() {
             desktop_command,
             quit_app,
             hide_to_tray,
-            set_tray_menu
+            set_tray_menu,
+            android_import
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| fatal(&format!("{err}")));

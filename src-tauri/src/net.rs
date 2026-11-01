@@ -227,6 +227,9 @@ pub enum Cmd {
     CloseRoutes,
     /// Announces this device at once and collects the Nearby list again; does nothing while discovery is off.
     RefreshNearby,
+    /// The phone moved to another network or woke from Doze: join discovery again, register with the
+    /// relay at once instead of after its back-off, and call the known devices. The listener stays.
+    NetworkChanged,
     Disconnect(String),
     ResolveOverwrite { id: u64, accept: bool },
 }
@@ -363,6 +366,14 @@ async fn run(
                     }
                     Cmd::Publish => {
                         publish_holdings(&db, &peers, &mut published_holdings);
+                    }
+                    Cmd::NetworkChanged => {
+                        if db.lock().map(|guard| network_open(&guard)).unwrap_or(false) {
+                            restart_discovery(&db, &material, actual_port, &event_tx, &mut discovery, &live).await;
+                            restart_relay(&db, &material, &provider, &event_tx, &mut relay_task, &live).await;
+                            dial_known(&db, &material, &provider, &event_tx, &live, &peers).await;
+                            publish(&app, &db, &live, &peers);
+                        }
                     }
                     Cmd::ViewHistory(device_id) => {
                         view_history(&app, &db, &peers, &live, &device_id);

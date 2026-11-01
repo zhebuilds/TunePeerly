@@ -230,6 +230,8 @@ pub fn update(app: &AppHandle, track: DesktopTrack) {
         *slot = track.clone();
     }
     let _ = app.emit_to("mini", "desktop-state", &track);
+    #[cfg(target_os = "android")]
+    crate::android::playback(&track);
     #[cfg(windows)]
     windows_media::publish(app, track);
 }
