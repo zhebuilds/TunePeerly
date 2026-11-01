@@ -220,6 +220,8 @@ pub enum Cmd {
     /// Leaves device control to play on its own, or joins it again.
     ConnectMode { detached: bool },
     CloseRoutes,
+    /// Announces this device at once and collects the Nearby list again; does nothing while discovery is off.
+    RefreshNearby,
     Disconnect(String),
     ResolveOverwrite { id: u64, accept: bool },
 }
@@ -308,7 +310,7 @@ async fn run(
     let mut pending: HashSet<String> = HashSet::new();
     let mut listener: Option<tokio::task::JoinHandle<()>> = None;
     let mut relay_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut discovery: Option<std::sync::mpsc::Sender<()>> = None;
+    let mut discovery: Option<std::sync::mpsc::Sender<DiscoveryCtl>> = None;
     let mut actual_port = 0u16;
     let mut pending_holdings: HashMap<String, HoldingsBuild> = HashMap::new();
     let mut published_holdings = String::new();
@@ -515,6 +517,12 @@ async fn run(
                         }
                     }
                     Cmd::CloseRoutes => bus.close_routes(),
+                    Cmd::RefreshNearby => {
+                        // Only the discovery list starts over; links to paired devices are left alone.
+                        if let Some(control) = &discovery {
+                            let _ = control.send(DiscoveryCtl::Refresh);
+                        }
+                    }
                     Cmd::Disconnect(device_id) => {
                         if let Ok(mut guard) = live.inner.lock() {
                             guard.paused.insert(device_id.clone());
@@ -1881,11 +1889,11 @@ async fn restart_discovery(
     material: &IdentityMaterial,
     port: u16,
     events: &mpsc::UnboundedSender<NetEvent>,
-    discovery: &mut Option<std::sync::mpsc::Sender<()>>,
+    discovery: &mut Option<std::sync::mpsc::Sender<DiscoveryCtl>>,
     live: &Live,
 ) {
     if let Some(stop) = discovery.take() {
-        let _ = stop.send(());
+        let _ = stop.send(DiscoveryCtl::Stop);
     }
     let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
     let (incognito, enabled, _, _) = switches(&guard);
@@ -1912,6 +1920,67 @@ const DISCOVERY_PORT: u16 = 41220;
 const DISCOVERY_MAX_DEVICES: usize = 64;
 const DISCOVERY_NETS_REFRESH: Duration = Duration::from_secs(5);
 const DISCOVERY_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 168);
+/// Multicast announces go out this often.
+const MULTICAST_EVERY: Duration = Duration::from_secs(3);
+/// Subnet broadcast reaches networks whose routers drop multicast, so it is sent less often.
+const BROADCAST_EVERY: Duration = Duration::from_secs(15);
+/// Peers answer one sender at most once a second, so a device heard this recently may not answer a Refresh.
+const REFRESH_KEEP_HEARD: Duration = Duration::from_secs(1);
+/// After a Refresh the list is held back this long so answers arrive before the screen changes.
+const REFRESH_SETTLE: Duration = Duration::from_millis(700);
+
+/// Messages to the discovery thread. Dropping the sender also stops it.
+pub(crate) enum DiscoveryCtl {
+    Stop,
+    Refresh,
+}
+
+/// When announces were last sent, on each path and by a Refresh.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AnnounceTimes {
+    multicast: Option<Instant>,
+    broadcast: Option<Instant>,
+    refresh_multicast: Option<Instant>,
+    refresh_broadcast: Option<Instant>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AnnounceDue {
+    multicast: bool,
+    broadcast: bool,
+}
+
+fn passed(since: Option<Instant>, now: Instant, every: Duration) -> bool {
+    since.is_none_or(|at| now.saturating_duration_since(at) >= every)
+}
+
+/// Decides which announces go out now and records them as sent.
+/// The regular announce on each path waits its interval since the last send on that path.
+/// A Refresh sends on each path at once, unless a Refresh already sent on that path within the same interval,
+/// so pressing Refresh again and again adds at most one extra packet per interval on each path.
+fn announce_due(times: &mut AnnounceTimes, now: Instant, refresh: bool) -> AnnounceDue {
+    let multicast = passed(times.multicast, now, MULTICAST_EVERY) || (refresh && passed(times.refresh_multicast, now, MULTICAST_EVERY));
+    let broadcast = passed(times.broadcast, now, BROADCAST_EVERY) || (refresh && passed(times.refresh_broadcast, now, BROADCAST_EVERY));
+    if multicast {
+        times.multicast = Some(now);
+        if refresh {
+            times.refresh_multicast = Some(now);
+        }
+    }
+    if broadcast {
+        times.broadcast = Some(now);
+        if refresh {
+            times.refresh_broadcast = Some(now);
+        }
+    }
+    AnnounceDue { multicast, broadcast }
+}
+
+/// How long until the next regular announce is due, so the loop wakes on time instead of up to a read timeout late.
+fn announce_wait(times: &AnnounceTimes, now: Instant) -> Duration {
+    let left = |since: Option<Instant>, every: Duration| since.map_or(Duration::ZERO, |at| (at + every).saturating_duration_since(now));
+    left(times.multicast, MULTICAST_EVERY).min(left(times.broadcast, BROADCAST_EVERY))
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Announce {
@@ -1992,7 +2061,7 @@ fn nearby_list(found: &HashMap<String, Heard>, nets: &[(Ipv4Addr, Ipv4Addr)]) ->
 }
 
 fn run_discovery(
-    stop: std::sync::mpsc::Receiver<()>,
+    control: std::sync::mpsc::Receiver<DiscoveryCtl>,
     events: mpsc::UnboundedSender<NetEvent>,
     device_id: String,
     name: String,
@@ -2009,14 +2078,28 @@ fn run_discovery(
     let group = std::net::SocketAddrV4::new(DISCOVERY_GROUP, DISCOVERY_PORT);
     let mut found: HashMap<String, Heard> = HashMap::new();
     let mut last_sent = String::new();
-    let mut last_announce = Instant::now() - Duration::from_secs(30);
+    let mut times = AnnounceTimes::default();
+    // While set, list changes wait so the answers to a Refresh land in one update.
+    let mut settle: Option<Instant> = None;
     let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 2048];
     // Reading the adapters is slow on Windows, so the list is refreshed every few seconds, not per packet.
     let mut nets = lan_nets();
     let mut nets_read = Instant::now();
     let mut replied: HashMap<std::net::IpAddr, Instant> = HashMap::new();
     loop {
-        if stop.try_recv() != Err(std::sync::mpsc::TryRecvError::Empty) {
+        let mut refresh = false;
+        let mut stopped = false;
+        loop {
+            match control.try_recv() {
+                Ok(DiscoveryCtl::Refresh) => refresh = true,
+                Ok(DiscoveryCtl::Stop) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    stopped = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+        if stopped {
             break;
         }
         if nets_read.elapsed() >= DISCOVERY_NETS_REFRESH {
@@ -2029,7 +2112,35 @@ fn run_discovery(
                 let _ = socket.join_multicast_v4(&DISCOVERY_GROUP, ip);
             }
         }
-        socket.set_read_timeout(Some(Duration::from_millis(400)))?;
+        let now = Instant::now();
+        let due = announce_due(&mut times, now, refresh);
+        if refresh && (due.multicast || due.broadcast) {
+            // Start the list over: a device that has left is gone at once, the rest answer this announce.
+            // A device heard within the last second is kept, because it may not answer again so soon.
+            found.retain(|_, item| now.duration_since(item.seen) < REFRESH_KEEP_HEARD);
+            settle = Some(now + REFRESH_SETTLE);
+        }
+        if due.multicast || due.broadcast {
+            let packet = announce_packet(&device_id, &name, listen_port, true, &local);
+            if due.multicast {
+                let target: socket2::SockAddr = std::net::SocketAddr::from(group).into();
+                for ip in &local {
+                    if socket.set_multicast_if_v4(ip).is_ok() {
+                        let _ = socket.send_to(&packet, &target);
+                    }
+                }
+            }
+            // Some routers drop multicast; subnet broadcast reaches those networks too.
+            if due.broadcast {
+                for broadcast in lan_broadcasts() {
+                    let to: socket2::SockAddr = std::net::SocketAddr::from((broadcast, DISCOVERY_PORT)).into();
+                    let _ = socket.send_to(&packet, &to);
+                }
+            }
+        }
+        let settle_left = settle.map_or(Duration::MAX, |until| until.saturating_duration_since(now));
+        let wait = Duration::from_millis(400).min(settle_left).min(announce_wait(&times, now)).max(Duration::from_millis(20));
+        socket.set_read_timeout(Some(wait))?;
         match socket.recv_from(&mut buf) {
             Ok((size, src)) => {
                 let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, size) };
@@ -2057,7 +2168,9 @@ fn run_discovery(
                     entry.sources.insert(peer.host, now);
                     entry.sources.retain(|_, at| now.duration_since(*at) < Duration::from_secs(12));
                     entry.seen = now;
-                    send_nearby(&events, &found, &nets, &mut last_sent);
+                    if settle.is_none() {
+                        send_nearby(&events, &found, &nets, &mut last_sent);
+                    }
                     if reply {
                         let packet = announce_packet(&device_id, &name, listen_port, false, &local);
                         let _ = socket.send_to(&packet, &src);
@@ -2071,23 +2184,11 @@ fn run_discovery(
         let now = Instant::now();
         let before = found.len();
         found.retain(|_, item| now.duration_since(item.seen) < Duration::from_secs(12));
-        if found.len() != before {
+        if settle.is_some_and(|until| now >= until) {
+            settle = None;
             send_nearby(&events, &found, &nets, &mut last_sent);
-        }
-        if last_announce.elapsed() >= Duration::from_secs(3) {
-            let packet = announce_packet(&device_id, &name, listen_port, true, &local);
-            let target: socket2::SockAddr = std::net::SocketAddr::from(group).into();
-            for ip in &local {
-                if socket.set_multicast_if_v4(ip).is_ok() {
-                    let _ = socket.send_to(&packet, &target);
-                }
-            }
-            // Some routers drop multicast; subnet broadcast reaches those networks too.
-            for broadcast in lan_broadcasts() {
-                let to: socket2::SockAddr = std::net::SocketAddr::from((broadcast, DISCOVERY_PORT)).into();
-                let _ = socket.send_to(&packet, &to);
-            }
-            last_announce = Instant::now();
+        } else if settle.is_none() && found.len() != before {
+            send_nearby(&events, &found, &nets, &mut last_sent);
         }
     }
     Ok(())
@@ -4841,5 +4942,111 @@ mod removal_tests {
         assert_eq!(peers.keys().collect::<Vec<_>>(), vec![&saved_verify]);
         assert!(live.inner.lock().unwrap().offer.is_some());
         assert!(!drop_stale_unpaired(&db, &live, &mut peers));
+    }
+}
+
+#[cfg(test)]
+mod announce_timing_tests {
+    use super::*;
+
+    fn at(start: Instant, millis: u64) -> Instant {
+        start + Duration::from_millis(millis)
+    }
+
+    /// Runs the clock in 100 ms steps, pressing Refresh at the given times, and returns when each path sent.
+    fn run(until_ms: u64, presses: &[u64]) -> (Vec<u64>, Vec<u64>) {
+        let start = Instant::now();
+        let mut times = AnnounceTimes::default();
+        let (mut multicast, mut broadcast) = (Vec::new(), Vec::new());
+        let mut step = 0;
+        while step <= until_ms {
+            let due = announce_due(&mut times, at(start, step), presses.contains(&step));
+            if due.multicast {
+                multicast.push(step);
+            }
+            if due.broadcast {
+                broadcast.push(step);
+            }
+            step += 100;
+        }
+        (multicast, broadcast)
+    }
+
+    fn most_in_window(sent: &[u64], window: u64) -> usize {
+        sent.iter().map(|first| sent.iter().filter(|other| **other >= *first && **other < first + window).count()).max().unwrap_or(0)
+    }
+
+    #[test]
+    fn both_paths_announce_at_start() {
+        let mut times = AnnounceTimes::default();
+        assert_eq!(announce_due(&mut times, Instant::now(), false), AnnounceDue { multicast: true, broadcast: true });
+    }
+
+    #[test]
+    fn multicast_every_three_seconds_and_broadcast_every_fifteen() {
+        let (multicast, broadcast) = run(30_000, &[]);
+        assert_eq!(multicast, (0..=10).map(|n| n * 3_000).collect::<Vec<_>>());
+        assert_eq!(broadcast, vec![0, 15_000, 30_000]);
+    }
+
+    #[test]
+    fn refresh_sends_both_paths_at_once() {
+        let start = Instant::now();
+        let mut times = AnnounceTimes::default();
+        announce_due(&mut times, start, false);
+        // One second after the regular announce, neither path is due on its own.
+        assert_eq!(announce_due(&mut times, at(start, 1_000), false), AnnounceDue::default());
+        assert_eq!(announce_due(&mut times, at(start, 1_000), true), AnnounceDue { multicast: true, broadcast: true });
+        // The regular multicast now counts from the Refresh.
+        assert!(!announce_due(&mut times, at(start, 3_900), false).multicast);
+        assert!(announce_due(&mut times, at(start, 4_000), false).multicast);
+    }
+
+    #[test]
+    fn repeated_refresh_is_limited_on_each_path() {
+        let start = Instant::now();
+        let mut times = AnnounceTimes::default();
+        announce_due(&mut times, start, false);
+        assert_eq!(announce_due(&mut times, at(start, 1_000), true), AnnounceDue { multicast: true, broadcast: true });
+        // Pressed again within 3 s: nothing extra.
+        assert_eq!(announce_due(&mut times, at(start, 1_500), true), AnnounceDue::default());
+        assert_eq!(announce_due(&mut times, at(start, 3_900), true), AnnounceDue::default());
+        // 3 s after the last Refresh multicast may go again; broadcast waits for 15 s.
+        assert_eq!(announce_due(&mut times, at(start, 4_000), true), AnnounceDue { multicast: true, broadcast: false });
+        assert!(!announce_due(&mut times, at(start, 15_900), true).broadcast);
+        assert!(announce_due(&mut times, at(start, 16_000), true).broadcast);
+    }
+
+    #[test]
+    fn pressing_nonstop_never_floods() {
+        // Refresh pressed every 100 ms for a minute.
+        let presses: Vec<u64> = (0..=600).map(|n| n * 100).collect();
+        let (multicast, broadcast) = run(60_000, &presses);
+        // At most one regular and one Refresh send per interval on each path.
+        assert!(most_in_window(&multicast, 3_000) <= 2, "{multicast:?}");
+        assert!(most_in_window(&broadcast, 15_000) <= 2, "{broadcast:?}");
+        // In practice a held-down Refresh simply takes the place of the regular announce.
+        assert_eq!(multicast.len(), 21);
+        assert_eq!(broadcast.len(), 5);
+    }
+
+    #[test]
+    fn loop_wakes_when_the_next_announce_is_due() {
+        let start = Instant::now();
+        let mut times = AnnounceTimes::default();
+        assert_eq!(announce_wait(&times, start), Duration::ZERO);
+        announce_due(&mut times, start, false);
+        assert_eq!(announce_wait(&times, at(start, 1_000)), Duration::from_millis(2_000));
+        assert_eq!(announce_wait(&times, at(start, 3_500)), Duration::ZERO);
+    }
+
+    #[test]
+    fn worst_case_is_two_sends_per_interval() {
+        // A Refresh just after the regular announce sends again at once; a second press does not.
+        let (multicast, broadcast) = run(15_000, &[100, 200, 2_900]);
+        assert_eq!(&multicast[..3], &[0, 100, 3_100]);
+        assert_eq!(&broadcast[..2], &[0, 100]);
+        assert!(most_in_window(&multicast, 3_000) <= 2);
+        assert!(most_in_window(&broadcast, 15_000) <= 2);
     }
 }

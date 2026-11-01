@@ -20,6 +20,7 @@ export function DevicesPage() {
   const app = useApp();
   const boot = app.boot;
   const [nameEpoch, setNameEpoch] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
   if (!boot) return null;
 
   const settings = app.settings;
@@ -47,6 +48,12 @@ export function DevicesPage() {
       danger: true,
       run: () => run("block", link.deviceId),
     });
+  // The backend limits how often announces go out, so pressing again only resets the short spinner.
+  const refreshNearby = () => {
+    setRefreshing(true);
+    run("refresh-nearby");
+    window.setTimeout(() => setRefreshing(false), 1000);
+  };
   const rename = (value: string) => {
     const name = value.trim().slice(0, 64);
     // A blank name is not saved; remounting the field puts the current name back.
@@ -161,6 +168,17 @@ export function DevicesPage() {
           <Revise />
           {settings.discovery && !networkOff && <span className="scanning" aria-hidden="true" />}
           <span className="panel-switch" title={t("devices.discoveryHelp")}>
+            {settings.discovery && !networkOff && (
+              <button
+                type="button"
+                className={`btn ghost small${refreshing ? " spinning" : ""}`}
+                title={t("devices.refreshNearbyHelp")}
+                disabled={refreshing}
+                onClick={refreshNearby}
+              >
+                <Icons.sync /> {t("devices.refreshNearby")}
+              </button>
+            )}
             <span className="device-switch-label">{t("devices.discovery")}</span>
             <Switch label={t("devices.discovery")} checked={Boolean(settings.discovery)} onChange={(value) => void app.setSetting("discovery", value)} />
           </span>

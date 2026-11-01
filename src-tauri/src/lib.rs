@@ -482,6 +482,7 @@ fn network_command(state: State<'_, AppState>, action: String, payload: Value) -
         },
         "remove" => net::Cmd::Remove(text()),
         "disconnect" => net::Cmd::Disconnect(text()),
+        "refresh-nearby" => net::Cmd::RefreshNearby,
         "resolve-overwrite" => net::Cmd::ResolveOverwrite {
             id: payload.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
             accept: payload.get("accept").and_then(|v| v.as_bool()).unwrap_or(false),

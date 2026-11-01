@@ -687,7 +687,8 @@ body.resizing * {
   color: var(--on-accent);
 }
 
-.round-btn.spinning svg {
+.round-btn.spinning svg,
+.btn.spinning svg {
   animation: spin 0.8s linear infinite;
 }
 

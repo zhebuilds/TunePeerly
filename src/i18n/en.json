@@ -432,6 +432,8 @@
     "discovery": "Discover nearby devices",
     "discoveryHelp": "Announces this computer on the local network a few times a minute. Shares only the device name, never song names.",
     "noNearby": "Looking for computers running this app on your network…",
+    "refreshNearby": "Refresh",
+    "refreshNearbyHelp": "Look for nearby devices again now. Devices that have left drop off the list.",
     "pair": "Pair",
     "addresses": "IPv4 addresses",
     "addressesHelp": "A Public network is listed only if Windows Firewall allows this app on it. Other computers reach this one through these addresses.",

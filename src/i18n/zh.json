@@ -428,6 +428,8 @@
     "discovery": "发现附近设备",
     "discoveryHelp": "每隔几秒在局域网里广播一次这台电脑。只公开设备名，不公开歌名。",
     "noNearby": "正在查找网络中运行本应用的电脑…",
+    "refreshNearby": "刷新",
+    "refreshNearbyHelp": "立即重新查找附近设备，已离开的设备会从列表中消失。",
     "pair": "配对",
     "addresses": "IPv4 地址",
     "addressesHelp": "“公用”网络只有在 Windows 防火墙允许本应用通过时才会列出。其他电脑通过这些地址连接本机。",
