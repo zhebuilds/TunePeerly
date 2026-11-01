@@ -94,11 +94,13 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
 
   override fun onPause(activity: AppCompatActivity) {
     pausedAt = SystemClock.elapsedRealtime()
+    Log.i(TAG, "app in the background (playing ${NowPlaying.snapshot.playing}, phone player song ${NativeAudio.current})")
     // WryActivity pauses the web view, and with it the audio element. A music app keeps playing.
     if (NowPlaying.snapshot.playing) keepRunning()
   }
 
   override fun onResume(activity: AppCompatActivity) {
+    Log.i(TAG, "app in front again (playing ${NowPlaying.snapshot.playing}, phone player song ${NativeAudio.current})")
     // After a long time away (Doze, a night in the pocket) the relay link is likely stale.
     if (pausedAt != 0L && SystemClock.elapsedRealtime() - pausedAt > 60_000) networkChanged()
     pausedAt = 0L
@@ -111,8 +113,16 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
     multicast?.let { if (it.isHeld) it.release() }
     multicast = null
     worker.shutdown()
-    NativeAudio.release()
-    PlaybackService.stop(activity)
+    if (activity.isFinishing) {
+      // The app was closed: the music ends with it.
+      Log.i(TAG, "app closed: stop the music")
+      NativeAudio.release()
+      PlaybackService.stop(activity)
+    } else {
+      // The system took the window away (e.g. to save memory) but the app goes on: the phone's
+      // player keeps playing the queue and the notification stays.
+      Log.i(TAG, "window closed by the system; the music keeps playing (song ${NativeAudio.current})")
+    }
   }
 
   /** Resumes the web view right after the activity paused it, so the audio element keeps going. */
@@ -269,8 +279,13 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
     main.post {
       // While the phone's player has a song, it is the one that knows whether sound is coming and
       // where. The page briefly reports "not playing" between songs, which must not stop the service.
+      // After songs changed in the background, the page may report the old song until it caught up.
       val next = if (NativeAudio.current != 0L) {
-        draft.copy(playing = NativeAudio.wantsPlay, position = NativeAudio.position, duration = NativeAudio.duration.takeIf { it > 0 } ?: draft.duration)
+        val song = NativeAudio.currentSong
+        val base = if (song != null && song.title != draft.title) {
+          draft.copy(title = song.title, artist = song.artist, album = song.album, coverPath = song.coverPath, favorite = song.favorite)
+        } else draft
+        base.copy(playing = NativeAudio.wantsPlay, position = NativeAudio.position, duration = NativeAudio.duration.takeIf { it > 0 } ?: song?.duration?.takeIf { it > 0 } ?: draft.duration)
       } else draft
       (activity as? MainActivity)?.applyTheme(dark)
       NowPlaying.update(next)

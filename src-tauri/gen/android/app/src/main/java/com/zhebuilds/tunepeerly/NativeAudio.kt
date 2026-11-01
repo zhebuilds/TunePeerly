@@ -6,6 +6,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
@@ -18,13 +19,15 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-/** What the page knows about the song lined up next, so the notification can show it before the page catches up. */
-data class NextSong(
-  val id: Long,
-  val url: String,
+/** A song the phone's player may start by itself. `url` is set for songs on the phone; others stream by content id. */
+data class Song(
+  val key: String,
+  val url: String?,
+  val contentId: String?,
   val title: String,
   val artist: String,
   val album: String,
@@ -34,33 +37,66 @@ data class NextSong(
 )
 
 /**
- * The phone's audio output. The web view's audio element is throttled, paused or starved once the
- * screen is off, so on Android the page drives this ExoPlayer instead (see `src/player/native.ts`).
- * It holds the CPU and Wi-Fi awake while it plays, and when a song ends it starts the one the page
- * lined up next by itself, so moving on never waits for the page's script to run.
- * Everything here runs on the main thread.
+ * The phone's audio output and, while the page's script is held back, its queue. The web view's audio
+ * element is throttled, paused or starved once the screen is off, so on Android the page drives this
+ * ExoPlayer instead (see `src/player/native.ts`).
+ *
+ * The page hands over every song it may play (`catalog`) and the whole queue with its rules (`queue`:
+ * what is next, repeat, shuffle order, the list to start over from and the library to continue with).
+ * When a song ends, or next or previous is pressed on the notification, the next song is chosen here
+ * with the same rules as `src/player/advance.ts` and started at once, so the music never waits for the
+ * page. Every change is reported back (`queue` events) and the page takes it over when it runs again.
+ *
+ * Remote songs play from the app's stream URLs, which pick a connected device on every request, so a
+ * dropped link is retried here a few times before the song counts as failed.
+ *
+ * Everything here runs on the main thread. Every stop, pause, skip, retry and error is logged with the
+ * tag `NativeAudio`.
  */
 @OptIn(UnstableApi::class)
 object NativeAudio {
   private const val TAG = "NativeAudio"
+  private const val MAX_RETRIES = 6
+  private const val MAX_FAILED_IN_ROW = 3
   private val main = Handler(Looper.getMainLooper())
   private var context: Context? = null
   private var player: ExoPlayer? = null
-  /** The page's id of the song loaded now; 0 when nothing is loaded. */
+
+  /** The id of the song loaded now; 0 when nothing is loaded. The page numbers its loads from 1; ids picked here are larger. */
   @Volatile var current = 0L
     private set
-  private var next: NextSong? = null
+  private var currentKey: String? = null
+  private var currentUrl: String? = null
+  private var nativeIds = 1_000_000_000L
   /** The newest page command applied, echoed so the page can ignore reports older than its last press. */
   private var seq = 0L
   private var ended = false
   private var volume = 1f
   private var errored = false
+
+  // The queue, as last sent by the page and then moved on here.
+  private val catalog = HashMap<String, Song>()
+  private var streamBase = ""
+  private val queue = NativeQueue({ playable(it) })
+  /** Counts the changes made here. The page sends the one it saw last, so a stale queue never undoes a skip. */
+  private var rev = 0L
+
+  private var retries = 0
+  /** A song on the phone that could not be read is tried once from a linked device. */
+  private var triedStream = false
+  private var failedInRow = 0
+  private var heardMs = 0L
+  private var heardSent = false
+  private var lastTick = 0L
+
   private val ticker = object : Runnable {
     override fun run() {
+      tick()
       report()
       if (player?.isPlaying == true) main.postDelayed(this, 250)
     }
   }
+  private var retry: Runnable? = null
 
   fun attach(context: Context) {
     this.context = context.applicationContext
@@ -81,6 +117,9 @@ object NativeAudio {
       return if (value == C.TIME_UNSET || value <= 0) 0.0 else value / 1000.0
     }
 
+  /** What is loaded now, when the page told about it. */
+  val currentSong: Song? get() = if (current != 0L) currentKey?.let { catalog[it] } else null
+
   private fun exo(): ExoPlayer? {
     player?.let { return it }
     val ctx = context ?: return null
@@ -96,41 +135,62 @@ object NativeAudio {
         true,
       )
       .setHandleAudioBecomingNoisy(true)
-      // Keeps the CPU and the Wi-Fi radio up while it plays, also with the screen off.
+      // Keeps the CPU and the Wi-Fi radio up while it plays or loads, also with the screen off.
       .setWakeMode(C.WAKE_MODE_NETWORK)
       .build()
     made.volume = volume
     made.addListener(object : Player.Listener {
       override fun onPlaybackStateChanged(state: Int) {
+        Log.i(TAG, "state ${stateName(state)} song $current ($currentKey)")
         if (state == Player.STATE_ENDED && current != 0L && !ended) finished() else changed()
       }
       override fun onIsPlayingChanged(isPlaying: Boolean) {
         changed()
         if (isPlaying) {
+          retries = 0
+          failedInRow = 0
+          lastTick = SystemClock.elapsedRealtime()
           main.removeCallbacks(ticker)
           main.postDelayed(ticker, 250)
         }
       }
-      override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) = changed()
-      override fun onPositionDiscontinuity(old: Player.PositionInfo, new: Player.PositionInfo, reason: Int) = report()
-      override fun onPlayerError(error: PlaybackException) {
-        errored = true
-        Log.w(TAG, "song $current: ${error.errorCodeName} ${error.message}")
-        emit(JSONObject().put("t", "error").put("id", current).put("code", mediaErrorCode(error)).put("msg", error.errorCodeName))
+      override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+        Log.i(TAG, "${if (playWhenReady) "play" else "pause"} song $current: ${pwrReason(reason)}")
         changed()
       }
+      override fun onPlaybackSuppressionReasonChanged(reason: Int) {
+        if (reason != Player.PLAYBACK_SUPPRESSION_REASON_NONE) Log.i(TAG, "sound held back (reason $reason), e.g. audio focus lost for a moment")
+      }
+      override fun onPositionDiscontinuity(old: Player.PositionInfo, new: Player.PositionInfo, reason: Int) = report()
+      override fun onPlayerError(error: PlaybackException) = failed(error)
     })
     player = made
     return made
   }
 
-  /** HTMLMediaElement error codes, so the page's retry rules stay the same as on desktop. */
+  private fun stateName(state: Int) = when (state) {
+    Player.STATE_IDLE -> "idle"
+    Player.STATE_BUFFERING -> "buffering"
+    Player.STATE_READY -> "ready"
+    Player.STATE_ENDED -> "ended"
+    else -> "$state"
+  }
+
+  private fun pwrReason(reason: Int) = when (reason) {
+    Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST -> "asked (page, notification or lock screen)"
+    Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS -> "audio focus lost to another app"
+    Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY -> "headphones or Bluetooth disconnected"
+    Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE -> "remote"
+    Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM -> "end of song"
+    else -> "reason $reason"
+  }
+
+  /** HTMLMediaElement error codes, as the page expects them. */
   private fun mediaErrorCode(error: PlaybackException): Int = when (error.errorCode) {
     in 3000..3999 -> if (error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ||
       error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED) 4 else 3
     PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED, PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES -> 4
     in 4000..4999 -> 3
-    PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND -> 4
     else -> 2
   }
 
@@ -149,7 +209,7 @@ object NativeAudio {
     val sent = args.optLong("seq", 0L)
     if (sent > seq) seq = sent
     when (op) {
-      "load" -> load(args.getLong("id"), args.getString("url"))
+      "load" -> load(args.getLong("id"), args.getString("url"), args.optString("key").ifEmpty { null })
       "play" -> if (args.optLong("id") == current) setPlaying(true)
       "pause" -> if (args.optLong("id") == current) setPlaying(false)
       "seek" -> if (args.optLong("id") == current) seek(args.optDouble("sec", 0.0))
@@ -157,29 +217,85 @@ object NativeAudio {
         volume = args.optDouble("v", 1.0).toFloat().coerceIn(0f, 1f)
         player?.volume = volume
       }
-      "stop" -> stop()
-      "next" -> next = if (args.has("url")) NextSong(
-        id = args.getLong("id"),
-        url = args.getString("url"),
-        title = args.optString("title"),
-        artist = args.optString("artist"),
-        album = args.optString("album"),
-        coverPath = args.optString("coverPath").ifEmpty { null },
-        favorite = args.optBoolean("favorite"),
-        duration = args.optDouble("duration", 0.0),
-      ) else null
+      "stop" -> {
+        Log.i(TAG, "stop: asked by the page (song $current)")
+        stop()
+      }
+      "catalog" -> setCatalog(args)
+      "queue" -> setQueue(args)
+      "sync" -> {
+        emitQueue("sync")
+        if (current != 0L) {
+          Log.i(TAG, "page asked where things are: song $current ($currentKey)")
+        }
+      }
     }
     report()
   }
 
-  private fun load(id: Long, url: String) {
+  private fun setCatalog(args: JSONObject) {
+    args.optString("base").takeIf { it.isNotEmpty() }?.let { streamBase = it }
+    val songs = args.optJSONArray("songs") ?: return
+    catalog.clear()
+    for (i in 0 until songs.length()) {
+      val row = songs.optJSONObject(i) ?: continue
+      val key = row.optString("k").ifEmpty { null } ?: continue
+      catalog[key] = Song(
+        key = key,
+        url = row.optString("u").ifEmpty { null },
+        contentId = row.optString("c").ifEmpty { null },
+        title = row.optString("t"),
+        artist = row.optString("a"),
+        album = row.optString("l"),
+        coverPath = row.optString("p").ifEmpty { null },
+        favorite = row.optBoolean("f"),
+        duration = row.optDouble("d", 0.0),
+      )
+    }
+    Log.i(TAG, "catalog: ${catalog.size} songs")
+  }
+
+  private fun keys(array: JSONArray?): ArrayList<String> {
+    val out = ArrayList<String>()
+    if (array == null) return out
+    for (i in 0 until array.length()) array.optString(i).takeIf { it.isNotEmpty() }?.let { out.add(it) }
+    return out
+  }
+
+  private fun setQueue(args: JSONObject) {
+    val seen = args.optLong("rev", -1L)
+    if (seen != rev) {
+      // The page had not seen the latest move made here yet. It gets that report and sends its queue again.
+      Log.i(TAG, "queue from the page skipped: it saw change $seen, now at $rev")
+      return
+    }
+    queue.past = keys(args.optJSONArray("past"))
+    queue.current = args.optString("current").ifEmpty { null } ?: currentKey
+    queue.future = keys(args.optJSONArray("future"))
+    queue.repeat = args.optString("repeat", "off")
+    queue.order = args.optString("order", "manual")
+    queue.contextId = args.optString("contextId", "library")
+    if (args.has("pool")) queue.pool = keys(args.optJSONArray("pool"))
+    if (args.has("library")) queue.library = keys(args.optJSONArray("library"))
+  }
+
+  private fun load(id: Long, url: String, key: String?) {
     val exo = exo() ?: return
+    cancelRetry()
     current = id
+    currentKey = key
+    if (key != null) queue.current = key
+    currentUrl = url
     ended = false
     errored = false
+    retries = 0
+    triedStream = false
+    heardMs = 0
+    heardSent = false
     exo.playWhenReady = false
     exo.setMediaItem(MediaItem.Builder().setMediaId(id.toString()).setUri(uriOf(url)).build())
     exo.prepare()
+    Log.i(TAG, "load song $id ($key) from the page")
   }
 
   /** Also used by the notification and lock screen, so play and pause answer even before the page does. */
@@ -188,6 +304,8 @@ object NativeAudio {
     if (current == 0L) return
     if (play && (errored || exo.playbackState == Player.STATE_IDLE)) {
       errored = false
+      retries = 0
+      cancelRetry()
       exo.prepare()
     }
     if (play && ended) {
@@ -209,8 +327,11 @@ object NativeAudio {
 
   fun stop() {
     current = 0L
+    currentKey = null
+    currentUrl = null
     ended = false
     errored = false
+    cancelRetry()
     main.removeCallbacks(ticker)
     player?.let {
       it.playWhenReady = false
@@ -220,47 +341,196 @@ object NativeAudio {
   }
 
   fun release() {
+    Log.i(TAG, "release: the player is closed")
     stop()
-    next = null
     player?.release()
     player = null
   }
 
-  /** The song played to its end. Start the next one now; the page adopts it when its script runs. */
-  private fun finished() {
+  /**
+   * A press outside the page: the notification, lock screen, headset, Bluetooth or the widget.
+   * Returns false when the page has to handle it (nothing is loaded here).
+   */
+  fun press(action: String): Boolean {
+    if (current == 0L || player == null) return false
+    when {
+      action == "next" -> skip(1)
+      action == "previous" -> skip(-1)
+      action == "play" -> setPlaying(true)
+      action == "pause" -> setPlaying(false)
+      action == "toggle" -> setPlaying(!wantsPlay)
+      action.startsWith("seek:") -> action.removePrefix("seek:").toDoubleOrNull()?.let { seek(it) } ?: return false
+      else -> return false
+    }
+    Log.i(TAG, "press $action handled here")
+    return true
+  }
+
+  private fun playable(key: String) = catalog[key]?.let { it.url != null || (it.contentId != null && streamBase.isNotEmpty()) } ?: false
+
+  fun skip(delta: Int) {
     val exo = player ?: return
-    val from = current
-    val upcoming = next
-    next = null
-    if (upcoming == null || upcoming.id == from) {
+    val moved = if (delta > 0) queue.next() else queue.previous(position)
+    if (!moved) {
+      Log.i(TAG, "${if (delta > 0) "next" else "previous"}: start the same song over")
+      ended = false
+      errored = false
+      exo.seekTo(0)
+      exo.playWhenReady = true
+      return
+    }
+    startQueued(if (delta > 0) "next pressed" else "previous pressed")
+  }
+
+  /** Starts the queue's current song, or stops when there is none. */
+  private fun startQueued(reason: String) {
+    val key = queue.current
+    val song = key?.let { catalog[it] }
+    val exo = player
+    if (key == null || song == null || exo == null) {
+      Log.i(TAG, "stop: nothing left to play after $reason")
+      queue.current = currentKey
       ended = true
+      rev++
+      emitQueue("$reason, nothing left")
       report()
       changed()
       return
     }
-    current = upcoming.id
+    cancelRetry()
+    val url = song.url ?: (streamBase + song.contentId)
+    current = ++nativeIds
+    currentKey = key
+    currentUrl = url
     ended = false
     errored = false
-    exo.setMediaItem(MediaItem.Builder().setMediaId(upcoming.id.toString()).setUri(uriOf(upcoming.url)).build())
+    retries = 0
+    triedStream = false
+    heardMs = 0
+    heardSent = false
+    exo.setMediaItem(MediaItem.Builder().setMediaId(current.toString()).setUri(uriOf(url)).build())
     exo.prepare()
     exo.playWhenReady = true
-    val before = NowPlaying.snapshot
+    Log.i(TAG, "start song $current ($key, ${if (song.url != null) "on the phone" else "remote"}): $reason")
     NowPlaying.update(
-      before.copy(
-        title = upcoming.title,
-        artist = upcoming.artist,
-        album = upcoming.album,
-        coverPath = upcoming.coverPath,
-        favorite = upcoming.favorite,
-        duration = upcoming.duration,
+      NowPlaying.snapshot.copy(
+        title = song.title,
+        artist = song.artist,
+        album = song.album,
+        coverPath = song.coverPath,
+        favorite = song.favorite,
+        duration = song.duration,
         position = 0.0,
         playing = true,
         at = System.currentTimeMillis(),
       )
     )
     context?.let { NowPlayingWidget.refresh(it) }
-    emit(JSONObject().put("t", "advanced").put("from", from).put("to", upcoming.id))
+    rev++
+    emitQueue(reason)
     report()
+  }
+
+  /** The song played to its end. Start the next one now; the page takes it over when its script runs. */
+  private fun finished() {
+    val exo = player ?: return
+    countHeard(ended = true)
+    if (queue.repeat == "one" && currentKey != null) {
+      Log.i(TAG, "song $current ended: repeat one")
+      heardMs = 0
+      heardSent = false
+      exo.seekTo(0)
+      exo.playWhenReady = true
+      emit(JSONObject().put("t", "restarted").put("id", current))
+      return
+    }
+    if (!queue.afterEnd()) {
+      queue.current = currentKey
+      Log.i(TAG, "stop: song $current ended and the queue, repeat and the library have nothing more")
+      ended = true
+      report()
+      changed()
+      return
+    }
+    startQueued("song ended")
+  }
+
+  private fun cancelRetry() {
+    retry?.let { main.removeCallbacks(it) }
+    retry = null
+  }
+
+  /** A dropped link or a device that went away is tried again; a broken file or format is not. */
+  private fun failed(error: PlaybackException) {
+    val exo = player ?: return
+    val id = current
+    val remote = currentUrl?.startsWith("http://127.0.0.1") == true
+    val transient = remote && error.errorCode in 1000..2999
+    Log.w(TAG, "error on song $id ($currentKey): ${error.errorCodeName} ${error.message} (cause ${error.cause?.message})")
+    if (transient && retries < MAX_RETRIES && id != 0L) {
+      retries++
+      val wait = (1000L shl (retries - 1)).coerceAtMost(15_000L)
+      val at = exo.currentPosition.coerceAtLeast(0L)
+      Log.i(TAG, "retry $retries/$MAX_RETRIES for song $id at ${at / 1000.0}s in ${wait}ms")
+      cancelRetry()
+      val again = Runnable {
+        retry = null
+        if (current != id) return@Runnable
+        Log.i(TAG, "retrying song $id at ${at / 1000.0}s")
+        exo.prepare()
+        if (at > 0) exo.seekTo(at)
+      }
+      retry = again
+      main.postDelayed(again, wait)
+      report()
+      return
+    }
+    val song = currentKey?.let { catalog[it] }
+    if (!remote && !triedStream && id != 0L && song?.contentId != null && streamBase.isNotEmpty()) {
+      triedStream = true
+      val url = streamBase + song.contentId
+      val at = exo.currentPosition.coerceAtLeast(0L)
+      Log.i(TAG, "song $id: the file on the phone failed, trying a linked device")
+      currentUrl = url
+      exo.setMediaItem(MediaItem.Builder().setMediaId(id.toString()).setUri(uriOf(url)).build(), at)
+      exo.prepare()
+      return
+    }
+    errored = true
+    emit(JSONObject().put("t", "error").put("id", id).put("code", mediaErrorCode(error)).put("msg", error.errorCodeName))
+    changed()
+    failedInRow++
+    val wanted = exo.playWhenReady
+    if (!wanted || failedInRow > MAX_FAILED_IN_ROW || currentKey == null) {
+      Log.w(TAG, "stop: song $id failed (${error.errorCodeName}); ${failedInRow} failed in a row")
+      return
+    }
+    // Like a song that ended, so a missing song does not stop the music with the screen off.
+    Log.w(TAG, "song $id failed (${error.errorCodeName}), moving on ($failedInRow in a row)")
+    main.postDelayed({
+      if (current != id || !errored) return@postDelayed
+      if (queue.afterEnd()) startQueued("previous song failed") else Log.w(TAG, "stop: nothing to move on to after a failed song")
+    }, 1000)
+  }
+
+  private fun tick() {
+    val now = SystemClock.elapsedRealtime()
+    val delta = now - lastTick
+    lastTick = now
+    if (player?.isPlaying == true && delta in 1..1500) heardMs += delta
+    countHeard(ended = false)
+  }
+
+  /** The page records a song in Recently Played once enough of it was heard, also when it played here alone. */
+  private fun countHeard(ended: Boolean) {
+    if (heardSent) return
+    val key = currentKey ?: return
+    val length = duration
+    val needed = if (length > 0) minOf(10_000.0, length * 500.0) else 10_000.0
+    if (heardMs >= needed || (ended && heardMs > 1000)) {
+      heardSent = true
+      emit(JSONObject().put("t", "heard").put("id", current).put("key", key))
+    }
   }
 
   /** Play state changed: tell the page, and keep the notification, lock screen and widget in step. */
@@ -273,6 +543,25 @@ object NativeAudio {
       NowPlaying.update(before.copy(playing = playing, position = position, at = System.currentTimeMillis()))
       context?.let { NowPlayingWidget.refresh(it) }
     }
+  }
+
+  private fun emitQueue(reason: String) {
+    val event = JSONObject()
+      .put("t", "queue")
+      .put("rev", rev)
+      .put("seq", seq)
+      .put("reason", reason)
+      .put("id", current)
+      .put("past", JSONArray(queue.past))
+      .put("current", currentKey ?: JSONObject.NULL)
+      .put("future", JSONArray(queue.future))
+      .put("repeat", queue.repeat)
+      .put("order", queue.order)
+      .put("contextId", queue.contextId)
+      .put("playing", wantsPlay)
+      .put("ended", ended)
+      .put("pos", position)
+    emit(event)
   }
 
   private fun report() {

@@ -38,6 +38,7 @@ class PlaybackService : MediaSessionService() {
 
   override fun onCreate() {
     super.onCreate()
+    Log.i(TAG, "service starts")
     running = true
     val mirror = MirrorPlayer(Looper.getMainLooper())
     player = mirror
@@ -92,6 +93,7 @@ class PlaybackService : MediaSessionService() {
     }
     handler.removeCallbacks(release)
     if (playing) {
+      if (wake?.isHeld != true) Log.i(TAG, "CPU and Wi-Fi kept awake for playback")
       if (wake == null) {
         wake = (getSystemService(Context.POWER_SERVICE) as PowerManager)
           .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "tunepeerly:playback").apply { setReferenceCounted(false) }
@@ -105,6 +107,7 @@ class PlaybackService : MediaSessionService() {
       wake?.acquire(30 * 60 * 1000L)
       runCatching { wifi?.acquire() }
     } else {
+      if (wake?.isHeld == true) Log.i(TAG, "CPU and Wi-Fi locks let go (not playing)")
       wake?.let { if (it.isHeld) it.release() }
       wifi?.let { if (it.isHeld) it.release() }
     }
@@ -113,12 +116,14 @@ class PlaybackService : MediaSessionService() {
   override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session
 
   override fun onTaskRemoved(rootIntent: Intent?) {
+    Log.i(TAG, "app swiped away: stop the music")
     // Swiping the app away closes the page that runs the queue, so the music and the notification stop too.
     NativeAudio.stop()
     stopSelf()
   }
 
   override fun onDestroy() {
+    Log.i(TAG, "service ends")
     running = false
     NowPlaying.listeners.remove(listener)
     locks(false, now = true)

@@ -78,7 +78,6 @@ class MirrorPlayer(looper: Looper) : SimpleBasePlayer(looper) {
   override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
     NowPlaying.assume { it.copy(playing = playWhenReady, position = it.positionNow()) }
     // The phone's player answers at once, even while the page's script is held back in the background.
-    NativeAudio.setPlaying(playWhenReady)
     return send(if (playWhenReady) "play" else "pause")
   }
 
