@@ -70,10 +70,21 @@ struct Waiter {
     queued: Option<Arc<AtomicUsize>>,
 }
 
+/// Picks an online device holding a song, skipping the given devices. Installed by the app (see `lib.rs`).
+pub type HolderPicker = Arc<dyn Fn(&str, &[String]) -> Option<String> + Send + Sync>;
+
+/// How long a device that failed to deliver a song is skipped for that song on stream URLs.
+const STREAM_FAILURE_MEMORY: Duration = Duration::from_secs(60);
+
 pub struct AudioBus {
     waiters: Mutex<HashMap<u64, Waiter>>,
     routes: Mutex<HashMap<String, Route>>,
     pub base: Mutex<String>,
+    /// Secret part of the stream URLs (`stream_base`), new on every start.
+    secret: String,
+    picker: Mutex<Option<HolderPicker>>,
+    /// Devices that recently failed a stream request, per content id.
+    stream_failures: Mutex<HashMap<String, Vec<(String, std::time::Instant)>>>,
 }
 
 impl AudioBus {
@@ -82,13 +93,52 @@ impl AudioBus {
             waiters: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
             base: Mutex::new(String::new()),
+            secret: random_hex(),
+            picker: Mutex::new(None),
+            stream_failures: Mutex::new(HashMap::new()),
         })
     }
 
+    pub fn set_picker(&self, picker: HolderPicker) {
+        *self.picker.lock().unwrap_or_else(PoisonError::into_inner) = Some(picker);
+    }
+
+    /// A song's stream URL is this followed by its content id. Unlike `open_route`, such a URL does not
+    /// expire and picks the device to read from on every request, so a player can reach any song of the
+    /// queue, and retry it after a dropped link, without asking the page for a new URL first.
+    pub fn stream_base(&self) -> String {
+        format!("{}/s{}.", self.base.lock().unwrap_or_else(PoisonError::into_inner), self.secret)
+    }
+
+    /// The route a stream URL token stands for right now, or None when it is not one or no device has the song.
+    fn stream_route(&self, token: &str) -> Option<Result<Route, ()>> {
+        let rest = token.strip_prefix('s')?.strip_prefix(self.secret.as_str())?.strip_prefix('.')?;
+        if rest.is_empty() || rest.len() > 200 || !rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Some(Err(()));
+        }
+        let skip: Vec<String> = {
+            let mut failures = self.stream_failures.lock().unwrap_or_else(PoisonError::into_inner);
+            failures.retain(|_, list| {
+                list.retain(|(_, at)| at.elapsed() < STREAM_FAILURE_MEMORY);
+                !list.is_empty()
+            });
+            failures.get(rest).map(|list| list.iter().map(|(device, _)| device.clone()).collect()).unwrap_or_default()
+        };
+        let picker = self.picker.lock().unwrap_or_else(PoisonError::into_inner).clone()?;
+        // Every device failed recently: try them all again rather than give up.
+        let device = picker(rest, &skip).or_else(|| if skip.is_empty() { None } else { picker(rest, &[]) });
+        Some(device.map(|device_id| Route { content_id: rest.to_string(), device_id, created: std::time::Instant::now() }).ok_or(()))
+    }
+
+    fn stream_failed(&self, content_id: &str, device_id: &str) {
+        let mut failures = self.stream_failures.lock().unwrap_or_else(PoisonError::into_inner);
+        let list = failures.entry(content_id.to_string()).or_default();
+        list.retain(|(device, _)| device != device_id);
+        list.push((device_id.to_string(), std::time::Instant::now()));
+    }
+
     pub fn open_route(&self, content_id: &str, device_id: &str) -> String {
-        let mut bytes = [0u8; 16];
-        rand::rng().fill_bytes(&mut bytes);
-        let token = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let token = random_hex();
         let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
         // Playback fetches one token many times (ranges), so tokens cannot be spent. Keep only the newest few.
         while routes.len() >= ROUTE_LIMIT {
@@ -151,6 +201,12 @@ impl AudioBus {
     }
 }
 
+fn random_hex() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+}
+
 /// Starts the loopback media proxy and signals once route URLs are usable.
 pub async fn serve(
     bus: Arc<AudioBus>,
@@ -206,7 +262,17 @@ async fn handle(mut socket: TcpStream, bus: Arc<AudioBus>, pulls: mpsc::Unbounde
         socket.write_all(status_response(400, "Bad Request").as_bytes()).await?;
         return Ok(());
     };
-    let route = bus.routes.lock().unwrap_or_else(PoisonError::into_inner).get(&request.token).cloned();
+    let stream = bus.stream_route(&request.token);
+    let streamed = stream.is_some();
+    let route = match stream {
+        Some(Ok(route)) => Some(route),
+        Some(Err(())) => {
+            // A stream URL, but no device that has the song is connected now. The player retries.
+            socket.write_all(status_response(503, "Service Unavailable").as_bytes()).await?;
+            return Ok(());
+        }
+        None => bus.routes.lock().unwrap_or_else(PoisonError::into_inner).get(&request.token).cloned(),
+    };
     let Some(route) = route else {
         socket.write_all(status_response(404, "Not Found").as_bytes()).await?;
         return Ok(());
@@ -220,6 +286,9 @@ async fn handle(mut socket: TcpStream, bus: Arc<AudioBus>, pulls: mpsc::Unbounde
     let mut opened = match open_pull(&bus, &pulls, &route.device_id, &route.content_id, start, end).await {
         Ok(opened) => opened,
         Err((code, reason)) => {
+            if streamed && code != 416 {
+                bus.stream_failed(&route.content_id, &route.device_id);
+            }
             socket.write_all(status_response(code, reason).as_bytes()).await?;
             return Ok(());
         }
@@ -278,14 +347,21 @@ async fn handle(mut socket: TcpStream, bus: Arc<AudioBus>, pulls: mpsc::Unbounde
     }
 
     let mut written = start;
+    // The other device stopped sending, as opposed to the player hanging up (a seek or a stop).
+    let mut peer_failed = false;
     loop {
         let piece = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
-        let Ok(Some(piece)) = piece else { break };
+        let Ok(Some(piece)) = piece else {
+            peer_failed = true;
+            break;
+        };
         taken(&queued, &piece);
         if piece.error.is_some() {
+            peer_failed = piece.error.as_deref() != Some("cancelled");
             break;
         }
         if piece.offset > written {
+            peer_failed = true;
             break;
         }
         let skip = (written - piece.offset) as usize;
@@ -304,6 +380,9 @@ async fn handle(mut socket: TcpStream, bus: Arc<AudioBus>, pulls: mpsc::Unbounde
     bus.finish(id);
     if written < stop {
         cancel(&pulls);
+        if streamed && peer_failed {
+            bus.stream_failed(&route.content_id, &route.device_id);
+        }
     }
     let _ = socket.shutdown().await;
     Ok(())
@@ -462,6 +541,31 @@ mod tests {
         assert_eq!(range_stop(20, None, 20), None);
         assert_eq!(range_stop(0, None, 0), None);
         assert_eq!(range_stop(10, Some(99), 20), Some(20));
+    }
+
+    #[test]
+    fn stream_urls_pick_a_device_per_request_and_skip_recent_failures() {
+        let bus = AudioBus::new();
+        *bus.base.lock().unwrap() = "http://127.0.0.1:9".into();
+        let base = bus.stream_base();
+        assert!(base.starts_with("http://127.0.0.1:9/s") && base.ends_with('.'));
+        let token = format!("{}abc", base.trim_start_matches("http://127.0.0.1:9/"));
+        // No picker yet: nothing can serve it.
+        assert!(matches!(bus.stream_route(&token), None));
+        bus.set_picker(Arc::new(|content: &str, skip: &[String]| {
+            assert_eq!(content, "abc");
+            ["one", "two"].iter().find(|device| !skip.iter().any(|s| s == *device)).map(|d| d.to_string())
+        }));
+        assert_eq!(bus.stream_route(&token).unwrap().unwrap().device_id, "one");
+        bus.stream_failed("abc", "one");
+        assert_eq!(bus.stream_route(&token).unwrap().unwrap().device_id, "two");
+        bus.stream_failed("abc", "two");
+        // Both failed lately: start over instead of giving up.
+        assert_eq!(bus.stream_route(&token).unwrap().unwrap().device_id, "one");
+        // Wrong secret, a bad id, or an ordinary route token are not stream URLs.
+        assert!(bus.stream_route("sdeadbeef.abc").is_none());
+        assert!(matches!(bus.stream_route(&format!("{}a.b", token.trim_end_matches("abc"))), Some(Err(()))));
+        assert!(bus.stream_route("0123456789abcdef0123456789abcdef").is_none());
     }
 
     #[test]

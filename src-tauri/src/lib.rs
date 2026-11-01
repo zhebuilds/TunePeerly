@@ -444,20 +444,52 @@ fn remote_url(state: State<'_, AppState>, content_id: String, exclude: Option<Ve
             sync_logic::FailureClass::Transport => {}
         }
     }
-    let mut holders: Vec<String> = {
-        let db = state.db.lock().unwrap_or_else(PoisonError::into_inner);
+    let exclude = exclude.unwrap_or_default();
+    let online = state.net.live.inner.lock().unwrap_or_else(PoisonError::into_inner).links.clone();
+    let device_id = online_holder(&state.db, &online, &content_id, &exclude)?
+        .ok_or_else(|| AppError::Message(if exclude.is_empty() { "notice.offlineTrack" } else { "playback.allSourcesFailed" }.into()))?;
+    Ok(json!({"url": state.net.bus.open_route(&content_id, &device_id), "deviceId": device_id}))
+}
+
+/// The first connected device that holds `content_id`, leaving out `exclude`.
+fn online_holder(db: &Mutex<Db>, online: &[net::LinkStatus], content_id: &str, exclude: &[String]) -> AppResult<Option<String>> {
+    let holders: Vec<String> = {
+        let db = db.lock().unwrap_or_else(PoisonError::into_inner);
         let mut stmt = db.conn.prepare("SELECT DISTINCT device_id FROM holdings WHERE content_id = ?1 ORDER BY device_id")?;
         let rows = stmt.query_map(rusqlite::params![content_id], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    let exclude = exclude.unwrap_or_default();
-    holders.retain(|holder| !exclude.contains(holder));
-    let online = state.net.live.inner.lock().unwrap_or_else(PoisonError::into_inner).links.clone();
-    let device_id = holders
+    Ok(holders
         .into_iter()
-        .find(|holder| online.iter().any(|link| &link.device_id == holder && link.state == "online"))
-        .ok_or_else(|| AppError::Message(if exclude.is_empty() { "notice.offlineTrack" } else { "playback.allSourcesFailed" }.into()))?;
-    Ok(json!({"url": state.net.bus.open_route(&content_id, &device_id), "deviceId": device_id}))
+        .filter(|holder| !exclude.contains(holder))
+        .find(|holder| online.iter().any(|link| &link.device_id == holder && link.state == "online")))
+}
+
+/// Lets stream URLs (`AudioBus::stream_base`) pick a device on every request, with the same rules as `remote_url`.
+fn install_holder_picker(db: Arc<Mutex<Db>>, net: &net::Network) {
+    let live = net.live.clone();
+    net.bus.set_picker(Arc::new(move |content_id: &str, skip: &[String]| {
+        {
+            let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+            if guard.setting_bool("incognito").unwrap_or(true) {
+                return None;
+            }
+            if let Ok(Some(reason)) = guard.unplayable_reason(content_id) {
+                if !matches!(sync_logic::failure_class(&reason), sync_logic::FailureClass::Transport) {
+                    return None;
+                }
+            }
+        }
+        let online = live.inner.lock().unwrap_or_else(PoisonError::into_inner).links.clone();
+        online_holder(&db, &online, content_id, skip).ok().flatten()
+    }));
+}
+
+/// The start of every song's stream URL; the content id follows. Android's player uses it to reach any
+/// song in the queue by itself.
+#[tauri::command]
+fn stream_base(state: State<'_, AppState>) -> String {
+    state.net.bus.stream_base()
 }
 
 #[tauri::command(async)]
@@ -598,6 +630,7 @@ pub fn run() {
             let net = net::spawn(app.handle().clone(), db.clone(), material.clone())
                 .unwrap_or_else(|err| fatal(&format!("network: {err}")));
             let _ = net.tx.send(net::Cmd::Apply);
+            install_holder_picker(db.clone(), &net);
             let (on_minimize, in_tray) = db.lock().unwrap_or_else(PoisonError::into_inner).mini_flags();
             let worker = BackgroundWork {
                 app: app.handle().clone(),
@@ -647,7 +680,8 @@ pub fn run() {
             hide_to_tray,
             set_tray_menu,
             android_import,
-            android_audio
+            android_audio,
+            stream_base
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| fatal(&format!("{err}")));
