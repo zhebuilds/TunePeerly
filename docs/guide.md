@@ -12,7 +12,7 @@ The installer does not add a firewall rule. The first time the app listens for o
 
 ## Add music
 
-Open **Music folder** in Settings, or drop folders and audio files onto the window. The app reads the files where they are. It does not copy them and it does not transcode them.
+Open **Music and download folders** in Settings, or drop folders and audio files onto the window. The app reads the files where they are. It does not copy them and it does not transcode them.
 
 **Scan** on the All music page, and **Rescan** in Settings, read every added folder again. New songs are added. A changed song, or a `.lrc` file you added or edited next to it, is read again. Nothing else changes.
 
@@ -36,64 +36,59 @@ The window has its own title bar. **When closing** in Settings → Appearance ch
 
 The Windows taskbar thumbnail shows the whole cover, scaled down to fit, with previous, play, next, and a heart.
 
-## Playlists and exposure
+## Playlists
 
 A playlist is a list of songs. Deleting a playlist does not delete the songs.
 
-**New local songs**, in Settings → Music folder, decides whether a song that is not governed by a playlist is offered to paired devices. Each playlist can follow that default, always expose new songs, or never expose them. That choice applies when a song is added. **Expose all now** and **Stop exposing all** change songs that are already in the list.
-
-A paired device can see and play a song only when this computer is exposing it.
+Every readable local song is offered to paired devices. Once a device is paired and connected, it can see, play, and download all of them, including songs added later. Only incognito stops this.
 
 ## Unfinished settings
 
 Some settings show a short mark beside the title. The mark does not describe the problem.
 
-- **To be revised** means this version keeps the current behavior, and it will change later. The mark is on **Paired devices**, **Nearby**, **Connect by address**, **Sync**, **Auto send**, **When a sync conflicts**, **Sync recently played**, **Merge when this computer comes online**, **LAN port**, and **Device ID**.
-- **Do not use** means do not use it. The feature has problems. The mark is on **Follow playback** and **Relay**.
-- **Not completed yet, not tested** is also on **Relay**. A relay implementation is in this version. It is not completed yet, and it has not been tested.
+- **To be revised** means this version keeps the current behavior, and it will change later. The mark is on **Sync**.
+- **Do not use** means do not use it. The feature has problems. The mark is on **Relay server** on the Devices page.
+- **Not completed yet, not tested** is also on **Relay server**. A relay implementation is in this version. It is not completed yet, and it has not been tested.
 
 The rest of this guide says what those controls are for.
 
 ## Pair a device
 
-Open **Devices**. **Paired devices**, **Nearby**, and **Connect by address** are marked **To be revised**. Before pairing, **Discover nearby devices** in Settings → Network must be on, or devices cannot be found.
+Open **Devices**. Before pairing, **Discover nearby devices**, the switch next to **Nearby**, must be on, or devices cannot be found.
 
 - **Discover nearby devices** announces this computer's name about every 3 seconds, over UDP multicast.
-- You can also type another computer's IPv4 address and port.
-- Pairing finishes only after both computers accept. Until then the connection is pending.
+- You can also type another computer's IPv4 address and port. The port changes on every start; that computer shows its current one under Settings → **This computer** → **TCP listening port**.
+- To pair, press **Pair** on one computer. The other computer shows a 6-digit code; type it on the first one. A code works once, for 90 seconds. After 3 wrong codes, pairing pauses for 1 minute. Until pairing finishes, the connection is pending.
 - After you decline a request, that device cannot ask again until **Silence after a decline** has passed. That setting is under History and privacy. The default is 60 seconds, and the allowed range is 1 to 86400. You can still connect to that device yourself.
 - Block removes a device. Later data from it is dropped.
+- **Remove** unpairs both sides. This computer deletes the device's saved key and tells the device, which removes this computer and shows a notice. If the device is offline, it is told the next time the two connect, and until then it only gets that notice from this computer. Your other devices are not changed. To use the two together again, press **Pair** on either one and type the new code.
 
-The four relay fields are under Settings → Network: address, port, the relay's certificate ID, and a token. **Relay** is marked **Not completed yet, not tested** and **Do not use**.
+The four relay fields are on the **Devices** page, in **Relay server** below **Nearby**: address, port, the relay's certificate ID, and a token, with the relay status shown under the heading. **Relay server** is marked **Not completed yet, not tested** and **Do not use**.
 
-**LAN port** and **Device ID** are under Settings → Storage, and both are marked **To be revised**.
+Settings → **This computer** is where you rename this computer; other devices see that name. Below it are read-only details: the **TCP listening port**, the discovery UDP port and multicast group, the LAN IPv4 addresses this computer announces, and last the **Device ID**. The discovery rows show Off while discovery is off. The TCP port cannot be set: each time the app starts or the network is turned back on, the system picks a free port, and discovery announces it. Changing other settings keeps the current port.
 
 ## Play a song that is on another computer
 
-A song offered by an online paired device can be played from that device. **Download** saves the original file into the downloads folder and adds it to this library.
+Any song on an online paired device can be played from that device. **Download** saves the original file into the downloads folder (set in Settings → Music and download folders) and adds it to this library.
 
 ## Sync
 
-The **Sync** heading, **Auto send**, and **When a sync conflicts** are marked **To be revised**.
+The **Sync** section in Settings, right after Music and download folders, is marked **To be revised**. Nothing syncs on its own: a copy moves only when you press Send or Override.
 
-Incognito cuts every device connection, stops discovery, and turns sync off.
+Incognito cuts every device connection, stops discovery, turns sync off, and stops offering this computer's songs to other devices.
 
 | Control | What it does |
 | --- | --- |
-| Send | Push this computer's copy to every paired device that is online now. |
-| Override | Ask one online device for its copy and replace this computer's copy with it. |
+| Send | Push this computer's copy to one connected device, or to all connected devices. |
+| Override | Ask one online device for its copy and replace this computer's copy with it. You pick the device each time; none is preselected. |
 
-**Silent overwrite** replaces the copy immediately. **Ask before overwrite** waits for a confirmation. Override does not ask again, because this computer requested that copy.
+A Send always overwrites; there is no merging and no conflict handling. Each computer chooses, per item, what a Send from another device may do: **Overwrite directly** replaces the copy at once, **Ask first** waits up to a minute for you to accept or decline, and **Don't allow** refuses it and changes nothing. The default is Overwrite directly. The sending computer shows each device's result, such as updated, not allowed, declined, timed out, or in incognito, and keeps it in the notifications. A device that does not answer within 15 seconds shows as no result. Override does not ask and is not affected by this choice, because this computer requested that copy.
 
 Appearance sync includes the theme, the language, the two mini player switches, and the close-window choice.
 
 ## Recently played
 
-**Sync recently played** and **Merge when this computer comes online** are marked **To be revised**.
-
-## Follow playback
-
-**Follow playback** is marked **Do not use**.
+Recently played is kept on each computer and is not synced. When a paired device is connected, the list at the top of **Recently played** can switch to that device. Its list is asked for once and shown read-only: it is not saved or merged here, and nothing is sent back. Songs that are also in this library, or that a connected device has, can be played from it. If that device disconnects, the page goes back to this computer's list. A device in incognito does not share its list.
 
 ## Notifications
 
@@ -101,6 +96,6 @@ The bell opens the notification list. You can mark items read when they scroll i
 
 ## Where your data stays
 
-The database is in `%APPDATA%\TunePeerly`. Covers and the window cache are in `%LOCALAPPDATA%\TunePeerly`. These two folders cannot be changed. Uninstalling asks whether to delete them.
+The database is in `%APPDATA%\TunePeerly`. It is encrypted, and its key file `db.key` beside it is sealed for your Windows account. Covers and the window cache are in `%LOCALAPPDATA%\TunePeerly`. These two folders cannot be changed. Uninstalling asks whether to delete them.
 
-There is no account. Paired devices on the same local network sync and stream directly. Outside that network they can meet through the relay configured under Settings → Network. **Relay** is marked **Not completed yet, not tested** and **Do not use**.
+There is no account. Paired devices on the same local network sync and stream directly. Outside that network they can meet through the relay configured on the **Devices** page under **Relay server**. **Relay server** is marked **Not completed yet, not tested** and **Do not use**.
