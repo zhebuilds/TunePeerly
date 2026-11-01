@@ -8,67 +8,79 @@ use rustls::{
     ClientConfig, DigitallySignedStruct, DistinguishedName, Error, ServerConfig, SignatureScheme,
 };
 
-use crate::identity::certificate_binds;
+use sha2::{Digest, Sha256};
 
-/// Checks the X.509 signature and the Signal identity binding.
-/// Handshake signatures still go through the rustls crypto provider.
+/// Pins the certificate a device or relay presents. Devices are pinned by the hash of their public
+/// key, so only the key a paired device holds matters; relays are pinned by their whole-certificate id.
+/// Handshake signatures still go through the rustls crypto provider, which proves the key is held.
 #[derive(Debug)]
 pub struct IdentityVerifier {
     provider: Arc<rustls::crypto::CryptoProvider>,
-    expected_identity: Option<Vec<u8>>,
-    expected_cert_id: Option<[u8; 32]>,
+    pin: Pin,
+}
+
+#[derive(Debug)]
+enum Pin {
+    /// Any device key except these SHA-256 hashes of removed devices' keys; the caller decides
+    /// from the device id afterwards.
+    AnyDevice(Vec<[u8; 32]>),
+    /// SHA-256 of the device's SubjectPublicKeyInfo.
+    Device([u8; 32]),
+    /// strelaysrv id: SHA-256 of the relay's certificate.
+    Relay([u8; 32]),
 }
 
 impl IdentityVerifier {
-    pub fn peer(provider: Arc<rustls::crypto::CryptoProvider>, expected_identity: Option<Vec<u8>>) -> Self {
+    pub fn peer(provider: Arc<rustls::crypto::CryptoProvider>, expected_key_hash: Option<[u8; 32]>) -> Self {
         Self {
             provider,
-            expected_identity,
-            expected_cert_id: None,
+            pin: expected_key_hash.map_or(Pin::AnyDevice(Vec::new()), Pin::Device),
         }
+    }
+
+    /// Accepts any device key except those of removed devices, which fail the TLS handshake.
+    pub fn any_peer_except(provider: Arc<rustls::crypto::CryptoProvider>, removed_key_hashes: Vec<[u8; 32]>) -> Self {
+        Self { provider, pin: Pin::AnyDevice(removed_key_hashes) }
     }
 
     pub fn relay(provider: Arc<rustls::crypto::CryptoProvider>, expected_cert_id: [u8; 32]) -> Self {
         Self {
             provider,
-            expected_identity: None,
-            expected_cert_id: Some(expected_cert_id),
+            pin: Pin::Relay(expected_cert_id),
         }
     }
 
     fn check_end_entity(&self, end_entity: &CertificateDer<'_>) -> Result<(), Error> {
-        if let Some(expected) = &self.expected_cert_id {
-            let actual = crate::ids::cert_id_bytes(end_entity.as_ref());
-            if &actual != expected {
-                return Err(Error::General("relay certificate id does not match".into()));
+        let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
+            .map_err(|err| Error::General(err.to_string()))?;
+        match &self.pin {
+            Pin::AnyDevice(removed) => {
+                let hash = Sha256::digest(cert.public_key().raw);
+                if removed.iter().any(|item| item.as_slice() == hash.as_slice()) {
+                    return Err(Error::General("this device was removed".into()));
+                }
+                Ok(())
             }
-            let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
-                .map_err(|err| Error::General(err.to_string()))?;
-            cert.verify_signature(None)
-                .map_err(|err| Error::General(err.to_string()))?;
-            return Ok(());
-        }
-        let identity = identity_extension(end_entity.as_ref()).map_err(Error::General)?;
-        if let Some(expected) = &self.expected_identity {
-            if &identity != expected {
-                return Err(Error::General("peer identity does not match the pinned key".into()));
+            Pin::Device(expected) => {
+                if Sha256::digest(cert.public_key().raw).as_slice() != expected {
+                    return Err(Error::General("peer key does not match the pinned key".into()));
+                }
+                Ok(())
+            }
+            Pin::Relay(expected) => {
+                if &crate::ids::cert_id_bytes(end_entity.as_ref()) != expected {
+                    return Err(Error::General("relay certificate id does not match".into()));
+                }
+                cert.verify_signature(None)
+                    .map_err(|err| Error::General(err.to_string()))
             }
         }
-        if !certificate_binds(end_entity.as_ref(), &identity).map_err(|err| Error::General(err.to_string()))? {
-            return Err(Error::General("certificate is not signed for its identity key".into()));
-        }
-        Ok(())
     }
 }
 
-fn identity_extension(cert_der: &[u8]) -> Result<Vec<u8>, String> {
-    let (_, cert) = x509_parser::parse_x509_certificate(cert_der).map_err(|err| err.to_string())?;
-    for extension in cert.extensions() {
-        if extension.oid.to_id_string() == "1.3.6.1.4.1.55529.1" {
-            return Ok(extension.value.to_vec());
-        }
-    }
-    Err("certificate has no identity key".into())
+/// Every connection negotiates TLS 1.3; these handshakes never reach a TLS 1.2 signature check.
+fn refuse_tls12() -> Result<rustls::client::danger::HandshakeSignatureValid, Error> {
+    Err(Error::General("TLS 1.2 is not allowed".into()))
 }
 
 impl ServerCertVerifier for IdentityVerifier {
@@ -86,11 +98,11 @@ impl ServerCertVerifier for IdentityVerifier {
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        refuse_tls12()
     }
 
     fn verify_tls13_signature(
@@ -112,7 +124,7 @@ impl ClientCertVerifier for IdentityVerifier {
         true
     }
     fn client_auth_mandatory(&self) -> bool {
-        self.expected_cert_id.is_none()
+        !matches!(self.pin, Pin::Relay(_))
     }
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         &[]
@@ -128,11 +140,11 @@ impl ClientCertVerifier for IdentityVerifier {
     }
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        refuse_tls12()
     }
     fn verify_tls13_signature(
         &self,
@@ -161,7 +173,7 @@ pub fn client_config(
     let cert = CertificateDer::from(cert_der.to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pkcs8.to_vec()));
     let mut config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|err| Error::General(err.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -183,7 +195,7 @@ pub fn server_config(
     let cert = CertificateDer::from(cert_der.to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pkcs8.to_vec()));
     let mut config = ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|err| Error::General(err.to_string()))?
         .with_client_cert_verifier(verifier)
         .with_single_cert(vec![cert], key)?;

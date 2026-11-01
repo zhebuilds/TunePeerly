@@ -5,11 +5,13 @@ mod media;
 mod config;
 mod connect;
 mod db;
+mod dbkey;
 mod error;
 mod frames;
 mod identity;
 mod ids;
 mod net;
+mod pairing;
 mod relay;
 mod scan;
 mod sync_logic;
@@ -70,11 +72,6 @@ fn bootstrap(state: State<'_, AppState>) -> AppResult<Value> {
         "deviceId": state.material.device_id,
         "certId": state.material.cert_id,
         "deviceName": db.setting_string("displayName").unwrap_or_default(),
-        "pairingText": identity::pairing_text(
-            &state.material.identity.identity_key().serialize(),
-            &state.material.cert_der,
-            &db.setting_string("displayName").unwrap_or_default(),
-        ),
         "settings": db.device_settings_map()?,
         "theme": db.synced("theme")?,
         "language": db.synced("language")?,
@@ -95,7 +92,6 @@ fn bootstrap(state: State<'_, AppState>) -> AppResult<Value> {
         "download": live.download,
         "downloadQueue": live.download_queue,
         "downloadHistory": db.setting_json("downloadHistory").unwrap_or(json!([])),
-        "manual": live.manual,
         "failures": live.failures,
         "blocks": blocks,
         "notices": notices,
@@ -465,6 +461,7 @@ fn network_command(state: State<'_, AppState>, action: String, payload: Value) -
         "confirm" => net::Cmd::Confirm {
             device_id: payload.get("deviceId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             trust: payload.get("trust").and_then(|v| v.as_str()).unwrap_or("full").to_string(),
+            code: payload.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         },
         "reject" => net::Cmd::Reject(text()),
         "block" => net::Cmd::Block(text()),
@@ -489,7 +486,6 @@ fn network_command(state: State<'_, AppState>, action: String, payload: Value) -
             id: payload.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
             accept: payload.get("accept").and_then(|v| v.as_bool()).unwrap_or(false),
         },
-        "paste" => net::Cmd::Paste(text()),
         "sync" => net::Cmd::Sync {
             feature: payload.get("feature").and_then(|v| v.as_str()).unwrap_or("favorites").to_string(),
             refresh: payload.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -637,7 +633,7 @@ pub fn run() {
             }
             let material = identity::load_or_create(&db).unwrap_or_else(|err| fatal(&format!("identity: {err}")));
             let db = Arc::new(Mutex::new(db));
-            let net = net::spawn(app.handle().clone(), db.clone(), material.clone_for_net())
+            let net = net::spawn(app.handle().clone(), db.clone(), material.clone())
                 .unwrap_or_else(|err| fatal(&format!("network: {err}")));
             let _ = net.tx.send(net::Cmd::Apply);
             let (on_minimize, in_tray) = db.lock().unwrap_or_else(PoisonError::into_inner).mini_flags();
@@ -819,19 +815,5 @@ impl BackgroundWork {
             }
         }
         true
-    }
-}
-
-impl IdentityMaterial {
-    fn clone_for_net(&self) -> Self {
-        Self {
-            device_id: self.device_id.clone(),
-            identity: self.identity,
-            registration_id: self.registration_id,
-            cert_der: self.cert_der.clone(),
-            cert_key_pkcs8: self.cert_key_pkcs8.clone(),
-            cert_id: self.cert_id.clone(),
-            distribution_id: self.distribution_id,
-        }
     }
 }

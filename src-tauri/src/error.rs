@@ -18,8 +18,6 @@ pub enum AppError {
     #[error(transparent)]
     Tauri(#[from] tauri::Error),
     #[error(transparent)]
-    Signal(#[from] libsignal_protocol::SignalProtocolError),
-    #[error(transparent)]
     Rustls(#[from] rustls::Error),
     #[error(transparent)]
     Rcgen(#[from] rcgen::Error),
