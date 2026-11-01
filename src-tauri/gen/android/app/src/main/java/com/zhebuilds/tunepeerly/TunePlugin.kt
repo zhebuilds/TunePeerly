@@ -1,0 +1,340 @@
+// Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
+
+package com.zhebuilds.tunepeerly
+
+import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
+import android.util.Base64
+import android.util.Log
+import android.webkit.WebView
+import androidx.activity.result.ActivityResult
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import app.tauri.annotation.ActivityCallback
+import app.tauri.annotation.Command
+import app.tauri.annotation.InvokeArg
+import app.tauri.annotation.TauriPlugin
+import app.tauri.plugin.Invoke
+import app.tauri.plugin.JSObject
+import app.tauri.plugin.Plugin
+import org.json.JSONObject
+import java.io.File
+import java.util.concurrent.Executors
+
+@InvokeArg
+class BlobArgs {
+  var data: String = ""
+}
+
+@InvokeArg
+class PickArgs {
+  var folder: Boolean = false
+  var dest: String = ""
+}
+
+@InvokeArg
+class TipArgs {
+  var like: String = "Like"
+}
+
+@InvokeArg
+class TrackArgs {
+  var title: String = ""
+  var artist: String = ""
+  var album: String = ""
+  var coverPath: String? = null
+  var playing: Boolean = false
+  var favorite: Boolean = false
+  var duration: Double = 0.0
+  var position: Double = 0.0
+  var theme: String = "dark"
+  var language: String = "en"
+  var tips: TipArgs? = null
+}
+
+/**
+ * The Android half of the app: the Keystore for the database key, the Wi-Fi multicast lock that lets
+ * discovery packets in, the system picker for adding songs, and the media session mirror. Actions from
+ * the notification, the lock screen, headsets and the widget go back to the web view as
+ * `desktop_command`, the same path the Windows media controls use.
+ */
+@TauriPlugin
+class TunePlugin(private val activity: Activity) : Plugin(activity) {
+  private var webView: WebView? = null
+  private var multicast: WifiManager.MulticastLock? = null
+  private var network: ConnectivityManager.NetworkCallback? = null
+  private val main = Handler(Looper.getMainLooper())
+  private val worker = Executors.newSingleThreadExecutor()
+  private var pickDest: File? = null
+  private var pickFolder = false
+  private var askedNotifications = false
+  private var pausedAt = 0L
+
+  override fun load(webView: WebView) {
+    this.webView = webView
+    instance = this
+    holdMulticast()
+    watchNetwork()
+  }
+
+  override fun onPause(activity: AppCompatActivity) {
+    pausedAt = SystemClock.elapsedRealtime()
+    // WryActivity pauses the web view, and with it the audio element. A music app keeps playing.
+    if (NowPlaying.snapshot.playing) keepRunning()
+  }
+
+  override fun onResume(activity: AppCompatActivity) {
+    // After a long time away (Doze, a night in the pocket) the relay link is likely stale.
+    if (pausedAt != 0L && SystemClock.elapsedRealtime() - pausedAt > 60_000) networkChanged()
+    pausedAt = 0L
+  }
+
+  override fun onDestroy(activity: AppCompatActivity) {
+    instance = null
+    network?.let { runCatching { connectivity().unregisterNetworkCallback(it) } }
+    network = null
+    multicast?.let { if (it.isHeld) it.release() }
+    multicast = null
+    worker.shutdown()
+    PlaybackService.stop(activity)
+  }
+
+  /** Resumes the web view right after the activity paused it, so the audio element keeps going. */
+  fun keepRunning() {
+    val view = webView ?: return
+    main.post { view.onResume() }
+    main.postDelayed({ if (NowPlaying.snapshot.playing) view.onResume() }, 150)
+  }
+
+  private fun holdMulticast() {
+    // Without it many phones drop the UDP broadcast and multicast that Nearby discovery uses.
+    val wifi = activity.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+    multicast = wifi.createMulticastLock("tunepeerly-discovery").apply {
+      setReferenceCounted(false)
+      runCatching { acquire() }.onFailure { Log.w(TAG, "multicast lock: ${it.message}") }
+    }
+  }
+
+  private fun connectivity() = activity.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
+  private fun watchNetwork() {
+    var first = true
+    val debounce = Runnable { networkChanged() }
+    val callback = object : ConnectivityManager.NetworkCallback() {
+      private fun changed() {
+        main.removeCallbacks(debounce)
+        main.postDelayed(debounce, 1500)
+      }
+      override fun onAvailable(net: Network) {
+        // The first call only reports the network the app started on.
+        if (first) { first = false; return }
+        changed()
+      }
+      override fun onLost(net: Network) = changed()
+      override fun onCapabilitiesChanged(net: Network, caps: NetworkCapabilities) {
+        if (!first) changed()
+      }
+    }
+    runCatching { connectivity().registerDefaultNetworkCallback(callback) }
+      .onSuccess { network = callback }
+      .onFailure { Log.w(TAG, "network callback: ${it.message}") }
+  }
+
+  private fun networkChanged() = invokeRust("network_command", JSONObject().put("action", "network-changed").put("payload", JSONObject.NULL))
+
+  private fun invokeRust(command: String, args: JSONObject) {
+    val script = "window.__TAURI_INTERNALS__&&window.__TAURI_INTERNALS__.invoke(${JSONObject.quote(command)},$args).catch(function(){})"
+    main.post { webView?.evaluateJavascript(script, null) }
+  }
+
+  /** Asks the page to handle the back button. [done] gets false when there was nothing left to close. */
+  fun back(done: (Boolean) -> Unit): Boolean {
+    val view = webView ?: return false
+    val script = "(function(){try{return !!(window.__tpBack&&window.__tpBack())}catch(e){return false}})()"
+    view.evaluateJavascript(script) { done(it == "true") }
+    return true
+  }
+
+  /** Runs a control press in the player. Returns false when the app is not running. */
+  fun action(name: String): Boolean {
+    if (webView == null) return false
+    keepRunning()
+    invokeRust("desktop_command", JSONObject().put("action", name))
+    return true
+  }
+
+  @Command
+  fun seal(invoke: Invoke) {
+    val args = invoke.parseArgs(BlobArgs::class.java)
+    runCatching { KeyVault.seal(Base64.decode(args.data, Base64.NO_WRAP)) }
+      .onSuccess { invoke.resolve(JSObject().put("data", Base64.encodeToString(it, Base64.NO_WRAP))) }
+      .onFailure { invoke.reject("keystore: ${it.message}") }
+  }
+
+  @Command
+  fun unseal(invoke: Invoke) {
+    val args = invoke.parseArgs(BlobArgs::class.java)
+    runCatching { KeyVault.unseal(Base64.decode(args.data, Base64.NO_WRAP)) }
+      .onSuccess { invoke.resolve(JSObject().put("data", Base64.encodeToString(it, Base64.NO_WRAP))) }
+      .onFailure { invoke.reject("keystore: ${it.message}") }
+  }
+
+  @Command
+  fun pick(invoke: Invoke) {
+    val args = invoke.parseArgs(PickArgs::class.java)
+    pickDest = File(args.dest)
+    pickFolder = args.folder
+    val intent = if (args.folder) {
+      Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+    } else {
+      Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+        addCategory(Intent.CATEGORY_OPENABLE)
+        type = "audio/*"
+        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+      }
+    }
+    startActivityForResult(invoke, intent, "picked")
+  }
+
+  @ActivityCallback
+  fun picked(invoke: Invoke, result: ActivityResult) {
+    val dest = pickDest
+    val data = result.data
+    if (result.resultCode != Activity.RESULT_OK || data == null || dest == null) {
+      invoke.resolve(JSObject().put("count", 0))
+      return
+    }
+    val uris = mutableListOf<Uri>()
+    data.clipData?.let { clip -> for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri) }
+    data.data?.let { if (uris.isEmpty()) uris.add(it) }
+    val tree = pickFolder && uris.size == 1
+    worker.execute {
+      runCatching {
+        val copier = Copier(activity.contentResolver)
+        if (tree) copier.copyTree(uris[0], dest) else uris.forEach { copier.copyFile(it, dest) }
+        copier.count
+      }.onSuccess { invoke.resolve(JSObject().put("count", it)) }
+        .onFailure { invoke.reject("import: ${it.message}") }
+    }
+  }
+
+  @Command
+  fun playback(invoke: Invoke) {
+    val args = invoke.parseArgs(TrackArgs::class.java)
+    val next = Snapshot(
+      title = args.title,
+      artist = args.artist,
+      album = args.album,
+      coverPath = args.coverPath,
+      playing = args.playing,
+      favorite = args.favorite,
+      duration = args.duration,
+      position = args.position,
+      language = args.language,
+      likeLabel = args.tips?.like ?: "Like",
+    )
+    val dark = args.theme != "light"
+    main.post {
+      (activity as? MainActivity)?.applyTheme(dark)
+      NowPlaying.update(next)
+      if (next.hasTrack) PlaybackService.ensure(activity)
+      if (next.playing) askNotifications()
+      NowPlayingWidget.refresh(activity.applicationContext)
+    }
+    invoke.resolve()
+  }
+
+  /** Android 13 and newer show the playback notification only after the user allows notifications. */
+  private fun askNotifications() {
+    if (askedNotifications || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    askedNotifications = true
+    if (ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+      runCatching { activity.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 41) }
+    }
+  }
+
+  companion object {
+    private const val TAG = "TunePlugin"
+    @Volatile var instance: TunePlugin? = null
+  }
+}
+
+/** Copies picked documents into the app's own music folder, which the importer then reads like any folder. */
+private class Copier(private val resolver: android.content.ContentResolver) {
+  var count = 0
+
+  private val audio = setOf(
+    "flac", "mp3", "wav", "ogg", "opus", "m4a", "aac", "aiff", "aif", "alac", "wma", "ape", "wv", "wave",
+    "oga", "m4b", "mp4", "dsf", "dff", "caf", "tta", "spx", "lrc",
+  )
+
+  private fun safe(name: String) = name.replace(Regex("[/\\\\:*?\"<>|\\u0000-\\u001f]"), "_").trim().ifEmpty { "song" }.take(180)
+
+  private fun wanted(name: String, mime: String?) =
+    (mime?.startsWith("audio/") == true) || name.substringAfterLast('.', "").lowercase() in audio
+
+  fun copyFile(uri: Uri, dir: File) {
+    var name = uri.lastPathSegment?.substringAfterLast('/') ?: "song"
+    resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+      if (cursor.moveToFirst()) cursor.getString(0)?.let { name = it }
+    }
+    copy(uri, File(dir, safe(name)))
+  }
+
+  private fun copy(uri: Uri, target: File) {
+    target.parentFile?.mkdirs()
+    val partial = File(target.parentFile, ".${target.name}.partial")
+    resolver.openInputStream(uri)?.use { input -> partial.outputStream().use { input.copyTo(it, 256 * 1024) } }
+      ?: throw IllegalStateException("cannot read $uri")
+    if (!partial.renameTo(target)) {
+      target.delete()
+      if (!partial.renameTo(target)) throw IllegalStateException("cannot save ${target.name}")
+    }
+    if (!target.name.endsWith(".lrc", true)) count++
+  }
+
+  fun copyTree(tree: Uri, dest: File) {
+    val root = DocumentsContract.getTreeDocumentId(tree)
+    var rootName = "Folder"
+    resolver.query(DocumentsContract.buildDocumentUriUsingTree(tree, root), arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use {
+      if (it.moveToFirst()) it.getString(0)?.let { name -> rootName = name }
+    }
+    walk(tree, root, File(dest, safe(rootName)), 0)
+  }
+
+  private fun walk(tree: Uri, parent: String, dir: File, depth: Int) {
+    if (depth > 12) return
+    val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parent)
+    val columns = arrayOf(
+      DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+      DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+      DocumentsContract.Document.COLUMN_MIME_TYPE,
+    )
+    resolver.query(children, columns, null, null, null)?.use { cursor ->
+      while (cursor.moveToNext()) {
+        val id = cursor.getString(0) ?: continue
+        val name = cursor.getString(1) ?: continue
+        val mime = cursor.getString(2)
+        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+          walk(tree, id, File(dir, safe(name)), depth + 1)
+        } else if (wanted(name, mime)) {
+          copy(DocumentsContract.buildDocumentUriUsingTree(tree, id), File(dir, safe(name)))
+        }
+      }
+    }
+  }
+}
