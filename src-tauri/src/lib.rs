@@ -519,10 +519,13 @@ fn set_tray_menu(app: AppHandle, show: String, quit: String, name: String) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            desktop::show_main(app);
-        }))
+    let builder = tauri::Builder::default();
+    // A second launch on desktop brings the running window forward. Android starts one copy by itself.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        desktop::show_main(app);
+    }));
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
