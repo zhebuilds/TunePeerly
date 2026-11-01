@@ -144,7 +144,9 @@ const state = {
   player: {} as Record<string, unknown>,
   history: tracks.slice(0, 9).filter((track) => track.playable).map(key),
   pending: params.has("conflict") ? [{ feature: "favorites", source: "dev-studio" }] : [],
-  offer: params.has("offer") ? { deviceId: "dev-new", name: "Living Room", safetyNumber: "12345 67890 24680 13579 11223 34455 66778 89900", role: "incoming" as const } : null,
+  offer: params.has("offer")
+    ? { deviceId: "dev-new", name: "Living Room", role: (params.get("offer") === "enter" ? "outgoing" : "incoming") as "incoming" | "outgoing", code: params.get("offer") === "enter" ? null : "042137", expiresAt: Date.now() + 90_000, status: "", triesLeft: 3, lockedUntil: null, trust: "full" }
+    : (null as Bootstrap["offer"]),
   blocks: [] as Bootstrap["blocks"],
   notices: [
     { id: 2, at: "2026-10-18T14:02:00.000Z", kind: "connected", deviceId: "dev-studio", name: "Studio PC", detail: "lan", read: false, pinned: false },
@@ -152,7 +154,6 @@ const state = {
   ] as NonNullable<Bootstrap["notices"]>,
   failures: {} as Bootstrap["failures"],
   download: null as Bootstrap["download"],
-  manual: null as string | null,
 };
 
 function emit(event: string, payload: unknown = {}) {
@@ -222,7 +223,6 @@ function bootstrap(): Bootstrap {
     deviceId: "dev-self",
     certId: "MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD",
     deviceName: String(settings.displayName),
-    pairingText: "DMP1:eyJpZCI6IkRlc2sgUEMiLCJrZXkiOiJCYXNlNjRJZGVudGl0eUtleUJ5dGVzRm9yUGFpcmluZyIsImNlcnQiOiJNSUlCZFRDQ0FSdWdBd0lCQWdJVSJ9",
     settings: structuredClone(settings),
     theme: state.theme,
     language: state.language,
@@ -243,7 +243,6 @@ function bootstrap(): Bootstrap {
     downloadHistory: [],
     offer: state.offer,
     download: state.download,
-    manual: state.manual,
     failures: state.failures,
     blocks: state.blocks,
     notices: state.notices,
@@ -370,7 +369,12 @@ async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<
     }
     case "network_command": {
       const action = String(args.action);
-      if (action === "confirm" || action === "reject") state.offer = null;
+      if (action === "reject") state.offer = null;
+      if (action === "confirm" && state.offer) {
+        // The mock pairs on 042137 and treats every other code as wrong.
+        const code = (args.payload as { code?: string }).code;
+        state.offer = state.offer.role === "outgoing" && code !== "042137" ? { ...state.offer, status: "wrong" } : null;
+      }
       if (action === "notice" || action === "clear-notices") {
         const payload = (args.payload ?? {}) as { action?: string; id?: number; ids?: number[] };
         const op = action === "clear-notices" ? "clear-all" : payload.action;
@@ -385,7 +389,6 @@ async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<
         if (op === "clear-all") state.notices = [];
       }
       if (action === "resolve") state.pending = state.pending.filter((item) => item.feature !== (args.payload as { feature: string }).feature);
-      if (action === "paste") state.manual = String(args.payload).startsWith("DMP1:") ? null : "badText";
       if (action === "download") {
         state.download = { seq: Date.now(), contentId: String(args.payload), state: "started", detail: "" };
         setTimeout(() => {

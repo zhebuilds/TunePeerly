@@ -39,7 +39,18 @@ export type Nearby = { deviceId: string; name: string; host: string; hosts: stri
 export type LinkState = "online" | "pending" | "offline" | "failed";
 export type Link = { deviceId: string; name: string; state: LinkState; path: string; detail: string; trust?: "full" | "verify" | string };
 export type OverwriteAsk = { id: number; deviceId: string; name: string; feature: string; remaining: number };
-export type Offer = { deviceId: string; name: string; safetyNumber: string; role?: "incoming" | "outgoing" };
+/** A pairing in progress. "incoming" shows a code, "outgoing" types the code, "approve" lets a saved Ask-each-time device in. */
+export type Offer = {
+  deviceId: string;
+  name: string;
+  role?: "incoming" | "outgoing" | "approve";
+  code?: string | null;
+  expiresAt?: number | null;
+  status?: string;
+  triesLeft?: number;
+  lockedUntil?: number | null;
+  trust?: string;
+};
 export type BlockedDevice = { deviceId: string; name: string; blockedAt: string };
 export type Notice = { id: number; at: string; kind: string; deviceId: string; name: string; detail: string; read?: boolean; pinned?: boolean };
 export type Download = {
@@ -92,7 +103,6 @@ export type Bootstrap = {
   deviceId: string;
   certId: string;
   deviceName: string;
-  pairingText: string;
   settings: Settings;
   theme: string;
   language: string;
@@ -113,7 +123,6 @@ export type Bootstrap = {
   download: Download | null;
   downloadQueue?: DownloadQueueItem[];
   downloadHistory?: DownloadHistoryItem[];
-  manual: string | null;
   failures?: Record<string, string>;
   blocks?: BlockedDevice[];
   notices?: Notice[];

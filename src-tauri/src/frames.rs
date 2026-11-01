@@ -6,8 +6,8 @@ pub const MAX_PAYLOAD: usize = 32 * 1024;
 #[derive(Debug, Clone)]
 pub enum Frame {
     Keepalive,
-    Bundle(Vec<u8>),
-    Signal(Vec<u8>),
+    /// One JSON app message: sync, history, holdings, snapshots, connect commands, hello.
+    Message(Vec<u8>),
     AudioReq {
         id: u64,
         content_id: String,
@@ -23,19 +23,27 @@ pub enum Frame {
     AudioErr { id: u64, reason: String },
     AudioCancel { id: u64 },
     AudioHead { id: u64, total: u64 },
-    /// The side that was asked to pair has accepted. Empty payload.
-    PairAccept,
+    /// Pairing, asking side: its SPAKE2 message, made with the code the user typed.
+    PairStart { message: Vec<u8> },
+    /// Pairing, asked side: its SPAKE2 message and its confirmation tag.
+    PairAnswer { message: Vec<u8>, tag: [u8; 32] },
+    /// Pairing, asking side: its confirmation tag. Both sides are paired once it checks out.
+    PairConfirm { tag: [u8; 32] },
+    /// Pairing stopped: "wrong", "expired", "locked", "busy" or "cancelled".
+    PairFail { reason: String },
     /// The sender disconnected this device on purpose, so do not dial it again until it comes back
     /// or the user presses Connect. Empty payload. Older versions read it as a keepalive.
     Hold,
+    /// The sender no longer has this device saved. `pair: false`: it was removed there, so forget the
+    /// sender and stay quiet. `pair: true`: the user is pairing again from the sender, so forget the
+    /// sender and show a new code. One byte. Older versions read it as a keepalive.
+    Unpaired { pair: bool },
 }
 
 impl Frame {
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         let (kind, payload) = match self {
             Self::Keepalive => (1u8, Vec::new()),
-            Self::Bundle(bytes) => (2, bytes.clone()),
-            Self::Signal(bytes) => (3, bytes.clone()),
             Self::AudioReq { id, content_id, start, end } => {
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&id.to_be_bytes());
@@ -63,8 +71,15 @@ impl Frame {
                 payload.extend_from_slice(&total.to_be_bytes());
                 (8, payload)
             }
-            Self::PairAccept => (9, Vec::new()),
+            // Kind 9 was the old accept-without-a-code answer.
+            Self::PairStart { message } => (12, message.clone()),
+            Self::PairAnswer { message, tag } => (13, [tag.as_slice(), message].concat()),
+            Self::PairConfirm { tag } => (14, tag.to_vec()),
+            Self::PairFail { reason } => (15, reason.as_bytes().to_vec()),
             Self::Hold => (10, Vec::new()),
+            Self::Unpaired { pair } => (16, vec![u8::from(*pair)]),
+            // Kinds 2 and 3 carried the retired Signal bundles and ciphertexts.
+            Self::Message(bytes) => (11, bytes.clone()),
         };
         if payload.len() > MAX_PAYLOAD {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
@@ -91,6 +106,8 @@ impl Frame {
             5 => 17,
             6 | 7 => 8,
             8 => 16,
+            13 | 14 => 32,
+            16 => 1,
             _ => 0,
         };
         if payload.len() < need {
@@ -98,8 +115,6 @@ impl Frame {
         }
         match kind {
             1 => Ok(Self::Keepalive),
-            2 => Ok(Self::Bundle(payload.to_vec())),
-            3 => Ok(Self::Signal(payload.to_vec())),
             4 => {
                 let id = u64::from_be_bytes(payload[0..8].try_into().unwrap());
                 let start = u64::from_be_bytes(payload[8..16].try_into().unwrap());
@@ -134,8 +149,16 @@ impl Frame {
                 id: u64::from_be_bytes(payload[0..8].try_into().unwrap()),
                 total: u64::from_be_bytes(payload[8..16].try_into().unwrap()),
             }),
-            9 => Ok(Self::PairAccept),
             10 => Ok(Self::Hold),
+            11 => Ok(Self::Message(payload.to_vec())),
+            12 => Ok(Self::PairStart { message: payload.to_vec() }),
+            13 => Ok(Self::PairAnswer {
+                tag: payload[..32].try_into().unwrap(),
+                message: payload[32..].to_vec(),
+            }),
+            14 => Ok(Self::PairConfirm { tag: payload[..32].try_into().unwrap() }),
+            16 => Ok(Self::Unpaired { pair: payload[0] == 1 }),
+            15 => Ok(Self::PairFail { reason: String::from_utf8_lossy(payload).chars().take(32).collect() }),
             // A frame kind from a newer version: skip it instead of dropping the whole connection.
             _ => Ok(Self::Keepalive),
         }
@@ -179,5 +202,41 @@ mod tests {
         let encoded = Frame::Hold.encode().unwrap();
         assert_eq!(encoded, vec![10, 0, 0, 0, 0]);
         assert!(matches!(Frame::decode(&encoded), Ok(Frame::Hold)));
+    }
+
+    #[test]
+    fn message_frames_round_trip_within_the_size_limit() {
+        let body = br#"{"kind":"hello","name":"Desk"}"#.to_vec();
+        let encoded = Frame::Message(body.clone()).encode().unwrap();
+        assert!(matches!(Frame::decode(&encoded), Ok(Frame::Message(bytes)) if bytes == body));
+        assert!(Frame::Message(vec![b' '; super::MAX_PAYLOAD + 1]).encode().is_err());
+        assert!(matches!(Frame::decode(&[2, 0, 0, 0, 1, 0]), Ok(Frame::Keepalive)));
+    }
+
+    #[test]
+    fn pairing_frames_round_trip() {
+        let start = Frame::PairStart { message: vec![0x41; 33] }.encode().unwrap();
+        assert!(matches!(Frame::decode(&start), Ok(Frame::PairStart { message }) if message == vec![0x41; 33]));
+        let answer = Frame::PairAnswer { message: vec![0x42; 33], tag: [7; 32] }.encode().unwrap();
+        assert!(matches!(Frame::decode(&answer), Ok(Frame::PairAnswer { message, tag }) if message == vec![0x42; 33] && tag == [7; 32]));
+        let confirm = Frame::PairConfirm { tag: [9; 32] }.encode().unwrap();
+        assert!(matches!(Frame::decode(&confirm), Ok(Frame::PairConfirm { tag }) if tag == [9; 32]));
+        let fail = Frame::PairFail { reason: "locked".into() }.encode().unwrap();
+        assert!(matches!(Frame::decode(&fail), Ok(Frame::PairFail { reason }) if reason == "locked"));
+        // A tag shorter than 32 bytes is refused instead of read past the end.
+        assert!(Frame::decode(&[14, 0, 0, 0, 3, 1, 2, 3]).is_err());
+        assert!(Frame::decode(&[13, 0, 0, 0, 1, 1]).is_err());
+        // The retired accept-without-a-code frame is skipped like any unknown kind.
+        assert!(matches!(Frame::decode(&[9, 0, 0, 0, 0]), Ok(Frame::Keepalive)));
+    }
+
+    #[test]
+    fn unpaired_frame_round_trips() {
+        assert_eq!(Frame::Unpaired { pair: false }.encode().unwrap(), vec![16, 0, 0, 0, 1, 0]);
+        assert_eq!(Frame::Unpaired { pair: true }.encode().unwrap(), vec![16, 0, 0, 0, 1, 1]);
+        assert!(matches!(Frame::decode(&[16, 0, 0, 0, 1, 0]), Ok(Frame::Unpaired { pair: false })));
+        assert!(matches!(Frame::decode(&[16, 0, 0, 0, 1, 1]), Ok(Frame::Unpaired { pair: true })));
+        // An empty payload is refused instead of read past the end.
+        assert!(Frame::decode(&[16, 0, 0, 0, 0]).is_err());
     }
 }

@@ -381,7 +381,9 @@
       "ask": "Waiting for a choice",
       "timeout": "No choice within a minute, so nothing was overwritten",
       "cancel": "Kept this computer's copy"
-    }
+    },
+    "removed": "Removed",
+    "removedYou": "Removed this computer"
   },
   "file": {
     "missing": "The file is gone from disk.",
@@ -416,7 +418,7 @@
     "status": "Connection",
     "port": "LAN port {{port}}",
     "pairLan": "Pair on this network",
-    "pairLanHelp": "First pairing happens here, between computers on the same network. Both screens show a safety number. After you accept, the two devices remember each other and can reconnect through the relay without pairing again.",
+    "pairLanHelp": "First pairing happens here, between computers on the same network. One computer shows a 6-digit code and you type it on the other. After that, the two devices remember each other and can reconnect through the relay without pairing again. A computer you removed here is refused by this computer until you pair it again. Start that pairing here, not on the removed computer.",
     "paired": "Paired devices",
     "noPaired": "No paired devices yet. Pair with a computer under Nearby.",
     "viaLan": "Local network",
@@ -424,7 +426,7 @@
     "browse": "Browse",
     "remove": "Remove device",
     "removeTitle": "Remove {{name}}?",
-    "removeBody": "It can no longer sync with this computer or play its music until you pair again.",
+    "removeBody": "Its saved key is deleted on this computer, and this computer refuses it from now on. Your other devices are not changed: if they are paired with it, they stay paired. To use it with this computer again, press Pair here and type the new code.",
     "nearby": "Nearby",
     "discoveryOff": "Discovery is off. Turn on the switch above to find computers running this app on your network.",
     "discovery": "Discover nearby devices",
@@ -473,14 +475,40 @@
     "failed": "Relay unavailable: {{reason}}"
   },
   "offer": {
-    "title": "Pair with this device?",
-    "body": "{{name}} wants to pair with this computer.",
-    "waiting": "Waiting for {{name}} to accept. Check that both screens show the same safety number.",
-    "help": "Check that both screens show the same safety number before you accept.",
-    "trustHelp": "Full trust reconnects on its own. Ask each time shows this prompt again before every later connection.",
-    "confirm": "Accept",
+    "title": "Pairing request",
+    "showBody": "{{name}} wants to pair with this computer. To pair, type this code on {{name}}.",
+    "codeLabel": "Pairing code",
+    "codeTime_one": "This code works once, for {{count}} more second.",
+    "codeTime_other": "This code works once, for {{count}} more seconds.",
+    "enterTitle": "Pair with {{name}}",
+    "enterBody": "Type the 6-digit code shown on {{name}}.",
+    "badCode": "Type all 6 digits of the code.",
+    "checking": "Checking the code…",
+    "asked": {
+      "wrong_one": "The code typed on {{name}} was wrong. Here is a new code. {{count}} try left before pairing pauses for 1 minute.",
+      "wrong_other": "The code typed on {{name}} was wrong. Here is a new code. {{count}} tries left before pairing pauses for 1 minute.",
+      "expired": "The code expired before it was used. Start pairing again from {{name}}.",
+      "locked": "A wrong code was typed 3 times, so pairing is paused for 1 minute.",
+      "busy": "Pairing could not start. Try again.",
+      "cancelled": "{{name}} stopped pairing.",
+      "failed": "Pairing did not finish because the connection to {{name}} was lost."
+    },
+    "asking": {
+      "wrong": "That code is wrong. {{name}} now shows a new code. Type that one.",
+      "expired": "The code expired. Press Pair again to get a new one.",
+      "locked": "A wrong code was typed 3 times. {{name}} has paused pairing for 1 minute. Try again after that.",
+      "busy": "{{name}} is pairing with another device. Try again in a moment.",
+      "cancelled": "{{name}} declined pairing.",
+      "failed": "Pairing did not finish. Check that {{name}} is still on and try again. If {{name}} removed this computer, start pairing on {{name}} instead."
+    },
+    "approveTitle": "Allow this connection?",
+    "approveBody": "{{name}} is paired and wants to connect. You chose to be asked each time for this device.",
+    "trustHelp": "Full trust reconnects on its own. Ask each time asks you before every later connection.",
+    "pair": "Pair",
+    "allow": "Allow",
     "reject": "Decline",
-    "cancel": "Cancel"
+    "cancel": "Cancel",
+    "close": "Close"
   },
   "overwrite": {
     "body": "{{device}} wants to replace this computer's {{feature}}. It is left unchanged if you don't choose within {{seconds}} seconds.",
@@ -658,7 +686,7 @@
     "author": "Author",
     "copyright": "© 2026 zhebuilds",
     "privacy": "Privacy",
-    "privacyHelp": "There is no account. Your library, playlists, listening history, and pairing details stay on your own devices. Away from your local network, that data is sent through a relay server you configure, which only forwards it to your other devices. Devices encrypt it end to end with libsignal, so the relay cannot read it.",
+    "privacyHelp": "There is no account. Your library, playlists, listening history, and pairing details stay on your own devices. Away from your local network, that data is sent through a relay server you configure, which only forwards it to your other devices. Devices talk over TLS 1.3 and accept only the keys saved when pairing, so the relay cannot read it. Pairing uses a one-time 6-digit code. The library database on this computer is encrypted, and on Windows its key opens only under your Windows account.",
     "components": "Built with",
     "componentsHelp": "Tauri, Rust, and React, along with other open-source components. Each of those projects keeps its own license.",
     "credits": "Credits and licenses",

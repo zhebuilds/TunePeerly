@@ -4817,18 +4817,31 @@ button.device-name:hover {
   height: 26px;
 }
 
-.safety-number {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 8px 12px;
-  margin: 18px 0 12px;
+.pair-code {
+  margin: 18px 0 8px;
   padding: 16px;
   border-radius: var(--r-md);
   background: var(--surface);
-  font-size: 18px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
+  font-size: 34px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
   user-select: text;
+}
+
+.pair-code-field {
+  margin: 16px auto 12px;
+  max-width: 220px;
+  text-align: left;
+}
+
+.pair-code-input {
+  font-size: 24px;
+  letter-spacing: 0.2em;
+  text-align: center;
+}
+
+.offer-problem {
+  color: var(--bad);
 }
 
 @keyframes fade {

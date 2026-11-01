@@ -20,8 +20,9 @@ use crate::media::{self, AudioBus, AudioPiece, Pull};
 use crate::db::{merge_history_into_db, Db, HoldingInput};
 use crate::error::{AppError, AppResult};
 use crate::frames::{self, Frame};
-use crate::identity::{self, IdentityMaterial, SignalStore};
+use crate::identity::{self, IdentityMaterial};
 use crate::ids::{self, smaller_device};
+use crate::pairing;
 use crate::relay;
 use crate::sync_logic::{self, HistoryEntry, PlaySource, SourceChoice, SourceKind};
 use crate::tls;
@@ -63,12 +64,55 @@ pub(crate) struct OverwriteAsk {
 pub struct PairingOffer {
     pub device_id: String,
     pub name: String,
-    pub safety_number: String,
-    pub cert_der: Vec<u8>,
-    pub identity_public: Vec<u8>,
+    /// DER SubjectPublicKeyInfo that pairing pins and that the code check is bound to.
+    #[serde(skip)]
+    pub public_key: Vec<u8>,
+    #[serde(skip)]
     pub cert_id: String,
-    /// "incoming" asks this device to accept or decline. "outgoing" is waiting on the other side.
+    /// "incoming": the other device asked, and this one shows the code. "outgoing": this device asked
+    /// and the user types the code shown on the other one. "approve": a paired device set to
+    /// Ask each time is connecting again.
     pub role: String,
+    /// The code to show. Only on the "incoming" side, and only while it can still be used.
+    pub code: Option<String>,
+    /// When the shown code stops working, in milliseconds since 1970.
+    pub expires_at: Option<i64>,
+    /// "" waiting, "checking", "wrong", "badCode", or a finished state (see `finished`).
+    pub status: String,
+    /// Wrong codes still allowed before pairing locks.
+    pub tries_left: u32,
+    /// When a lock after too many wrong codes ends, in milliseconds since 1970.
+    pub locked_until: Option<i64>,
+    /// Trust saved once paired: "full" or "verify".
+    pub trust: String,
+}
+
+impl PairingOffer {
+    /// This pairing try is over. The dialog stays until the user closes it.
+    fn finished(&self) -> bool {
+        matches!(self.status.as_str(), "expired" | "locked" | "busy" | "cancelled" | "failed")
+    }
+}
+
+/// Pairing state that never leaves this computer.
+#[derive(Default)]
+pub struct PairSession {
+    /// Wrong codes and the lock they cause, for every device that asks to pair with this one.
+    guard: pairing::Guard,
+    /// The code on screen for the device in `offer`. The first try takes it, so it works once.
+    code: Option<pairing::Code>,
+    /// Asked side: answered a try and waits until the deadline for the other side's tag.
+    expecting: Option<(String, pairing::Expected, Instant)>,
+    /// Asking side: sent a try and waits until the deadline for the answer.
+    asking: Option<(String, pairing::Asking, Instant)>,
+}
+
+impl PairSession {
+    fn reset(&mut self) {
+        self.code = None;
+        self.expecting = None;
+        self.asking = None;
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,7 +152,7 @@ pub struct LiveInner {
     /// Songs waiting because another download is already copying.
     pub download_queue: VecDeque<QueuedDownload>,
     pub offer: Option<PairingOffer>,
-    pub manual: Option<String>,
+    pub pairing: PairSession,
     pub failures: HashMap<String, String>,
     pub playing: bool,
     pub current_local: Option<String>,
@@ -157,7 +201,8 @@ pub enum Cmd {
     Publish,
     AutoSync(String),
     Pair { device_id: String, host: Option<String> },
-    Confirm { device_id: String, trust: String },
+    /// Approves a saved Ask-each-time device, or sends the typed code to the device that shows it.
+    Confirm { device_id: String, trust: String, code: String },
     Reject(String),
     Block(String),
     Unblock(String),
@@ -165,7 +210,6 @@ pub enum Cmd {
     ClearNotices,
     Notice { action: String, id: i64, ids: Vec<i64> },
     Remove(String),
-    Paste(String),
     Sync { feature: String, refresh: bool },
     RequestSync { feature: String, device_id: String },
     Resolve { feature: String, take: bool },
@@ -227,6 +271,8 @@ struct PeerOut {
     conn: u64,
     dialed_by: String,
     confirmed: bool,
+    /// The device said hello on this connection, so it has confirmed this one too and takes messages.
+    ready: bool,
     incoming: bool,
     path: String,
     tx: mpsc::UnboundedSender<Frame>,
@@ -234,6 +280,8 @@ struct PeerOut {
     audio: mpsc::Sender<Frame>,
     /// Turns false when this connection is dropped, so transfers still reading a file stop at once.
     alive: Arc<std::sync::atomic::AtomicBool>,
+    /// The certificate the device showed on this connection, for a pairing it asks for later.
+    cert_der: Vec<u8>,
 }
 
 impl Drop for PeerOut {
@@ -252,22 +300,6 @@ async fn run(
     live: Live,
     bus: Arc<AudioBus>,
 ) {
-    let mut store = match SignalStore::open(db.clone(), material.identity, material.registration_id) {
-        Ok(store) => store,
-        Err(err) => {
-            // Stay offline instead of aborting: local playback keeps working and the reason is shown as a notice.
-            eprintln!("signal store: {err}");
-            let _ = db
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .add_notice("networkFailed", "", &err.to_string(), "");
-            let _ = app.emit("network-updated", json!({}));
-            // Keep the thread (and the media proxy beside it) alive and drop commands until the app quits.
-            while rx.recv().await.is_some() {}
-            return;
-        }
-    };
-    let _ = store.ensure_prekeys().await;
     // Read the Windows network profiles once now so the first screen already knows which adapters are usable.
     std::thread::spawn(|| {
         let _ = lan_ipv4();
@@ -278,12 +310,10 @@ async fn run(
     let mut relay_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut discovery: Option<std::sync::mpsc::Sender<()>> = None;
     let mut actual_port = 0u16;
-    let mut ready_sessions: HashSet<String> = HashSet::new();
     let mut pending_holdings: HashMap<String, HoldingsBuild> = HashMap::new();
     let mut published_holdings = String::new();
     let provider = tls::provider();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<NetEvent>();
-    trust_saved_peers(&db, &mut store);
     publish(&app, &db, &live, &peers);
     let mut reconnect = tokio::time::interval(Duration::from_secs(30));
     let mut overwrite_tick = tokio::time::interval(Duration::from_secs(1));
@@ -291,7 +321,11 @@ async fn run(
         tokio::select! {
             _ = overwrite_tick.tick() => {
                 expire_overwrites(&app, &db, &live);
-                tick_history_startup(&db, &material, &mut store, &peers, &live).await;
+                tick_history_startup(&db, &peers, &live);
+                let ticked = tick_pairing(&live, &mut peers, Instant::now());
+                if drop_stale_unpaired(&db, &live, &mut peers) || ticked {
+                    publish(&app, &db, &live, &peers);
+                }
             }
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break };
@@ -299,28 +333,28 @@ async fn run(
                     Cmd::Apply => {
                         let open = db.lock().map(|guard| network_open(&guard)).unwrap_or(false);
                         if !open {
-                            publish_holdings(&db, &material, &mut store, &peers, &mut published_holdings).await;
+                            publish_holdings(&db, &peers, &mut published_holdings);
                             peers.clear();
-                            ready_sessions.clear();
                             bus.close_routes();
                             if let Ok(mut guard) = live.inner.lock() {
                                 guard.offer = None;
+                                guard.pairing.reset();
                             }
                         }
                         restart_listener(&db, &material, &provider, &event_tx, &mut listener, &mut actual_port, &live).await;
                         restart_discovery(&db, &material, actual_port, &event_tx, &mut discovery, &live).await;
                         restart_relay(&db, &material, &provider, &event_tx, &mut relay_task, &live).await;
                         if open {
-                            publish_holdings(&db, &material, &mut store, &peers, &mut published_holdings).await;
+                            publish_holdings(&db, &peers, &mut published_holdings);
                             dial_known(&db, &material, &provider, &event_tx, &live, &peers).await;
                         }
                         publish(&app, &db, &live, &peers);
                     }
                     Cmd::Publish => {
-                        publish_holdings(&db, &material, &mut store, &peers, &mut published_holdings).await;
+                        publish_holdings(&db, &peers, &mut published_holdings);
                     }
                     Cmd::AutoSync(feature) => {
-                        auto_sync(&db, &material, &mut store, &peers, &feature).await;
+                        auto_sync(&db, &material, &peers, &feature);
                     }
                     Cmd::Pair { device_id, host } => {
                         if let Ok(mut guard) = live.inner.lock() {
@@ -340,28 +374,45 @@ async fn run(
                             let _ = event_tx.send(NetEvent::DialFailed { device_id: Some(device_id), target: None });
                         }
                     }
-                    Cmd::Confirm { device_id, trust } => {
-                        if confirm_peer(&db, &material, &live, &mut peers, &device_id, &trust) {
-                            trust_saved_peers(&db, &mut store);
-                            let _ = peers.get(&device_id).and_then(|peer| peer.tx.send(Frame::PairAccept).ok());
-                            send_bundle(&db, &mut store, &peers, &device_id).await;
+                    Cmd::Confirm { device_id, trust, code } => {
+                        let role = live.inner.lock().ok().and_then(|guard| {
+                            guard.offer.as_ref().filter(|offer| offer.device_id == device_id).map(|offer| offer.role.clone())
+                        });
+                        match role.as_deref() {
+                            Some("approve") => {
+                                if approve_peer(&db, &live, &mut peers, &device_id, &trust) {
+                                    say_hello(&db, &peers, &device_id);
+                                }
+                            }
+                            Some("outgoing") => start_pairing(&material, &live, &peers, &device_id, &trust, &code),
+                            _ => {}
                         }
                         publish(&app, &db, &live, &peers);
                     }
                     Cmd::Reject(device_id) => {
                         pending.remove(&device_id);
+                        // Closing a dialog whose try already ended neither tells the other side nor silences it.
+                        let finished = live.inner.lock().ok().is_some_and(|guard| {
+                            guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id && offer.finished())
+                        });
+                        let unconfirmed = peers.get(&device_id).is_some_and(|peer| !peer.confirmed);
+                        if unconfirmed && !finished {
+                            send_frame(&peers, &device_id, Frame::PairFail { reason: "cancelled".into() });
+                        }
                         let incoming = peers.get(&device_id).is_some_and(|peer| peer.incoming && !peer.confirmed);
                         if incoming
+                            && !finished
                             && let Ok(guard) = db.lock()
                         {
                             let _ = guard.silence(&device_id);
                         }
-                        if peers.get(&device_id).is_some_and(|peer| !peer.confirmed) {
+                        if unconfirmed {
                             peers.remove(&device_id);
                         }
                         if let Ok(mut guard) = live.inner.lock() {
                             if guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id) {
                                 guard.offer = None;
+                                guard.pairing.reset();
                             }
                         }
                         publish(&app, &db, &live, &peers);
@@ -373,12 +424,12 @@ async fn run(
                         }
                         peers.remove(&device_id);
                         pending.remove(&device_id);
-                        ready_sessions.remove(&device_id);
                         pending_holdings.remove(&device_id);
                         drop_partial_snapshots(&live, &device_id);
                         if let Ok(mut guard) = live.inner.lock() {
                             if guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id) {
                                 guard.offer = None;
+                                guard.pairing.reset();
                             }
                             // Questions this device asked before it was blocked are dropped.
                             guard.overwrite_waiting.retain(|ask| ask.device_id != device_id);
@@ -397,6 +448,12 @@ async fn run(
                     Cmd::Trust { device_id, trust } => {
                         if let Ok(guard) = db.lock() {
                             let _ = guard.set_peer_trust(&device_id, &trust);
+                        }
+                        // Chosen in the pairing dialog before the device is saved: kept for when it is.
+                        if let Ok(mut guard) = live.inner.lock()
+                            && let Some(offer) = guard.offer.as_mut().filter(|offer| offer.device_id == device_id)
+                        {
+                            offer.trust = clean_trust(&trust).into();
                         }
                         publish(&app, &db, &live, &peers);
                     }
@@ -424,38 +481,15 @@ async fn run(
                         publish(&app, &db, &live, &peers);
                     }
                     Cmd::Remove(device_id) => {
-                        peers.remove(&device_id);
+                        remove_here(&db, &live, &mut peers, &mut pending_holdings, &device_id);
                         pending.remove(&device_id);
-                        ready_sessions.remove(&device_id);
-                        pending_holdings.remove(&device_id);
-                        drop_partial_snapshots(&live, &device_id);
-                        if let Ok(guard) = db.lock() {
-                            let _ = guard.remove_peer(&device_id);
-                        }
-                        store.forget_peer(&device_id);
-                        store.forget_sender_key(&material.device_id, material.distribution_id);
-                        let remaining: Vec<String> = peers.keys().filter(|id| ready_sessions.contains(*id)).cloned().collect();
-                        for peer_id in remaining {
-                            send_sender_key(&material, &mut store, &peers, &peer_id).await;
-                        }
                         publish(&app, &db, &live, &peers);
                     }
-                    Cmd::Paste(text) => {
-                        match identity::parse_pairing_text(&text) {
-                            Ok(parsed) => {
-                                stage_offer(&db, &material, &live, &parsed.identity_public, &parsed.cert_der, &parsed.display_name, "incoming", &app);
-                            }
-                            Err(_) => {
-                                set_manual(&live, "badText");
-                                publish(&app, &db, &live, &peers);
-                            }
-                        }
-                    }
                     Cmd::Sync { feature, refresh } => {
-                        send_sync(&db, &material, &mut store, &peers, &feature, refresh).await;
+                        send_sync(&db, &material, &peers, &feature, refresh);
                     }
                     Cmd::RequestSync { feature, device_id } => {
-                        request_sync(&db, &material, &mut store, &peers, &live, &feature, &device_id).await;
+                        request_sync(&db, &peers, &live, &feature, &device_id);
                     }
                     Cmd::Resolve { feature, take } => {
                         resolve_pending(&app, &db, &feature, take);
@@ -471,13 +505,13 @@ async fn run(
                         }
                     }
                     Cmd::Connect { kind, to, body } => {
-                        send_connect(&db, &live, &material, &mut store, &peers, &kind, to.as_deref(), &body).await;
+                        send_connect(&db, &live, &peers, &kind, to.as_deref(), &body);
                     }
                     Cmd::ConnectMode { detached } => {
                         let changed = live.inner.lock().map(|mut state| std::mem::replace(&mut state.connect_detached, detached) != detached).unwrap_or(false);
                         // The others forget this computer at once instead of waiting for it to go quiet.
                         if changed && detached {
-                            send_connect(&db, &live, &material, &mut store, &peers, "connect-leave", None, &json!({"v": crate::connect::VERSION})).await;
+                            send_connect(&db, &live, &peers, "connect-leave", None, &json!({"v": crate::connect::VERSION}));
                         }
                     }
                     Cmd::CloseRoutes => bus.close_routes(),
@@ -490,7 +524,6 @@ async fn run(
                             let _ = peer.tx.send(Frame::Hold);
                         }
                         peers.remove(&device_id);
-                        ready_sessions.remove(&device_id);
                         pending_holdings.remove(&device_id);
                         drop_partial_snapshots(&live, &device_id);
                         publish(&app, &db, &live, &peers);
@@ -510,7 +543,7 @@ async fn run(
                         dial_known(&db, &material, &provider, &event_tx, &live, &peers).await;
                         publish(&app, &db, &live, &peers);
                     }
-                    NetEvent::Connected { device_id, conn, target, dialed_by, path, writer, audio, identity_public, cert_der, name, incoming } => {
+                    NetEvent::Connected { device_id, conn, target, dialed_by, path, writer, audio, public_key, cert_der, name, incoming } => {
                         if let Ok(mut guard) = live.inner.lock() {
                             guard.failures.remove(&device_id);
                             guard.held.remove(&device_id);
@@ -519,10 +552,9 @@ async fn run(
                             eprintln!("connected to {} at {target}", short_id(&device_id));
                         }
                         let before = peers.get(&device_id).map(|peer| peer.conn);
-                        adopt_connection(&db, &material, &live, &mut peers, &pending, &app, device_id.clone(), conn, dialed_by, incoming, path, writer, audio, identity_public, cert_der, name);
+                        adopt_connection(&db, &material, &live, &mut peers, &pending, &app, device_id.clone(), conn, dialed_by, incoming, path, writer, audio, public_key, cert_der, name);
                         if before != Some(conn) && peers.get(&device_id).is_some_and(|peer| peer.confirmed && peer.conn == conn) {
-                            ready_sessions.remove(&device_id);
-                            send_bundle(&db, &mut store, &peers, &device_id).await;
+                            say_hello(&db, &peers, &device_id);
                         }
                         publish(&app, &db, &live, &peers);
                     }
@@ -538,12 +570,19 @@ async fn run(
                         publish(&app, &db, &live, &peers);
                     }
                     NetEvent::Frame { device_id, frame } => {
-                        if matches!(frame, Frame::PairAccept) {
-                            if accept_remote_pair(&db, &live, &mut peers, &device_id) {
-                                trust_saved_peers(&db, &mut store);
-                                send_bundle(&db, &mut store, &peers, &device_id).await;
+                        if matches!(frame, Frame::PairStart { .. } | Frame::PairAnswer { .. } | Frame::PairConfirm { .. } | Frame::PairFail { .. }) {
+                            // Only a connection that is not paired yet runs the code check.
+                            if peers.get(&device_id).is_some_and(|peer| !peer.confirmed) {
+                                if pairing_frame(&db, &material, &live, &mut peers, &device_id, frame) {
+                                    say_hello(&db, &peers, &device_id);
+                                }
+                                publish(&app, &db, &live, &peers);
                             }
-                            publish(&app, &db, &live, &peers);
+                        } else if let Frame::Unpaired { pair } = frame {
+                            if peers.contains_key(&device_id) {
+                                forgotten_by(&db, &live, &mut peers, &mut pending_holdings, &device_id, pair);
+                                publish(&app, &db, &live, &peers);
+                            }
                         } else if matches!(frame, Frame::Hold) {
                             // Arrives before the close, so the redial that follows the close already skips it.
                             if peers.contains_key(&device_id)
@@ -552,7 +591,7 @@ async fn run(
                                 guard.held.insert(device_id.clone());
                             }
                         } else {
-                            handle_frame(&app, &db, &material, &mut store, &peers, &live, &bus, &mut ready_sessions, &mut pending_holdings, &mut published_holdings, &device_id, frame).await;
+                            handle_frame(&app, &db, &material, &mut peers, &live, &bus, &mut pending_holdings, &mut published_holdings, &device_id, frame);
                             let wanted: Vec<String> = live
                                 .inner
                                 .lock()
@@ -568,7 +607,6 @@ async fn run(
                             continue;
                         }
                         let removed = peers.remove(&device_id);
-                        ready_sessions.remove(&device_id);
                         pending_holdings.remove(&device_id);
                         drop_partial_snapshots(&live, &device_id);
                         if let Some(peer) = removed {
@@ -585,11 +623,7 @@ async fn run(
                                     guard.failures.insert(device_id.clone(), "failed".into());
                                 }
                             }
-                            if let Ok(mut guard) = live.inner.lock() {
-                                if guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id) {
-                                    guard.offer = None;
-                                }
-                            }
+                            pairing_closed(&live, &device_id);
                         }
                         publish(&app, &db, &live, &peers);
                         // Try the LAN again right away; the nearby list does not change when a connection drops.
@@ -660,7 +694,7 @@ enum NetEvent {
         path: String,
         writer: mpsc::UnboundedSender<Frame>,
         audio: mpsc::Sender<Frame>,
-        identity_public: Vec<u8>,
+        public_key: Vec<u8>,
         cert_der: Vec<u8>,
         name: String,
         incoming: bool,
@@ -675,12 +709,6 @@ enum NetEvent {
 fn network_open(db: &Db) -> bool {
     let (incognito, discovery, sync, audio) = switches(db);
     !incognito && (discovery || sync || audio)
-}
-
-fn set_manual(live: &Live, state: &str) {
-    if let Ok(mut guard) = live.inner.lock() {
-        guard.manual = Some(state.to_string());
-    }
 }
 
 
@@ -867,7 +895,13 @@ async fn accept_lan(
     provider: Arc<rustls::crypto::CryptoProvider>,
     events: mpsc::UnboundedSender<NetEvent>,
 ) -> AppResult<()> {
-    let verifier = Arc::new(tls::IdentityVerifier::peer(provider.clone(), None));
+    // A removed device fails the TLS handshake here, before it can ask for anything.
+    let removed: Vec<[u8; 32]> = db
+        .lock()
+        .ok()
+        .map(|guard| guard.removals().unwrap_or_default().iter().filter_map(|row| ids::key_hash_from_device_id(&row.device_id)).collect())
+        .unwrap_or_default();
+    let verifier = Arc::new(tls::IdentityVerifier::any_peer_except(provider.clone(), removed));
     let config = tls::server_config(provider, &material.cert_der, &material.cert_key, verifier)
         .map_err(|err| crate::error::AppError::Message(err.to_string()))?;
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
@@ -909,7 +943,7 @@ async fn dial_peer(
         }
         let Some(stream) = connected else { return failed(&events, &target) };
         let failed = |events: &mpsc::UnboundedSender<NetEvent>| failed(events, &target);
-        let expected = expected_device.as_ref().and_then(|id| ids::identity_bytes_from_app_id(id));
+        let expected = expected_device.as_ref().and_then(|id| ids::key_hash_from_device_id(id));
         let verifier = Arc::new(tls::IdentityVerifier::peer(provider.clone(), expected));
         let config = match tls::client_config(provider, &parts.cert_der, &parts.cert_key, verifier, None) {
             Ok(config) => config,
@@ -942,18 +976,16 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
 {
     let peer_cert = certs.first().ok_or_else(|| crate::error::AppError::Message("missing peer cert".into()))?;
-    let identity_public = identity_of(peer_cert.as_ref())?;
-    if !identity::certificate_binds(peer_cert.as_ref(), &identity_public)? {
-        return Err(crate::error::AppError::Message("bad peer cert".into()));
-    }
-    let device_id = ids::app_device_id(&identity_public);
+    let public_key = identity::public_key_of(peer_cert.as_ref())?;
+    let device_id = ids::app_device_id(&public_key);
     // On a connection we accepted, the other device is the one that dialed. Both sides must agree on this
     // so that, when two devices dial each other at once, they keep the same connection.
     // An empty value marks a relay session where the other device is the TLS client, so both sides
     // name the same dialer and keep the same connection.
     let dialed_by = if incoming || dialed_by.is_empty() { device_id.clone() } else { dialed_by };
     let refuse = db.lock().ok().is_some_and(|guard| {
-        guard.is_blocked(&device_id).unwrap_or(false) || (incoming && guard.silence_active(&device_id))
+        guard.is_blocked(&device_id).unwrap_or(false)
+            || (incoming && (guard.silence_active(&device_id) || guard.is_removed(&device_id)))
     });
     if refuse {
         return Err(crate::error::AppError::Message("unreachable".into()));
@@ -969,7 +1001,7 @@ where
         path,
         writer: tx,
         audio: audio_tx,
-        identity_public,
+        public_key,
         cert_der: peer_cert.as_ref().to_vec(),
         name: device_id.clone(),
         incoming,
@@ -1026,17 +1058,6 @@ where
     Ok(())
 }
 
-fn identity_of(cert_der: &[u8]) -> AppResult<Vec<u8>> {
-    let (_, cert) = x509_parser::parse_x509_certificate(cert_der)
-        .map_err(|err| crate::error::AppError::Message(err.to_string()))?;
-    for extension in cert.extensions() {
-        if extension.oid.to_id_string() == "1.3.6.1.4.1.55529.1" {
-            return Ok(extension.value.to_vec());
-        }
-    }
-    Err(crate::error::AppError::Message("no identity".into()))
-}
-
 fn adopt_connection(
     db: &Arc<Mutex<Db>>,
     material: &IdentityMaterial,
@@ -1051,7 +1072,7 @@ fn adopt_connection(
     path: String,
     writer: mpsc::UnboundedSender<Frame>,
     audio: mpsc::Sender<Frame>,
-    identity_public: Vec<u8>,
+    public_key: Vec<u8>,
     cert_der: Vec<u8>,
     name: String,
 ) {
@@ -1074,6 +1095,10 @@ fn adopt_connection(
     if known.is_none() && !incoming && !waiting {
         return;
     }
+    // A removed device is refused without a pairing dialog. Only the user pressing Pair here lets it back.
+    if !waiting && db.lock().ok().is_some_and(|guard| guard.is_removed(&device_id)) {
+        return;
+    }
     // Strangers cannot fill the device list: only a few unconfirmed devices wait at once.
     if known.is_none()
         && !waiting
@@ -1083,9 +1108,17 @@ fn adopt_connection(
         return;
     }
     if let Some(peer) = &known {
-        if peer.identity_public != identity_public {
+        if peer.public_key != public_key {
             return;
         }
+    }
+    // After too many wrong codes, new devices cannot start pairing until the lock ends.
+    if known.is_none()
+        && incoming
+        && live.inner.lock().is_ok_and(|mut guard| guard.pairing.guard.locked(Instant::now()))
+    {
+        let _ = writer.send(Frame::PairFail { reason: "locked".into() });
+        return;
     }
     // A paired device keeps its saved name; an unauthenticated announce must not rename it.
     let saved_name = known.as_ref().map(|peer| peer.display_name.clone()).filter(|text| !text.is_empty() && *text != device_id);
@@ -1108,17 +1141,36 @@ fn adopt_connection(
             return;
         }
     }
+    // An unasked request does not replace a pairing still going on with another device.
     let confirmed = known.as_ref().is_some_and(|peer| peer.trust != "verify");
+    let busy = !confirmed
+        && incoming
+        && !waiting
+        && live.inner.lock().ok().is_some_and(|guard| {
+            guard.offer.as_ref().is_some_and(|offer| offer.device_id != device_id && !offer.finished())
+        });
+    // A new device is told at once and let go, so it does not wait in the list.
+    if busy && known.is_none() {
+        let _ = writer.send(Frame::PairFail { reason: "busy".into() });
+        return;
+    }
+    // Pairing from here with a device that may still have this one saved: it forgets this device
+    // and shows a code, instead of treating the connection as already paired.
+    if known.is_none() && !incoming {
+        let _ = writer.send(Frame::Unpaired { pair: true });
+    }
     peers.insert(device_id.clone(), PeerOut {
         device_id: device_id.clone(),
         conn,
         dialed_by,
         confirmed,
+        ready: false,
         incoming,
         path: path.clone(),
         tx: writer,
         audio,
         alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        cert_der: cert_der.clone(),
     });
     if confirmed {
         let shown = name.clone();
@@ -1132,30 +1184,29 @@ fn adopt_connection(
         {
             let _ = guard.add_notice("request", &device_id, &name, &path);
         }
-        // An unasked request does not replace the pairing question already on screen for another device.
-        let busy = incoming
-            && !waiting
-            && live.inner.lock().ok().is_some_and(|guard| guard.offer.as_ref().is_some_and(|offer| offer.device_id != device_id));
         if !busy {
-            stage_offer(db, material, live, &identity_public, &cert_der, &name, if incoming { "incoming" } else { "outgoing" }, app);
+            // A saved device set to Ask each time is already known by its key: it only needs a yes.
+            let role = if known.is_some() { "approve" } else if incoming { "incoming" } else { "outgoing" };
+            // Allow keeps the trust saved for a known device unless the user changes it in the dialog.
+            let trust = known.as_ref().map_or("full", |peer| clean_trust(&peer.trust));
+            stage_offer(live, &public_key, &cert_der, &name, role, trust, app);
         }
     }
 }
 
-fn stage_offer(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    live: &Live,
-    identity_public: &[u8],
-    cert_der: &[u8],
-    name: &str,
-    role: &str,
-    app: &AppHandle,
-) {
-    let Ok(remote_key) = libsignal_protocol::IdentityKey::decode(identity_public) else { return };
-    let number = identity::safety_number(material.identity.identity_key(), &remote_key).unwrap_or_default();
-    let device_id = ids::app_device_id(identity_public);
+fn stage_offer(live: &Live, public_key: &[u8], cert_der: &[u8], name: &str, role: &str, trust: &str, app: &AppHandle) {
+    put_offer(live, public_key, cert_der, name, role, trust);
+    let _ = app.emit("network-updated", json!({}));
+}
+
+/// Puts the pairing dialog for this device on screen. The "incoming" side gets a fresh code.
+fn put_offer(live: &Live, public_key: &[u8], cert_der: &[u8], name: &str, role: &str, trust: &str) {
+    let device_id = ids::app_device_id(public_key);
     if let Ok(mut guard) = live.inner.lock() {
+        // A new connection from the same device keeps the code already on screen.
+        if guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id && offer.role == role && !offer.finished()) {
+            return;
+        }
         let shown = guard
             .nearby
             .iter()
@@ -1163,42 +1214,61 @@ fn stage_offer(
             .map(|item| item.name.clone())
             .filter(|text| !text.is_empty())
             .unwrap_or_else(|| if name.is_empty() || name == device_id { short_id(&device_id) } else { name.to_string() });
+        guard.pairing.reset();
+        let now = Instant::now();
+        let code = (role == "incoming").then(|| pairing::Code::new(now));
+        let tries_left = guard.pairing.guard.tries_left();
         guard.offer = Some(PairingOffer {
             device_id,
             name: shown,
-            safety_number: number,
-            cert_der: cert_der.to_vec(),
-            identity_public: identity_public.to_vec(),
+            public_key: public_key.to_vec(),
             cert_id: ids::cert_id_display(cert_der),
             role: role.to_string(),
+            code: code.as_ref().map(|code| code.value().to_string()),
+            expires_at: code.as_ref().map(|code| code_deadline_ms(code, now)),
+            status: String::new(),
+            tries_left,
+            locked_until: None,
+            trust: clean_trust(trust).into(),
         });
+        guard.pairing.code = code;
     }
-    let _ = db;
-    let _ = app.emit("network-updated", json!({}));
 }
 
-fn confirm_peer(
-    db: &Arc<Mutex<Db>>,
-    _material: &IdentityMaterial,
-    live: &Live,
-    peers: &mut HashMap<String, PeerOut>,
-    device_id: &str,
-    trust: &str,
-) -> bool {
-    let offer = live.inner.lock().ok().and_then(|guard| guard.offer.clone());
-    let Some(offer) = offer.filter(|offer| offer.device_id == device_id && offer.role == "incoming") else { return false };
-    let number = offer.safety_number.clone();
-    let trust = if trust == "verify" { "verify" } else { "full" };
+fn clean_trust(trust: &str) -> &'static str {
+    if trust == "verify" { "verify" } else { "full" }
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn code_deadline_ms(code: &pairing::Code, now: Instant) -> i64 {
+    now_ms() + i64::try_from(code.seconds_left(now)).unwrap_or(0) * 1000
+}
+
+fn send_frame(peers: &HashMap<String, PeerOut>, device_id: &str, frame: Frame) {
+    if let Some(peer) = peers.get(device_id) {
+        let _ = peer.tx.send(frame);
+    }
+}
+
+/// Ends a connection that is not paired. Frames queued before this still go out.
+fn drop_unpaired(peers: &mut HashMap<String, PeerOut>, device_id: &str) {
+    if peers.get(device_id).is_some_and(|peer| !peer.confirmed) {
+        peers.remove(device_id);
+    }
+}
+
+/// A saved device set to Ask each time is connecting again and the user said yes. TLS already
+/// checked that it holds the key saved when it was paired.
+fn approve_peer(db: &Arc<Mutex<Db>>, live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str, trust: &str) -> bool {
+    let asked = live.inner.lock().is_ok_and(|guard| guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id && offer.role == "approve"));
+    if !asked {
+        return false;
+    }
     if let Ok(guard) = db.lock() {
-        let _ = guard.upsert_peer(&crate::db::PeerRow {
-            device_id: offer.device_id.clone(),
-            identity_public: offer.identity_public,
-            cert_der: offer.cert_der,
-            cert_id: offer.cert_id,
-            display_name: offer.name.clone(),
-            safety_number: number,
-            trust: trust.to_string(),
-        });
+        let _ = guard.set_peer_trust(device_id, clean_trust(trust));
     }
     if let Some(peer) = peers.get_mut(device_id) {
         peer.confirmed = true;
@@ -1209,30 +1279,410 @@ fn confirm_peer(
     true
 }
 
-/// The device we dialed has accepted. Save the identity it already presented.
-fn accept_remote_pair(db: &Arc<Mutex<Db>>, live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str) -> bool {
+/// Asking side: the user typed the code shown on the other device. Sends the first SPAKE2 message,
+/// bound to this device's TLS key and the key the other device showed on this connection.
+fn start_pairing(material: &IdentityMaterial, live: &Live, peers: &HashMap<String, PeerOut>, device_id: &str, trust: &str, typed: &str) {
+    let Ok(mut guard) = live.inner.lock() else { return };
+    let inner = &mut *guard;
+    let Some(offer) = inner.offer.as_mut().filter(|offer| offer.device_id == device_id && offer.role == "outgoing") else { return };
+    if offer.finished() || inner.pairing.asking.is_some() {
+        return;
+    }
+    let Some(code) = pairing::clean_code(typed) else {
+        offer.status = "badCode".into();
+        return;
+    };
+    if !peers.contains_key(device_id) {
+        offer.status = "failed".into();
+        return;
+    }
+    let (asking, message) = pairing::Asking::start(&code, &material.public_key, &offer.public_key);
+    inner.pairing.asking = Some((device_id.to_string(), asking, Instant::now() + pairing::ANSWER_TIMEOUT * 2));
+    offer.status = "checking".into();
+    offer.trust = clean_trust(trust).into();
+    send_frame(peers, device_id, Frame::PairStart { message });
+}
+
+/// Handles one pairing frame from a device that is not paired yet. True when it is paired now.
+fn pairing_frame(db: &Arc<Mutex<Db>>, material: &IdentityMaterial, live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str, frame: Frame) -> bool {
+    match frame {
+        Frame::PairStart { message } => {
+            answer_pairing(material, live, peers, device_id, &message);
+            false
+        }
+        Frame::PairAnswer { message, tag } => {
+            let asking = live.inner.lock().ok().and_then(|mut guard| guard.pairing.asking.take_if(|(id, _, _)| id == device_id));
+            let Some((_, asking, _)) = asking else { return false };
+            match asking.finish(&message, &tag) {
+                Ok(back) => {
+                    send_frame(peers, device_id, Frame::PairConfirm { tag: back });
+                    save_paired(db, live, peers, device_id, "outgoing")
+                }
+                Err(_) => {
+                    // The asked side counts the wrong try and sends a new code or the lock.
+                    send_frame(peers, device_id, Frame::PairFail { reason: "wrong".into() });
+                    set_asking_status(live, device_id, "wrong");
+                    false
+                }
+            }
+        }
+        Frame::PairConfirm { tag } => {
+            let expecting = live.inner.lock().ok().and_then(|mut guard| guard.pairing.expecting.take_if(|(id, _, _)| id == device_id));
+            let Some((_, expected, _)) = expecting else { return false };
+            if expected.accepts(&tag) {
+                if let Ok(mut guard) = live.inner.lock() {
+                    guard.pairing.guard.succeeded();
+                }
+                save_paired(db, live, peers, device_id, "incoming")
+            } else {
+                wrong_code(live, peers, device_id);
+                false
+            }
+        }
+        Frame::PairFail { reason } => {
+            let role = live.inner.lock().ok().and_then(|guard| {
+                guard.offer.as_ref().filter(|offer| offer.device_id == device_id).map(|offer| offer.role.clone())
+            });
+            let expecting = live.inner.lock().is_ok_and(|guard| guard.pairing.expecting.as_ref().is_some_and(|(id, _, _)| id == device_id));
+            if expecting {
+                // The asking side gave up or found the code wrong: that try counts.
+                wrong_code(live, peers, device_id);
+            }
+            match role.as_deref() {
+                Some("outgoing") => {
+                    if let Ok(mut guard) = live.inner.lock() {
+                        guard.pairing.asking = None;
+                    }
+                    let status = match reason.as_str() {
+                        "wrong" | "expired" | "locked" | "busy" | "cancelled" => reason.as_str(),
+                        _ => "failed",
+                    };
+                    set_asking_status(live, device_id, status);
+                }
+                Some("incoming") if reason == "cancelled" => {
+                    if let Ok(mut guard) = live.inner.lock() {
+                        guard.pairing.reset();
+                        if let Some(offer) = guard.offer.as_mut() {
+                            offer.status = "cancelled".into();
+                            offer.code = None;
+                            offer.expires_at = None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn set_asking_status(live: &Live, device_id: &str, status: &str) {
+    if let Ok(mut guard) = live.inner.lock()
+        && let Some(offer) = guard.offer.as_mut().filter(|offer| offer.device_id == device_id && offer.role == "outgoing")
+    {
+        // A lock already reported stays on screen.
+        if offer.status == "locked" && status == "wrong" {
+            return;
+        }
+        offer.status = status.into();
+    }
+}
+
+/// Asked side: the other device sent its first SPAKE2 message. The code on screen is used up by
+/// this try, whatever the outcome.
+fn answer_pairing(material: &IdentityMaterial, live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str, message: &[u8]) {
+    let now = Instant::now();
+    let mut reply = None;
+    let mut ended = None;
+    let mut malformed = false;
+    if let Ok(mut guard) = live.inner.lock() {
+        let inner = &mut *guard;
+        if inner.pairing.guard.locked(now) {
+            reply = Some(Frame::PairFail { reason: "locked".into() });
+        } else if let Some(offer) = inner.offer.as_mut().filter(|offer| offer.device_id == device_id && offer.role == "incoming") {
+            if inner.pairing.expecting.is_some() {
+                reply = Some(Frame::PairFail { reason: "busy".into() });
+            } else {
+                match inner.pairing.code.take().map(|code| code.use_once(now)) {
+                    Some(Some(code)) => match pairing::answer(&code, &material.public_key, &offer.public_key, message) {
+                        Ok(answer) => {
+                            let (message, tag, expected) = answer.into_expected();
+                            inner.pairing.expecting = Some((device_id.to_string(), expected, now + pairing::ANSWER_TIMEOUT));
+                            offer.status = "checking".into();
+                            offer.code = None;
+                            offer.expires_at = None;
+                            reply = Some(Frame::PairAnswer { message, tag });
+                        }
+                        Err(_) => malformed = true,
+                    },
+                    Some(None) => ended = Some("expired"),
+                    None if offer.finished() => reply = Some(Frame::PairFail { reason: offer.status.clone() }),
+                    None => reply = Some(Frame::PairFail { reason: "busy".into() }),
+                }
+            }
+        } else {
+            reply = Some(Frame::PairFail { reason: "busy".into() });
+        }
+    }
+    if let Some(frame) = reply {
+        send_frame(peers, device_id, frame);
+    }
+    if let Some(status) = ended {
+        end_shown_code(live, peers, device_id, status);
+    }
+    if malformed {
+        wrong_code(live, peers, device_id);
+    }
+}
+
+/// Asked side: one try failed. Counts it, then shows a new code, or locks pairing after too many.
+fn wrong_code(live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str) {
+    let now = Instant::now();
+    let Ok(mut guard) = live.inner.lock() else { return };
+    let inner = &mut *guard;
+    inner.pairing.expecting = None;
+    inner.pairing.code = None;
+    let locked = inner.pairing.guard.wrong(now);
+    let lock_ms = i64::try_from(inner.pairing.guard.lock_left(now)).unwrap_or(0) * 1000;
+    let tries_left = inner.pairing.guard.tries_left();
+    if let Some(offer) = inner.offer.as_mut().filter(|offer| offer.device_id == device_id && offer.role == "incoming") {
+        offer.tries_left = tries_left;
+        if locked {
+            offer.status = "locked".into();
+            offer.code = None;
+            offer.expires_at = None;
+            offer.locked_until = Some(now_ms() + lock_ms);
+        } else {
+            let code = pairing::Code::new(now);
+            offer.status = "wrong".into();
+            offer.code = Some(code.value().to_string());
+            offer.expires_at = Some(code_deadline_ms(&code, now));
+            inner.pairing.code = Some(code);
+        }
+    }
+    drop(guard);
+    send_frame(peers, device_id, Frame::PairFail { reason: if locked { "locked" } else { "wrong" }.into() });
+    if locked {
+        drop_unpaired(peers, device_id);
+    }
+}
+
+/// Asked side: the shown code can no longer be used ("expired"). Tells the other device and closes.
+fn end_shown_code(live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str, status: &str) {
+    if let Ok(mut guard) = live.inner.lock() {
+        guard.pairing.code = None;
+        guard.pairing.expecting = None;
+        if let Some(offer) = guard.offer.as_mut().filter(|offer| offer.device_id == device_id) {
+            offer.status = status.into();
+            offer.code = None;
+            offer.expires_at = None;
+        }
+    }
+    send_frame(peers, device_id, Frame::PairFail { reason: status.into() });
+    drop_unpaired(peers, device_id);
+}
+
+/// Runs every second: ends codes that expired and tries whose answer never came. True when
+/// something changed.
+fn tick_pairing(live: &Live, peers: &mut HashMap<String, PeerOut>, now: Instant) -> bool {
+    let mut expired = None;
+    let mut no_tag = None;
+    let mut changed = false;
+    if let Ok(mut guard) = live.inner.lock() {
+        let inner = &mut *guard;
+        if inner.pairing.code.as_ref().is_some_and(|code| code.expired(now)) {
+            expired = inner.offer.as_ref().filter(|offer| offer.role == "incoming").map(|offer| offer.device_id.clone());
+            if expired.is_none() {
+                inner.pairing.code = None;
+            }
+        }
+        if inner.pairing.expecting.as_ref().is_some_and(|(_, _, deadline)| now >= *deadline) {
+            no_tag = inner.pairing.expecting.as_ref().map(|(id, _, _)| id.clone());
+        }
+        if let Some((device_id, _, _)) = inner.pairing.asking.take_if(|(_, _, deadline)| now >= *deadline) {
+            if let Some(offer) = inner.offer.as_mut().filter(|offer| offer.device_id == device_id) {
+                offer.status = "failed".into();
+            }
+            changed = true;
+        }
+    }
+    if let Some(device_id) = expired {
+        end_shown_code(live, peers, &device_id, "expired");
+        changed = true;
+    }
+    if let Some(device_id) = no_tag {
+        wrong_code(live, peers, &device_id);
+        changed = true;
+    }
+    changed
+}
+
+/// The connection to a device in the middle of pairing closed. A try that was waiting for its tag
+/// still counts as wrong, so hanging up does not give free guesses.
+fn pairing_closed(live: &Live, device_id: &str) {
+    let now = Instant::now();
+    let Ok(mut guard) = live.inner.lock() else { return };
+    let inner = &mut *guard;
+    let counted = inner.pairing.expecting.take_if(|(id, _, _)| id == device_id).is_some();
+    let locked = counted && inner.pairing.guard.wrong(now);
+    let lock_ms = i64::try_from(inner.pairing.guard.lock_left(now)).unwrap_or(0) * 1000;
+    if inner.pairing.asking.as_ref().is_some_and(|(id, _, _)| id == device_id) {
+        inner.pairing.asking = None;
+    }
+    let Some(offer) = inner.offer.as_mut().filter(|offer| offer.device_id == device_id) else { return };
+    if offer.role == "approve" {
+        inner.offer = None;
+        return;
+    }
+    inner.pairing.code = None;
+    if locked {
+        offer.status = "locked".into();
+        offer.locked_until = Some(now_ms() + lock_ms);
+    } else if !offer.finished() {
+        offer.status = "failed".into();
+    }
+    offer.code = None;
+    offer.expires_at = None;
+}
+
+/// Both sides proved they used the same code and saw the same two TLS keys. Saves the key this
+/// connection showed; from now on TLS only accepts this device with that key.
+fn save_paired(db: &Arc<Mutex<Db>>, live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str, role: &str) -> bool {
     let offer = live.inner.lock().ok().and_then(|guard| guard.offer.clone());
-    let Some(offer) = offer.filter(|offer| offer.device_id == device_id && offer.role == "outgoing") else { return false };
+    let Some(offer) = offer.filter(|offer| offer.device_id == device_id && offer.role == role) else { return false };
     if let Ok(guard) = db.lock() {
         let _ = guard.upsert_peer(&crate::db::PeerRow {
             device_id: offer.device_id.clone(),
-            identity_public: offer.identity_public,
-            cert_der: offer.cert_der,
+            public_key: offer.public_key,
             cert_id: offer.cert_id,
             display_name: offer.name.clone(),
-            safety_number: offer.safety_number,
-            trust: "full".into(),
+            trust: offer.trust.clone(),
         });
-        let _ = guard.add_notice("paired", &offer.device_id, &offer.name, "full");
+        // Pairing with the code again lets a removed device back in.
+        let _ = guard.end_removal(&offer.device_id);
+        let _ = guard.add_notice("paired", &offer.device_id, &offer.name, &offer.trust);
     }
     if let Some(peer) = peers.get_mut(device_id) {
         peer.confirmed = true;
     }
     if let Ok(mut guard) = live.inner.lock() {
         guard.offer = None;
+        guard.pairing.reset();
         guard.failures.remove(device_id);
     }
     true
+}
+
+/// Removes a device on this computer only: its key is deleted here and this computer refuses it
+/// until it is paired again with a code. Other devices are not told and keep their own pairing
+/// with it. If the removed device is online it gets an Unpaired frame, so it forgets this computer
+/// (and only this one) and does not keep asking to pair.
+fn remove_here(
+    db: &Arc<Mutex<Db>>,
+    live: &Live,
+    peers: &mut HashMap<String, PeerOut>,
+    pending_holdings: &mut HashMap<String, HoldingsBuild>,
+    device_id: &str,
+) {
+    let name = block_name(db, live, device_id);
+    // Queued before the connection is dropped.
+    send_frame(peers, device_id, Frame::Unpaired { pair: false });
+    forget_connection(live, peers, pending_holdings, device_id);
+    if let Ok(guard) = db.lock() {
+        let _ = guard.remove_peer(device_id);
+        let _ = guard.record_removal(device_id, &name, now_ms());
+        let _ = guard.add_notice("removed", device_id, &name, "");
+    }
+}
+
+/// Ends the connection to a device and everything waiting on it, without touching what is saved.
+fn forget_connection(live: &Live, peers: &mut HashMap<String, PeerOut>, pending_holdings: &mut HashMap<String, HoldingsBuild>, device_id: &str) {
+    peers.remove(device_id);
+    pending_holdings.remove(device_id);
+    drop_partial_snapshots(live, device_id);
+    if let Ok(mut guard) = live.inner.lock() {
+        if guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id) {
+            guard.offer = None;
+            guard.pairing.reset();
+        }
+        guard.paused.remove(device_id);
+        guard.held.remove(device_id);
+        guard.failures.remove(device_id);
+    }
+}
+
+/// Lets go of connections to devices that are not saved and no longer have a pairing going on,
+/// such as one whose code ran out or failed, so they do not stay in the device list as waiting.
+fn drop_stale_unpaired(db: &Arc<Mutex<Db>>, live: &Live, peers: &mut HashMap<String, PeerOut>) -> bool {
+    let saved: HashSet<String> = db
+        .lock()
+        .ok()
+        .and_then(|guard| guard.peers().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|peer| peer.device_id)
+        .collect();
+    let pairing = live.inner.lock().ok().and_then(|guard| {
+        guard.offer.as_ref().filter(|offer| !offer.finished()).map(|offer| offer.device_id.clone())
+    });
+    let stale: Vec<String> = peers
+        .values()
+        .filter(|peer| !peer.confirmed && !saved.contains(&peer.device_id) && pairing.as_deref() != Some(peer.device_id.as_str()))
+        .map(|peer| peer.device_id.clone())
+        .collect();
+    for device_id in &stale {
+        peers.remove(device_id);
+    }
+    !stale.is_empty()
+}
+
+/// The other device no longer has this one saved and said so with an Unpaired frame. TLS proved
+/// which device sent it, so a device can only make this one forget that same device.
+fn forgotten_by(
+    db: &Arc<Mutex<Db>>,
+    live: &Live,
+    peers: &mut HashMap<String, PeerOut>,
+    pending_holdings: &mut HashMap<String, HoldingsBuild>,
+    sender: &str,
+    pair: bool,
+) {
+    let saved = db.lock().ok().and_then(|guard| guard.peers().ok()).unwrap_or_default().into_iter().find(|peer| peer.device_id == sender);
+    // Not saved here either: a normal first pairing, or nothing to forget.
+    let Some(saved) = saved else { return };
+    let name = block_name(db, live, sender);
+    if let Ok(guard) = db.lock() {
+        let _ = guard.remove_peer(sender);
+        if !pair {
+            let _ = guard.add_notice("removedYou", sender, &name, "");
+        }
+    }
+    let cert_der = peers.get(sender).map(|peer| peer.cert_der.clone()).unwrap_or_default();
+    if !pair {
+        forget_connection(live, peers, pending_holdings, sender);
+        return;
+    }
+    pending_holdings.remove(sender);
+    drop_partial_snapshots(live, sender);
+    let busy = live.inner.lock().ok().is_some_and(|guard| {
+        guard.offer.as_ref().is_some_and(|offer| offer.device_id != sender && !offer.finished())
+    });
+    if busy {
+        send_frame(peers, sender, Frame::PairFail { reason: "busy".into() });
+        peers.remove(sender);
+        return;
+    }
+    if let Some(peer) = peers.get_mut(sender) {
+        peer.confirmed = false;
+        peer.ready = false;
+    }
+    if let Ok(mut guard) = live.inner.lock()
+        && guard.offer.as_ref().is_some_and(|offer| offer.device_id == sender)
+    {
+        guard.offer = None;
+    }
+    // Shown by the publish that follows.
+    put_offer(live, &saved.public_key, &cert_der, &name, "incoming", "full");
 }
 
 fn block_name(db: &Arc<Mutex<Db>>, live: &Live, device_id: &str) -> String {
@@ -1937,61 +2387,71 @@ mod lan_tests {
         assert!(!lan_interface("Ethernet", "169.254.8.1".parse().unwrap()));
     }
 
-    fn test_store(name: &str) -> (crate::identity::IdentityMaterial, crate::identity::SignalStore) {
+    fn test_identity(name: &str) -> crate::identity::IdentityMaterial {
         let dir = std::env::temp_dir().join(format!("tunepeerly-net-test-{name}-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).expect("dir");
         let db = crate::db::Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).expect("db");
-        let material = crate::identity::load_or_create(&db).expect("identity");
-        let store = crate::identity::SignalStore::open(std::sync::Arc::new(std::sync::Mutex::new(db)), material.identity, material.registration_id).expect("store");
-        (material, store)
+        crate::identity::load_or_create(&db).expect("identity")
     }
 
-    /// Both directions of the private channel and the group channel must open on the other side.
+    /// Runs one handshake over memory. The server takes any device key; the client pins `pin`.
+    async fn handshake(
+        server: &crate::identity::IdentityMaterial,
+        client: &crate::identity::IdentityMaterial,
+        pin: [u8; 32],
+    ) -> Result<(rustls::ProtocolVersion, String), std::io::Error> {
+        handshake_refusing(server, client, pin, Vec::new()).await
+    }
+
+    /// Like `handshake`, with the server refusing the given removed device keys.
+    async fn handshake_refusing(
+        server: &crate::identity::IdentityMaterial,
+        client: &crate::identity::IdentityMaterial,
+        pin: [u8; 32],
+        removed: Vec<[u8; 32]>,
+    ) -> Result<(rustls::ProtocolVersion, String), std::io::Error> {
+        use std::sync::Arc;
+        let provider = crate::tls::provider();
+        let server_verifier = Arc::new(crate::tls::IdentityVerifier::any_peer_except(provider.clone(), removed));
+        let server_config = crate::tls::server_config(provider.clone(), &server.cert_der, &server.cert_key_pkcs8, server_verifier).expect("server config");
+        let client_verifier = Arc::new(crate::tls::IdentityVerifier::peer(provider.clone(), Some(pin)));
+        let client_config = crate::tls::client_config(provider, &client.cert_der, &client.cert_key_pkcs8, client_verifier, None).expect("client config");
+        let (left, right) = tokio::io::duplex(64 * 1024);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let name = rustls::pki_types::ServerName::try_from(crate::identity::TLS_DNS_NAME).expect("name");
+        let (accepted, connected) = tokio::join!(acceptor.accept(left), connector.connect(name, right));
+        let (accepted, connected) = (accepted?, connected?);
+        let version = connected.get_ref().1.protocol_version().expect("version");
+        let seen = accepted.get_ref().1.peer_certificates().and_then(|certs| certs.first().cloned()).expect("client cert");
+        let seen_id = crate::ids::app_device_id(&crate::identity::public_key_of(seen.as_ref()).expect("key"));
+        Ok((version, seen_id))
+    }
+
+    /// Devices meet over TLS 1.3 with both certificates, and a dial only completes to the pinned key.
     #[tokio::test]
-    async fn signal_frames_open_in_both_directions() {
-        use crate::identity::SignalStore;
-        use super::{decode_ciphertext, tag_ciphertext, tag_group, SIGNAL_GROUP};
-        let (a_mat, mut a) = test_store("a");
-        let (b_mat, mut b) = test_store("b");
-        let a_addr = SignalStore::address_for(&a_mat.device_id);
-        let b_addr = SignalStore::address_for(&b_mat.device_id);
-        let mut rng = rand::rng();
-        let b_bundle = b.ensure_prekeys().await.expect("bundle");
-        let _ = a.ensure_prekeys().await.expect("bundle");
-        a.trust(&b_mat.device_id, &b_mat.identity.identity_key().serialize());
-        b.trust(&a_mat.device_id, &a_mat.identity.identity_key().serialize());
-        libsignal_protocol::process_prekey_bundle(&b_addr, &a_addr, &mut a.clone(), &mut a.clone(), &b_bundle, std::time::SystemTime::now(), &mut rng)
-            .await
-            .expect("session");
+    async fn tls_pins_the_device_key_both_ways() {
+        let a = test_identity("a");
+        let b = test_identity("b");
+        let pin_a = crate::ids::key_hash_from_device_id(&a.device_id).expect("hash");
+        let (version, seen) = handshake(&a, &b, pin_a).await.expect("handshake");
+        assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
+        assert_eq!(seen, b.device_id);
+        let pin_b = crate::ids::key_hash_from_device_id(&b.device_id).expect("hash");
+        assert!(handshake(&a, &b, pin_b).await.is_err());
+    }
 
-        async fn open(store: &SignalStore, remote: &libsignal_protocol::ProtocolAddress, local: &libsignal_protocol::ProtocolAddress, frame: &[u8]) -> Vec<u8> {
-            let (&kind, body) = frame.split_first().expect("kind");
-            let message = decode_ciphertext(kind, body).expect("decodes");
-            let mut rng = rand::rng();
-            libsignal_protocol::message_decrypt(
-                &message, remote, local,
-                &mut store.clone(), &mut store.clone(), &mut store.clone(), &store.clone(), &mut store.clone(), &mut rng,
-            ).await.expect("decrypts")
-        }
-
-        // A (the first to speak) -> B: a prekey message.
-        let first = libsignal_protocol::message_encrypt(b"hello", &b_addr, &a_addr, &mut a.clone(), &mut a.clone(), std::time::SystemTime::now(), &mut rng).await.expect("encrypt");
-        let frame = tag_ciphertext(&first);
-        assert_eq!(open(&b, &a_addr, &b_addr, &frame).await, b"hello");
-
-        // B -> A: an ordinary message that has no prekey part.
-        let reply = libsignal_protocol::message_encrypt(b"reply", &a_addr, &b_addr, &mut b.clone(), &mut b.clone(), std::time::SystemTime::now(), &mut rng).await.expect("encrypt");
-        let frame = tag_ciphertext(&reply);
-        assert_eq!(open(&a, &b_addr, &a_addr, &frame).await, b"reply");
-
-        // B's group channel: A learns B's sender key privately, then opens B's group message.
-        let skdm = libsignal_protocol::create_sender_key_distribution_message(&b_addr, b_mat.distribution_id, &mut b.clone(), &mut rng).await.expect("skdm");
-        libsignal_protocol::process_sender_key_distribution_message(&b_addr, &skdm, &mut a.clone()).await.expect("process");
-        let group = libsignal_protocol::group_encrypt(&mut b.clone(), &b_addr, b_mat.distribution_id, b"holdings", &mut rng).await.expect("group");
-        let frame = tag_group(group.serialized());
-        assert_eq!(frame[0], SIGNAL_GROUP);
-        let plain = libsignal_protocol::group_decrypt(&frame[1..], &mut a.clone(), &b_addr).await.expect("group opens");
-        assert_eq!(plain, b"holdings");
+    /// A removed device's key fails the TLS handshake on the accepting side; other devices still get in.
+    #[tokio::test]
+    async fn tls_refuses_removed_device_keys() {
+        let a = test_identity("a");
+        let b = test_identity("b");
+        let c = test_identity("c");
+        let pin_a = crate::ids::key_hash_from_device_id(&a.device_id).expect("hash");
+        let removed_c = crate::ids::key_hash_from_device_id(&c.device_id).expect("hash");
+        assert!(handshake_refusing(&a, &c, pin_a, vec![removed_c]).await.is_err());
+        let (_, seen) = handshake_refusing(&a, &b, pin_a, vec![removed_c]).await.expect("other device");
+        assert_eq!(seen, b.device_id);
     }
 
     fn row(n: usize) -> HoldingInput {
@@ -2248,10 +2708,21 @@ async fn join_invited(
             relay_port(&guard),
         )
     };
-    let Ok(fallback) = resolve_v4(&host, port).await else { return };
-    if invitation.from.is_empty() {
+    // The relay names the inviting device by its certificate id. Only a saved device may come in this
+    // way, and its TLS handshake must then present the key that was pinned when pairing.
+    let Some(expected) = ({
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .peers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|peer| !guard.is_blocked(&peer.device_id).unwrap_or(false))
+            .find(|peer| ids::parse_cert_id(&peer.cert_id).is_some_and(|id| id.as_slice() == invitation.from.as_slice()))
+            .and_then(|peer| ids::key_hash_from_device_id(&peer.device_id))
+    }) else {
         return;
-    }
+    };
+    let Ok(fallback) = resolve_v4(&host, port).await else { return };
     let Ok(target) = relay::invitation_target(&invitation, match fallback.ip() {
         std::net::IpAddr::V4(ip) => ip,
         _ => return,
@@ -2273,8 +2744,7 @@ async fn join_invited(
         if code != 0 {
             return;
         }
-        let expected = None;
-        let verifier = Arc::new(tls::IdentityVerifier::peer(provider.clone(), expected));
+        let verifier = Arc::new(tls::IdentityVerifier::peer(provider.clone(), Some(expected)));
         // The TLS client counts as the dialer on both sides; empty means "the other device".
         let dialed_by = if invitation.server_socket { String::new() } else { parts.device_id.clone() };
         if invitation.server_socket {
@@ -2295,15 +2765,13 @@ async fn join_invited(
     });
 }
 
-async fn handle_frame(
+fn handle_frame(
     app: &AppHandle,
     db: &Arc<Mutex<Db>>,
     material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
+    peers: &mut HashMap<String, PeerOut>,
     live: &Live,
     bus: &AudioBus,
-    ready_sessions: &mut HashSet<String>,
     pending_holdings: &mut HashMap<String, HoldingsBuild>,
     published_holdings: &mut String,
     device_id: &str,
@@ -2314,72 +2782,26 @@ async fn handle_frame(
         return;
     }
     match frame {
-        Frame::Keepalive | Frame::PairAccept | Frame::Hold => {}
-        Frame::Bundle(bytes) => {
-            if smaller_device(&material.device_id, device_id).is_lt() {
-                if let Ok(bundle) = decode_bundle(&bytes) {
-                    let remote = SignalStore::address_for(device_id);
-                    let local = SignalStore::address_for(&material.device_id);
-                    let mut sessions = store.clone();
-                    let mut identities = store.clone();
-                    let mut rng = rand::rng();
-                    if libsignal_protocol::process_prekey_bundle(
-                        &remote,
-                        &local,
-                        &mut sessions,
-                        &mut identities,
-                        &bundle,
-                        std::time::SystemTime::now(),
-                        &mut rng,
-                    ).await.is_ok() {
-                        session_ready(db, material, store, peers, ready_sessions, published_holdings, device_id).await;
-                    }
-                }
-            }
-        }
-        Frame::Signal(bytes) => {
-            // The first byte says which kind of message follows; libsignal does not mark it in its own bytes.
-            let Some((&kind, body)) = bytes.split_first() else { return };
-            let bytes = body.to_vec();
-            if kind != SIGNAL_GROUP && let Some(message) = decode_ciphertext(kind, &bytes) {
-                let remote = SignalStore::address_for(device_id);
-                let local = SignalStore::address_for(&material.device_id);
-                let mut sessions = store.clone();
-                let mut identities = store.clone();
-                let mut prekeys = store.clone();
-                let signed = store.clone();
-                let mut kyber = store.clone();
-                let mut rng = rand::rng();
-                if let Ok(plain) = libsignal_protocol::message_decrypt(
-                    &message,
-                    &remote,
-                    &local,
-                    &mut sessions,
-                    &mut identities,
-                    &mut prekeys,
-                    &signed,
-                    &mut kyber,
-                    &mut rng,
-                ).await {
-                    if smaller_device(&material.device_id, device_id).is_gt() {
-                        session_ready(db, material, store, peers, ready_sessions, published_holdings, device_id).await;
-                    }
-                    if accept_private(db, store, device_id, &plain).await {
-                        publish(app, db, live, peers);
-                    } else if refuse_detached_connect(db, material, store, peers, live, device_id, &plain).await {
-                        // A control for a computer that plays on its own: refused above.
-                    } else if !reply_sync_request(db, material, store, peers, live, device_id, &plain).await
-                        && !reply_history_request(db, material, store, peers, device_id, &plain).await
-                    {
-                        note_history_reply(live, device_id, &plain);
-                        apply_plain(app, db, live, pending_holdings, device_id, &plain);
-                    }
-                }
-            } else if kind == SIGNAL_GROUP
-                && let Ok(plain) = libsignal_protocol::group_decrypt(&bytes, store, &SignalStore::address_for(device_id)).await
+        Frame::Keepalive
+        | Frame::Hold
+        | Frame::Unpaired { .. }
+        | Frame::PairStart { .. }
+        | Frame::PairAnswer { .. }
+        | Frame::PairConfirm { .. }
+        | Frame::PairFail { .. } => {}
+        Frame::Message(bytes) => {
+            // TLS already proved which paired device sent this: the one on the other end of this connection.
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { return };
+            if value.get("kind").and_then(Value::as_str) == Some("hello") {
+                accept_hello(db, material, peers, published_holdings, device_id, &value);
+                publish(app, db, live, peers);
+            } else if refuse_detached_connect(db, peers, live, device_id, &value) {
+                // A control for a computer that plays on its own: refused above.
+            } else if !reply_sync_request(db, peers, live, device_id, &value)
+                && !reply_history_request(db, peers, device_id, &value)
             {
-                note_history_reply(live, device_id, &plain);
-                apply_plain(app, db, live, pending_holdings, device_id, &plain);
+                note_history_reply(live, device_id, &value);
+                apply_message(app, db, live, pending_holdings, device_id, &value);
             }
         }
         Frame::AudioReq { id, content_id, start, end } => {
@@ -2635,20 +3057,14 @@ fn finish_audio_request(live: &Live, id: u64, was_serving: bool) {
     }
 }
 
-fn apply_plain(
+fn apply_message(
     app: &AppHandle,
     db: &Arc<Mutex<Db>>,
     live: &Live,
     pending_holdings: &mut HashMap<String, HoldingsBuild>,
     device_id: &str,
-    plain: &[u8],
+    value: &Value,
 ) {
-    let Ok(value) = serde_json::from_slice::<Value>(plain) else { return };
-    let payload = value.get("payload").cloned().unwrap_or(value.clone());
-    if !verify_author(db, device_id, &value) {
-        return;
-    }
-    let value = payload;
     let Ok(guard) = db.lock() else { return };
     let kind = value.get("kind").and_then(|item| item.as_str()).unwrap_or("");
     match kind {
@@ -2785,7 +3201,7 @@ fn apply_plain(
                 return;
             }
             drop(guard);
-            let Some(body) = crate::connect::sanitize(kind, &value) else { return };
+            let Some(body) = crate::connect::sanitize(kind, value) else { return };
             let Ok(mut state) = live.inner.lock() else { return };
             // A computer that left plays on its own: no reports, controls or transfers get through.
             if crate::connect::inbound(state.connect_detached, kind) != crate::connect::Inbound::Forward {
@@ -2887,17 +3303,9 @@ fn expand_sync_body(body: Value) -> Vec<Value> {
     snapshot_part_messages(feature, manual, &items)
 }
 
-async fn deliver_sync(
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    bodies: Vec<Value>,
-) {
-    let targets: Vec<String> = peers.iter().filter(|(_, peer)| peer.confirmed).map(|(id, _)| id.clone()).collect();
+fn deliver_sync(peers: &HashMap<String, PeerOut>, bodies: Vec<Value>) {
     for body in &bodies {
-        for id in &targets {
-            send_private_signed(material, store, peers, id, body).await;
-        }
+        broadcast(peers, body);
     }
 }
 
@@ -2957,10 +3365,8 @@ fn take_sync_request(state: &mut LiveInner, device_id: &str, feature: &str) -> b
     state.sync_requests.remove(&sync_request_key(device_id, feature)).is_some()
 }
 
-async fn request_sync(
+fn request_sync(
     db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
     peers: &HashMap<String, PeerOut>,
     live: &Live,
     feature: &str,
@@ -2974,7 +3380,7 @@ async fn request_sync(
         eprintln!("sync {feature}: request not sent, sync is off");
         return;
     }
-    if !peers.get(device_id).is_some_and(|peer| peer.confirmed) {
+    if !peers.get(device_id).is_some_and(|peer| peer.ready) {
         eprintln!("sync {feature}: {} is not connected", short_id(device_id));
         return;
     }
@@ -2984,28 +3390,21 @@ async fn request_sync(
         state.sync_requests.retain(|_, deadline| *deadline > now);
         state.sync_requests.insert(sync_request_key(device_id, feature), now + SYNC_REQUEST_WINDOW);
     }
-    send_private_signed(material, store, peers, device_id, &json!({"kind": "sync-request", "feature": feature})).await;
+    send_message(peers, device_id, &json!({"kind": "sync-request", "feature": feature}));
 }
 
 /// The other computer asked for our copy. Send it back only to them, so it replaces their copy.
-async fn reply_sync_request(
+fn reply_sync_request(
     db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
     peers: &HashMap<String, PeerOut>,
     live: &Live,
     device_id: &str,
-    plain: &[u8],
+    value: &Value,
 ) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(plain) else { return false };
-    let payload = value.get("payload").cloned().unwrap_or(value.clone());
-    if payload.get("kind").and_then(|item| item.as_str()) != Some("sync-request") {
+    if value.get("kind").and_then(|item| item.as_str()) != Some("sync-request") {
         return false;
     }
-    if !verify_author(db, device_id, &value) {
-        return true;
-    }
-    let feature = payload.get("feature").and_then(|item| item.as_str()).unwrap_or("").to_string();
+    let feature = value.get("feature").and_then(|item| item.as_str()).unwrap_or("").to_string();
     if !crate::db::FEATURES.contains(&feature.as_str()) {
         return true;
     }
@@ -3039,15 +3438,13 @@ async fn reply_sync_request(
         }
     };
     for body in &answer {
-        send_private_signed(material, store, peers, device_id, body).await;
+        send_message(peers, device_id, body);
     }
     true
 }
 
-fn note_history_reply(live: &Live, device_id: &str, plain: &[u8]) {
-    let Ok(value) = serde_json::from_slice::<Value>(plain) else { return };
-    let payload = value.get("payload").cloned().unwrap_or(value);
-    if payload.get("kind").and_then(|item| item.as_str()) != Some("history") {
+fn note_history_reply(live: &Live, device_id: &str, value: &Value) {
+    if value.get("kind").and_then(|item| item.as_str()) != Some("history") {
         return;
     }
     if let Ok(mut guard) = live.inner.lock() {
@@ -3056,41 +3453,28 @@ fn note_history_reply(live: &Live, device_id: &str, plain: &[u8]) {
 }
 
 /// A startup request for this computer's play history. Sync off means no reply and no notice.
-async fn reply_history_request(
+fn reply_history_request(
     db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
     peers: &HashMap<String, PeerOut>,
     device_id: &str,
-    plain: &[u8],
+    value: &Value,
 ) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(plain) else { return false };
-    let payload = value.get("payload").cloned().unwrap_or(value.clone());
-    if payload.get("kind").and_then(|item| item.as_str()) != Some("history-request") {
+    if value.get("kind").and_then(|item| item.as_str()) != Some("history-request") {
         return false;
-    }
-    if !verify_author(db, device_id, &value) {
-        return true;
     }
     let Some(body) = db.lock().ok().and_then(|guard| history_message(&guard)) else { return true };
     for part in expand_sync_body(body) {
-        send_private_signed(material, store, peers, device_id, &part).await;
+        send_message(peers, device_id, &part);
     }
     true
 }
 
 /// Once, after this computer comes online: merge every synced device's history, then send the result.
-async fn tick_history_startup(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    live: &Live,
-) {
+fn tick_history_startup(db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, live: &Live) {
     let enabled = db.lock().map(|guard| {
         data_sync_open(&guard) && guard.setting_bool("historySync").unwrap_or(false) && guard.setting_bool("historyStartup").unwrap_or(false)
     }).unwrap_or(false);
-    let online: Vec<String> = peers.iter().filter(|(_, peer)| peer.confirmed).map(|(id, _)| id.clone()).collect();
+    let online: Vec<String> = peers.iter().filter(|(_, peer)| peer.ready).map(|(id, _)| id.clone()).collect();
     let (ask, send) = {
         let Ok(mut guard) = live.inner.lock() else { return };
         if guard.history_done || !enabled || online.is_empty() {
@@ -3113,11 +3497,11 @@ async fn tick_history_startup(
         (ask, send)
     };
     for id in &ask {
-        send_private_signed(material, store, peers, id, &json!({"kind": "history-request"})).await;
+        send_message(peers, id, &json!({"kind": "history-request"}));
     }
     if send {
         if let Some(body) = db.lock().ok().and_then(|guard| history_message(&guard)) {
-            deliver_sync(material, store, peers, expand_sync_body(body)).await;
+            deliver_sync(peers, expand_sync_body(body));
         }
     }
 }
@@ -3135,17 +3519,16 @@ fn history_message(db: &Db) -> Option<Value> {
     Some(json!({"kind": "history", "entries": entries}))
 }
 
-async fn send_sync(
+fn send_sync(
     db: &Arc<Mutex<Db>>,
     material: &IdentityMaterial,
-    store: &mut SignalStore,
     peers: &HashMap<String, PeerOut>,
     feature: &str,
     refresh: bool,
 ) {
     if feature == "history" {
         let Some(body) = db.lock().ok().and_then(|guard| history_message(&guard)) else { return };
-        deliver_sync(material, store, peers, expand_sync_body(body)).await;
+        deliver_sync(peers, expand_sync_body(body));
         return;
     }
     let bodies = {
@@ -3165,7 +3548,7 @@ async fn send_sync(
             return;
         }
         // Unsent changes stay marked when no paired device is connected to receive them.
-        if peers.values().all(|peer| !peer.confirmed) {
+        if peers.values().all(|peer| !peer.ready) {
             eprintln!("sync {feature}: not sent, no device is connected");
             return;
         }
@@ -3175,22 +3558,16 @@ async fn send_sync(
         eprintln!("sync {feature}: sending {count} item(s)");
         snapshot_part_messages(feature, true, &items)
     };
-    deliver_sync(material, store, peers, bodies).await;
+    deliver_sync(peers, bodies);
 }
 
 /// A device that is its own sync source sends each local change. History in time-merge mode sends the trimmed list.
-async fn auto_sync(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    feature: &str,
-) {
-    if peers.values().all(|peer| !peer.confirmed) {
+fn auto_sync(db: &Arc<Mutex<Db>>, material: &IdentityMaterial, peers: &HashMap<String, PeerOut>, feature: &str) {
+    if peers.values().all(|peer| !peer.ready) {
         return;
     }
     let Some(body) = db.lock().ok().and_then(|guard| auto_body(&guard, &material.device_id, feature)) else { return };
-    deliver_sync(material, store, peers, expand_sync_body(body)).await;
+    deliver_sync(peers, expand_sync_body(body));
 }
 
 fn auto_body(db: &Db, self_id: &str, feature: &str) -> Option<Value> {
@@ -3246,45 +3623,25 @@ fn resolve_pending(app: &AppHandle, db: &Arc<Mutex<Db>>, feature: &str, take: bo
     let _ = app.emit("library-updated", json!({}));
 }
 
-async fn send_sender_key(
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    device_id: &str,
-) {
-    let sender = SignalStore::address_for(&material.device_id);
-    let mut rng = rand::rng();
-    if let Ok(message) = libsignal_protocol::create_sender_key_distribution_message(&sender, material.distribution_id, store, &mut rng).await {
-        send_private(material, store, peers, device_id, &json!({
-            "kind": "skdm",
-            "bytes": b64_bytes(message.serialized()),
-        })).await;
-    }
-}
-
 /// A control or transfer that reached this computer while it plays on its own is answered with a
 /// refusal here, so it never reaches the player and the sender is not left waiting. True when the
 /// message was one of those.
-async fn refuse_detached_connect(
+fn refuse_detached_connect(
     db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
     peers: &HashMap<String, PeerOut>,
     live: &Live,
     device_id: &str,
-    plain: &[u8],
+    value: &Value,
 ) -> bool {
     if !live.inner.lock().map(|state| state.connect_detached).unwrap_or(false) {
         return false;
     }
-    let Ok(value) = serde_json::from_slice::<Value>(plain) else { return false };
-    let Some(payload) = value.get("payload") else { return false };
-    let kind = payload.get("kind").and_then(Value::as_str).unwrap_or("");
+    let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
     if crate::connect::inbound(true, kind) != crate::connect::Inbound::Refuse {
         return false;
     }
     let allowed = db.lock().ok().is_some_and(|guard| data_sync_open(&guard) && !guard.is_blocked(device_id).unwrap_or(true));
-    if !allowed || !verify_author(db, device_id, &value) {
+    if !allowed {
         return true;
     }
     let within = live.inner.lock().is_ok_and(|mut state| {
@@ -3293,8 +3650,8 @@ async fn refuse_detached_connect(
     if !within {
         return true;
     }
-    if let Some(answer) = crate::connect::refusal(kind, payload).and_then(|body| crate::connect::sanitize("connect-ack", &body)) {
-        send_private_signed(material, store, peers, device_id, &answer).await;
+    if let Some(answer) = crate::connect::refusal(kind, value).and_then(|body| crate::connect::sanitize("connect-ack", &body)) {
+        send_message(peers, device_id, &answer);
     }
     true
 }
@@ -3305,20 +3662,16 @@ fn connect_epoch() -> u64 {
     *EPOCH.get_or_init(|| rand::random::<u32>() as u64)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn send_connect(
+fn send_connect(
     db: &Arc<Mutex<Db>>,
     live: &Live,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
     peers: &HashMap<String, PeerOut>,
     kind: &str,
     to: Option<&str>,
     body: &Value,
 ) {
     let open = db.lock().ok().is_some_and(|guard| data_sync_open(&guard));
-    // Encrypting saves key state to disk, so nothing is sealed when no paired device is connected.
-    if !open || peers.values().all(|peer| !peer.confirmed) {
+    if !open || peers.values().all(|peer| !peer.ready) {
         return;
     }
     let detached = live.inner.lock().map(|state| state.connect_detached).unwrap_or(false);
@@ -3330,7 +3683,7 @@ async fn send_connect(
         return;
     };
     if kind == "connect-leave" {
-        seal_and_send(material, store, peers, &message).await;
+        broadcast(peers, &message);
         return;
     }
     if kind == "connect-state" {
@@ -3341,37 +3694,83 @@ async fn send_connect(
         let Ok(seq) = seq else { return };
         message["epoch"] = json!(connect_epoch());
         message["seq"] = json!(seq);
-        seal_and_send(material, store, peers, &message).await;
+        broadcast(peers, &message);
         return;
     }
     let Some(to) = to.filter(|id| crate::connect::is_device_id(id)) else { return };
-    if !peers.get(to).is_some_and(|peer| peer.confirmed) {
-        return;
-    }
-    send_private_signed(material, store, peers, to, &message).await;
+    send_message(peers, to, &message);
 }
 
-async fn seal_and_send(
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    body: &Value,
-) {
-    let payload = serde_json::to_vec(body).unwrap_or_default();
-    let mut rng = rand::rng();
-    let Ok(signature) = material.identity.private_key().calculate_signature(&payload, &mut rng) else { return };
-    let envelope = json!({
-        "author": material.device_id,
-        "signature": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.as_ref()),
-        "payload": body,
-    });
-    let plain = serde_json::to_vec(&envelope).unwrap_or_default();
-    let sender = SignalStore::address_for(&material.device_id);
-    if let Ok(message) = libsignal_protocol::group_encrypt(store, &sender, material.distribution_id, &plain, &mut rng).await {
-        let frame = Frame::Signal(tag_group(message.serialized()));
-        for peer in peers.values().filter(|peer| peer.confirmed) {
-            let _ = peer.tx.send(frame.clone());
+/// Sends one message to a paired device that has said hello on its current connection.
+fn send_message(peers: &HashMap<String, PeerOut>, device_id: &str, body: &Value) {
+    if let Some(peer) = peers.get(device_id).filter(|peer| peer.ready) {
+        send_json(peer, body);
+    }
+}
+
+/// Sends one message to every paired device that has said hello.
+fn broadcast(peers: &HashMap<String, PeerOut>, body: &Value) {
+    for peer in peers.values().filter(|peer| peer.ready) {
+        send_json(peer, body);
+    }
+}
+
+fn send_json(peer: &PeerOut, body: &Value) {
+    match serde_json::to_vec(body) {
+        Ok(bytes) => {
+            let _ = peer.tx.send(Frame::Message(bytes));
         }
+        Err(err) => eprintln!("message not sent: {err}"),
+    }
+}
+
+/// Opens messaging on a connection this device has confirmed. The other side answers with its own
+/// hello once it has confirmed this device too, and only then do messages flow.
+fn say_hello(db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, device_id: &str) {
+    let Some(peer) = peers.get(device_id).filter(|peer| peer.confirmed) else { return };
+    let name = db.lock().ok().and_then(|guard| guard.setting_string("displayName").ok()).unwrap_or_default();
+    send_json(peer, &json!({"kind": "hello", "name": name}));
+}
+
+/// The paired device said hello, so it has confirmed this one. The first hello on a connection is
+/// answered with ours and the full current state, since the reconnecting device needs it even when
+/// nothing changed here.
+fn accept_hello(
+    db: &Arc<Mutex<Db>>,
+    material: &IdentityMaterial,
+    peers: &mut HashMap<String, PeerOut>,
+    published_holdings: &mut String,
+    device_id: &str,
+    value: &Value,
+) {
+    let name = clean_name(value.get("name").and_then(|item| item.as_str()).unwrap_or(""), 64);
+    if !name.is_empty() {
+        let _ = db.lock().map(|guard| guard.rename_peer(device_id, &name));
+    }
+    let Some(peer) = peers.get_mut(device_id) else { return };
+    if std::mem::replace(&mut peer.ready, true) {
+        return;
+    }
+    eprintln!("{} is ready", short_id(device_id));
+    say_hello(db, peers, device_id);
+    // A changed list goes to every device below; then this device already has it.
+    let published = publish_holdings(db, peers, published_holdings);
+    let catch_up = db.lock().ok().map(|guard| {
+        let mut bodies = Vec::new();
+        if !published {
+            let rows = local_publishable(&guard).unwrap_or_default();
+            let revision = guard.our_holdings_revision().unwrap_or(0).max(1);
+            bodies.extend(holdings_messages(revision, &rows));
+        }
+        for feature in crate::db::FEATURES {
+            if let Some(body) = auto_body(&guard, &material.device_id, feature) {
+                bodies.extend(expand_sync_body(body));
+            }
+        }
+        bodies
+    }).unwrap_or_default();
+    for body in catch_up {
+        send_message(peers, device_id, &body);
     }
 }
 
@@ -3451,166 +3850,8 @@ fn apply_snapshot_payload(db: &Db, feature: &str, items: &Value) {
     }
 }
 
-fn verify_author(db: &Arc<Mutex<Db>>, device_id: &str, envelope: &Value) -> bool {
-    let Some(payload) = envelope.get("payload") else { return false };
-    let Some(signature) = envelope.get("signature").and_then(|item| item.as_str()) else { return false };
-    if envelope.get("author").and_then(|item| item.as_str()) != Some(device_id) {
-        return false;
-    }
-    let Ok(signature) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature) else { return false };
-    let Ok(bytes) = serde_json::to_vec(payload) else { return false };
-    let Ok(guard) = db.lock() else { return false };
-    let Ok(peers) = guard.peers() else { return false };
-    let Some(peer) = peers.into_iter().find(|peer| peer.device_id == device_id) else { return false };
-    let Ok(identity) = libsignal_protocol::IdentityKey::decode(&peer.identity_public) else { return false };
-    identity.public_key().verify_signature(&bytes, &signature)
-}
-
-fn trust_saved_peers(db: &Arc<Mutex<Db>>, store: &mut SignalStore) {
-    let Ok(guard) = db.lock() else { return };
-    let Ok(peers) = guard.peers() else { return };
-    for peer in peers {
-        store.trust(&peer.device_id, &peer.identity_public);
-    }
-}
-
-async fn send_bundle(db: &Arc<Mutex<Db>>, store: &mut SignalStore, peers: &HashMap<String, PeerOut>, device_id: &str) {
-    let _ = db;
-    let Ok(bundle) = store.ensure_prekeys().await else { return };
-    let Ok(identity) = bundle.identity_key() else { return };
-    let Ok(signed_public) = bundle.signed_pre_key_public() else { return };
-    let Ok(signed_signature) = bundle.signed_pre_key_signature() else { return };
-    let Ok(kyber_public) = bundle.kyber_pre_key_public() else { return };
-    let Ok(kyber_signature) = bundle.kyber_pre_key_signature() else { return };
-    let body = json!({
-        "identity": b64_bytes(&identity.serialize()),
-        "signedPublic": b64_bytes(&signed_public.serialize()),
-        "signedSignature": b64_bytes(signed_signature),
-        "kyberPublic": b64_bytes(&kyber_public.serialize()),
-        "kyberSignature": b64_bytes(kyber_signature),
-        "registrationId": bundle.registration_id().unwrap_or(1),
-    });
-    if let Some(peer) = peers.get(device_id) {
-        let _ = peer.tx.send(Frame::Bundle(serde_json::to_vec(&body).unwrap_or_default()));
-    }
-}
-
-async fn session_ready(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    ready_sessions: &mut HashSet<String>,
-    published_holdings: &mut String,
-    device_id: &str,
-) {
-    if !ready_sessions.insert(device_id.to_string()) {
-        return;
-    }
-    let name = db.lock().ok().and_then(|guard| guard.setting_string("displayName").ok()).unwrap_or_default();
-    eprintln!("secure session with {} is ready", short_id(device_id));
-    send_private(material, store, peers, device_id, &json!({"kind": "hello", "name": name})).await;
-    send_sender_key(material, store, peers, device_id).await;
-    // The reconnecting peer needs the full current state even when nothing changed here.
-    // A changed list goes to every device below; then this device already has it.
-    let published = publish_holdings(db, material, store, peers, published_holdings).await;
-    let catch_up = db.lock().ok().map(|guard| {
-        let mut bodies = Vec::new();
-        if !published {
-            let rows = local_publishable(&guard).unwrap_or_default();
-            let revision = guard.our_holdings_revision().unwrap_or(0).max(1);
-            bodies.extend(holdings_messages(revision, &rows));
-        }
-        for feature in crate::db::FEATURES {
-            if let Some(body) = auto_body(&guard, &material.device_id, feature) {
-                bodies.extend(expand_sync_body(body));
-            }
-        }
-        bodies
-    }).unwrap_or_default();
-    for body in catch_up {
-        send_private_signed(material, store, peers, device_id, &body).await;
-    }
-}
-
-async fn send_private_signed(
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    device_id: &str,
-    body: &Value,
-) {
-    let payload = serde_json::to_vec(body).unwrap_or_default();
-    let mut rng = rand::rng();
-    let Ok(signature) = material.identity.private_key().calculate_signature(&payload, &mut rng) else { return };
-    let envelope = json!({
-        "author": material.device_id,
-        "signature": b64_bytes(signature.as_ref()),
-        "payload": body,
-    });
-    send_private(material, store, peers, device_id, &envelope).await;
-}
-
-async fn send_private(
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    device_id: &str,
-    body: &Value,
-) {
-    let Some(peer) = peers.get(device_id) else { return };
-    let plain = serde_json::to_vec(body).unwrap_or_default();
-    let remote = SignalStore::address_for(device_id);
-    let local = SignalStore::address_for(&material.device_id);
-    let mut sessions = store.clone();
-    let mut identities = store.clone();
-    let mut rng = rand::rng();
-    if let Ok(message) = libsignal_protocol::message_encrypt(
-        &plain,
-        &remote,
-        &local,
-        &mut sessions,
-        &mut identities,
-        std::time::SystemTime::now(),
-        &mut rng,
-    ).await {
-        let _ = peer.tx.send(Frame::Signal(tag_ciphertext(&message)));
-    }
-}
-
-async fn accept_private(db: &Arc<Mutex<Db>>, store: &mut SignalStore, device_id: &str, plain: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(plain) else { return false };
-    match value.get("kind").and_then(|item| item.as_str()) {
-        Some("hello") => {
-            let name = clean_name(value.get("name").and_then(|item| item.as_str()).unwrap_or(""), 64);
-            if !name.is_empty() {
-                let _ = db.lock().map(|guard| guard.rename_peer(device_id, &name));
-            }
-            return true;
-        }
-        Some("skdm") => {}
-        _ => return false,
-    }
-    let Some(text) = value.get("bytes").and_then(|item| item.as_str()) else { return true };
-    let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text) else { return true };
-    if let Ok(message) = libsignal_protocol::SenderKeyDistributionMessage::try_from(bytes.as_slice()) {
-        let _ = libsignal_protocol::process_sender_key_distribution_message(
-            &SignalStore::address_for(device_id),
-            &message,
-            store,
-        ).await;
-    }
-    true
-}
-
-async fn publish_holdings(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    published_holdings: &mut String,
-) -> bool {
-    if peers.values().all(|peer| !peer.confirmed) {
+fn publish_holdings(db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, published_holdings: &mut String) -> bool {
+    if peers.values().all(|peer| !peer.ready) {
         return false;
     }
     let Some((fingerprint, revision, rows)) = ({
@@ -3629,12 +3870,12 @@ async fn publish_holdings(
     };
     *published_holdings = fingerprint;
     for body in holdings_messages(revision, &rows) {
-        seal_and_send(material, store, peers, &body).await;
+        broadcast(peers, &body);
     }
     true
 }
 
-/// One signal frame cannot carry a whole library, so the list is split.
+/// One message frame cannot carry a whole library, so the list is split.
 /// The receiver replaces its copy only after every part of this revision has arrived.
 const HOLDINGS_PART_BYTES: usize = 20 * 1024;
 
@@ -3706,10 +3947,6 @@ async fn write_or_stop(writer: &mut (impl tokio::io::AsyncWriteExt + Unpin), fra
         }
         Err(_) => true,
     }
-}
-
-fn b64_bytes(bytes: &[u8]) -> String {
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
 }
 
 fn dequeue_download(live: &Live, tx: &mpsc::UnboundedSender<Cmd>) {
@@ -4097,60 +4334,6 @@ fn unique_path(directory: &PathBuf, name: &str) -> PathBuf {
     directory.join(format!("{stem}-{tick}.{ext}"))
 }
 
-fn decode_bundle(bytes: &[u8]) -> AppResult<libsignal_protocol::PreKeyBundle> {
-    let value: Value = serde_json::from_slice(bytes)?;
-    let b64 = |key: &str| {
-        base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            value.get(key).and_then(|item| item.as_str()).unwrap_or(""),
-        ).map_err(|err| crate::error::AppError::Message(err.to_string()))
-    };
-    let identity = libsignal_protocol::IdentityKey::decode(&b64("identity")?).map_err(|err| crate::error::AppError::Message(err.to_string()))?;
-    let signed_public = libsignal_protocol::PublicKey::deserialize(&b64("signedPublic")?).map_err(|err| crate::error::AppError::Message(err.to_string()))?;
-    let kyber_public = libsignal_protocol::kem::PublicKey::deserialize(&b64("kyberPublic")?).map_err(|err| crate::error::AppError::Message(err.to_string()))?;
-    libsignal_protocol::PreKeyBundle::new(
-        value.get("registrationId").and_then(|item| item.as_u64()).unwrap_or(1) as u32,
-        libsignal_protocol::DeviceId::new(1).expect("id"),
-        None,
-        libsignal_protocol::SignedPreKeyId::from(1u32),
-        signed_public,
-        b64("signedSignature")?,
-        libsignal_protocol::KyberPreKeyId::from(1u32),
-        kyber_public,
-        b64("kyberSignature")?,
-        identity,
-    ).map_err(|err| crate::error::AppError::Message(err.to_string()))
-}
-
-/// Kind byte placed in front of every Signal frame.
-const SIGNAL_WHISPER: u8 = 2;
-const SIGNAL_PREKEY: u8 = 3;
-const SIGNAL_GROUP: u8 = 4;
-
-fn tag_ciphertext(message: &libsignal_protocol::CiphertextMessage) -> Vec<u8> {
-    let kind = match message {
-        libsignal_protocol::CiphertextMessage::PreKeySignalMessage(_) => SIGNAL_PREKEY,
-        _ => SIGNAL_WHISPER,
-    };
-    let mut out = vec![kind];
-    out.extend_from_slice(message.serialize());
-    out
-}
-
-fn tag_group(serialized: &[u8]) -> Vec<u8> {
-    let mut out = vec![SIGNAL_GROUP];
-    out.extend_from_slice(serialized);
-    out
-}
-
-fn decode_ciphertext(kind: u8, bytes: &[u8]) -> Option<libsignal_protocol::CiphertextMessage> {
-    match kind {
-        SIGNAL_WHISPER => libsignal_protocol::SignalMessage::try_from(bytes).ok().map(libsignal_protocol::CiphertextMessage::SignalMessage),
-        SIGNAL_PREKEY => libsignal_protocol::PreKeySignalMessage::try_from(bytes).ok().map(libsignal_protocol::CiphertextMessage::PreKeySignalMessage),
-        _ => None,
-    }
-}
-
 #[derive(Clone)]
 struct IdentityParts {
     device_id: String,
@@ -4193,5 +4376,470 @@ mod disconnect_tests {
         assert_eq!(redial_ids(saved.clone(), |id| id == "a", &paused), vec!["c".to_string()]);
         // After Connect the hold is lifted and the device is dialed again.
         assert_eq!(redial_ids(saved, |id| id == "a", &HashSet::new()), vec!["b".to_string(), "c".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::{answer_pairing, pairing_closed, pairing_frame, put_offer, start_pairing, tick_pairing, Live, LiveInner, PeerOut};
+    use crate::db::Db;
+    use crate::frames::Frame;
+    use crate::identity::{self, IdentityMaterial};
+    use crate::pairing;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+
+    /// One app: its database, key, pairing state, and the frames it sent to the other side.
+    struct Side {
+        db: Arc<Mutex<Db>>,
+        material: IdentityMaterial,
+        live: Live,
+        peers: HashMap<String, PeerOut>,
+        sent: Option<mpsc::UnboundedReceiver<Frame>>,
+    }
+
+    fn side(name: &str) -> Side {
+        let dir = std::env::temp_dir().join(format!("tunepeerly-pairing-{name}-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).expect("db");
+        let material = identity::load_or_create(&db).expect("identity");
+        Side { db: Arc::new(Mutex::new(db)), material, live: Live { inner: Arc::new(Mutex::new(LiveInner::default())) }, peers: HashMap::new(), sent: None }
+    }
+
+    /// Opens an unpaired connection from `me` to a device whose TLS key `me` sees as `seen_key`.
+    fn connect(me: &mut Side, device_id: &str, seen_key: &[u8], cert_der: &[u8], role: &str) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (audio, _) = mpsc::channel(1);
+        me.peers.insert(device_id.to_string(), PeerOut {
+            device_id: device_id.to_string(),
+            conn: 1,
+            dialed_by: String::new(),
+            confirmed: false,
+            ready: false,
+            incoming: role == "incoming",
+            path: "lan".into(),
+            tx,
+            audio,
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            cert_der: Vec::new(),
+        });
+        me.sent = Some(rx);
+        put_offer(&me.live, seen_key, cert_der, "Other", role, "full");
+        // put_offer names the device by the key it was given; tests use the real id throughout.
+        if let Ok(mut guard) = me.live.inner.lock()
+            && let Some(offer) = guard.offer.as_mut()
+        {
+            offer.device_id = device_id.to_string();
+        }
+    }
+
+    /// The asked app (shows the code) and the asking app (types it), connected to each other.
+    fn pair_of() -> (Side, Side) {
+        let mut asked = side("asked");
+        let mut asking = side("asking");
+        let (asking_id, asking_key, asking_cert) = (asking.material.device_id.clone(), asking.material.public_key.clone(), asking.material.cert_der.clone());
+        let (asked_id, asked_key, asked_cert) = (asked.material.device_id.clone(), asked.material.public_key.clone(), asked.material.cert_der.clone());
+        connect(&mut asked, &asking_id, &asking_key, &asking_cert, "incoming");
+        connect(&mut asking, &asked_id, &asked_key, &asked_cert, "outgoing");
+        (asked, asking)
+    }
+
+    /// Delivers every frame `from` sent to `to`. Returns true if `to` became paired.
+    fn deliver(from: &mut Side, to: &mut Side) -> bool {
+        let mut frames = Vec::new();
+        if let Some(rx) = from.sent.as_mut() {
+            while let Ok(frame) = rx.try_recv() {
+                frames.push(frame);
+            }
+        }
+        let mut paired = false;
+        for frame in frames {
+            paired |= pairing_frame(&to.db, &to.material, &to.live, &mut to.peers, &from.material.device_id, frame);
+        }
+        paired
+    }
+
+    fn sent_frames(side: &mut Side) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        if let Some(rx) = side.sent.as_mut() {
+            while let Ok(frame) = rx.try_recv() {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
+    fn shown_code(side: &Side) -> Option<String> {
+        side.live.inner.lock().unwrap().offer.as_ref().and_then(|offer| offer.code.clone())
+    }
+
+    fn status(side: &Side) -> Option<String> {
+        side.live.inner.lock().unwrap().offer.as_ref().map(|offer| offer.status.clone())
+    }
+
+    fn saved_key(side: &Side, device_id: &str) -> Option<Vec<u8>> {
+        side.db.lock().unwrap().peers().unwrap().into_iter().find(|peer| peer.device_id == device_id).map(|peer| peer.public_key)
+    }
+
+    /// The asking app types `code` and the frames go back and forth until the exchange settles.
+    fn try_code(asked: &mut Side, asking: &mut Side, code: &str) -> (bool, bool) {
+        let asked_id = asked.material.device_id.clone();
+        start_pairing(&asking.material, &asking.live, &asking.peers, &asked_id, "full", code);
+        let mut asked_paired = deliver(asking, asked);
+        let asking_paired = deliver(asked, asking);
+        asked_paired |= deliver(asking, asked);
+        deliver(asked, asking);
+        (asked_paired, asking_paired)
+    }
+
+    fn other_code(code: &str) -> String {
+        let value: u32 = code.parse().unwrap();
+        format!("{:06}", (value + 1) % 1_000_000)
+    }
+
+    #[test]
+    fn the_right_code_pairs_both_apps_and_pins_both_keys() {
+        let (mut asked, mut asking) = pair_of();
+        let code = shown_code(&asked).expect("code on screen");
+        assert_eq!(code.len(), 6);
+        assert!(shown_code(&asking).is_none(), "the asking side never sees the code");
+        assert_eq!(try_code(&mut asked, &mut asking, &code), (true, true));
+        assert_eq!(saved_key(&asked, &asking.material.device_id), Some(asking.material.public_key.clone()));
+        assert_eq!(saved_key(&asking, &asked.material.device_id), Some(asked.material.public_key.clone()));
+        assert!(asked.peers.values().all(|peer| peer.confirmed));
+        assert!(asking.peers.values().all(|peer| peer.confirmed));
+        assert!(asked.live.inner.lock().unwrap().offer.is_none());
+        assert!(asking.live.inner.lock().unwrap().offer.is_none());
+    }
+
+    #[test]
+    fn nothing_is_saved_before_the_code_is_checked() {
+        let (asked, asking) = pair_of();
+        // The old flow saved the device on the asking side as soon as the other side accepted.
+        assert!(saved_key(&asked, &asking.material.device_id).is_none());
+        assert!(saved_key(&asking, &asked.material.device_id).is_none());
+        assert!(asking.peers.values().all(|peer| !peer.confirmed));
+    }
+
+    #[test]
+    fn a_wrong_code_fails_and_a_new_code_replaces_the_used_one() {
+        let (mut asked, mut asking) = pair_of();
+        let first = shown_code(&asked).unwrap();
+        assert_eq!(try_code(&mut asked, &mut asking, &other_code(&first)), (false, false));
+        assert_eq!(status(&asking).as_deref(), Some("wrong"));
+        assert_eq!(status(&asked).as_deref(), Some("wrong"));
+        assert_eq!(asked.live.inner.lock().unwrap().offer.as_ref().unwrap().tries_left, 2);
+        let second = shown_code(&asked).expect("a new code");
+        assert!(saved_key(&asked, &asking.material.device_id).is_none());
+        assert!(saved_key(&asking, &asked.material.device_id).is_none());
+        // The first code worked once and is gone, even though it was the right one.
+        if first != second {
+            assert_eq!(try_code(&mut asked, &mut asking, &first), (false, false));
+        }
+        let third = shown_code(&asked).unwrap();
+        assert_eq!(try_code(&mut asked, &mut asking, &third), (true, true));
+    }
+
+    #[test]
+    fn three_wrong_codes_lock_pairing() {
+        let (mut asked, mut asking) = pair_of();
+        for _ in 0..pairing::MAX_WRONG {
+            let code = shown_code(&asked).expect("code");
+            assert_eq!(try_code(&mut asked, &mut asking, &other_code(&code)), (false, false));
+        }
+        assert_eq!(status(&asked).as_deref(), Some("locked"));
+        assert_eq!(status(&asking).as_deref(), Some("locked"));
+        assert!(shown_code(&asked).is_none());
+        let offer = asked.live.inner.lock().unwrap().offer.clone().unwrap();
+        let left = offer.locked_until.unwrap() - super::now_ms();
+        assert!((55_000..=60_000).contains(&left), "{left}");
+        // The connection was closed, and any new try is refused while locked.
+        assert!(asked.peers.is_empty());
+        let mut other = side("other");
+        let (asked_id, asked_key, asked_cert) = (asked.material.device_id.clone(), asked.material.public_key.clone(), asked.material.cert_der.clone());
+        connect(&mut other, &asked_id, &asked_key, &asked_cert, "outgoing");
+        let other_id = other.material.device_id.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (audio, _) = mpsc::channel(1);
+        asked.peers.insert(other_id.clone(), PeerOut {
+            device_id: other_id.clone(), conn: 2, dialed_by: String::new(), confirmed: false, ready: false, incoming: true,
+            path: "lan".into(), tx, audio, alive: Arc::new(std::sync::atomic::AtomicBool::new(true)), cert_der: Vec::new(),
+        });
+        let (_, message) = pairing::Asking::start("000000", &other.material.public_key, &asked.material.public_key);
+        answer_pairing(&asked.material, &asked.live, &mut asked.peers, &other_id, &message);
+        assert!(matches!(rx.try_recv(), Ok(Frame::PairFail { reason }) if reason == "locked"));
+    }
+
+    #[test]
+    fn a_code_expires() {
+        let (mut asked, mut asking) = pair_of();
+        let code = shown_code(&asked).unwrap();
+        assert!(!tick_pairing(&asked.live, &mut asked.peers, Instant::now() + Duration::from_secs(30)));
+        assert!(tick_pairing(&asked.live, &mut asked.peers, Instant::now() + pairing::CODE_LIFETIME));
+        assert_eq!(status(&asked).as_deref(), Some("expired"));
+        assert!(shown_code(&asked).is_none());
+        assert!(asked.peers.is_empty(), "the unpaired connection is closed");
+        deliver(&mut asked, &mut asking);
+        assert_eq!(status(&asking).as_deref(), Some("expired"));
+        // The right code typed now gets nowhere.
+        start_pairing(&asking.material, &asking.live, &asking.peers, &asked.material.device_id, "full", &code);
+        assert!(sent_frames(&mut asking).is_empty());
+    }
+
+    #[test]
+    fn a_late_try_with_an_expired_code_is_refused() {
+        let (mut asked, mut asking) = pair_of();
+        let Some(past) = Instant::now().checked_sub(pairing::CODE_LIFETIME + Duration::from_secs(1)) else { return };
+        let old = pairing::Code::new(past);
+        let value = old.value().to_string();
+        asked.live.inner.lock().unwrap().pairing.code = Some(old);
+        assert_eq!(try_code(&mut asked, &mut asking, &value), (false, false));
+        assert_eq!(status(&asked).as_deref(), Some("expired"));
+        assert_eq!(status(&asking).as_deref(), Some("expired"));
+    }
+
+    #[test]
+    fn someone_in_the_middle_fails_even_with_the_right_code() {
+        let (mut asked, mut asking) = pair_of();
+        let code = shown_code(&asked).unwrap();
+        // Each end only sees the key the middle used for its TLS session; the middle passes frames on.
+        let middle_one = side("middle-one").material.public_key;
+        let middle_two = side("middle-two").material.public_key;
+        asking.live.inner.lock().unwrap().offer.as_mut().unwrap().public_key = middle_one;
+        asked.live.inner.lock().unwrap().offer.as_mut().unwrap().public_key = middle_two;
+        assert_eq!(try_code(&mut asked, &mut asking, &code), (false, false));
+        assert_eq!(status(&asking).as_deref(), Some("wrong"));
+        assert_eq!(asked.live.inner.lock().unwrap().pairing.guard.tries_left(), 2);
+        assert!(saved_key(&asked, &asking.material.device_id).is_none());
+        assert!(saved_key(&asking, &asked.material.device_id).is_none());
+    }
+
+    #[test]
+    fn hanging_up_or_never_answering_counts_as_a_wrong_try() {
+        let (mut asked, mut asking) = pair_of();
+        let code = shown_code(&asked).unwrap();
+        let asked_id = asked.material.device_id.clone();
+        start_pairing(&asking.material, &asking.live, &asking.peers, &asked_id, "full", &code);
+        deliver(&mut asking, &mut asked);
+        assert_eq!(status(&asked).as_deref(), Some("checking"));
+        // The tag never comes back.
+        assert!(tick_pairing(&asked.live, &mut asked.peers, Instant::now() + pairing::ANSWER_TIMEOUT));
+        assert_eq!(asked.live.inner.lock().unwrap().pairing.guard.tries_left(), 2);
+        assert_eq!(status(&asked).as_deref(), Some("wrong"));
+        // Next try: the asking side hangs up after the answer.
+        let (mut asked2, mut asking2) = pair_of();
+        let code = shown_code(&asked2).unwrap();
+        let asked2_id = asked2.material.device_id.clone();
+        start_pairing(&asking2.material, &asking2.live, &asking2.peers, &asked2_id, "full", &code);
+        deliver(&mut asking2, &mut asked2);
+        pairing_closed(&asked2.live, &asking2.material.device_id);
+        assert_eq!(asked2.live.inner.lock().unwrap().pairing.guard.tries_left(), 2);
+        assert_eq!(status(&asked2).as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn only_the_device_on_screen_can_use_the_code() {
+        let (mut asked, _asking) = pair_of();
+        let code = shown_code(&asked).unwrap();
+        let stranger = side("stranger");
+        let stranger_id = stranger.material.device_id.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (audio, _) = mpsc::channel(1);
+        asked.peers.insert(stranger_id.clone(), PeerOut {
+            device_id: stranger_id.clone(), conn: 3, dialed_by: String::new(), confirmed: false, ready: false, incoming: true,
+            path: "lan".into(), tx, audio, alive: Arc::new(std::sync::atomic::AtomicBool::new(true)), cert_der: Vec::new(),
+        });
+        let (_, message) = pairing::Asking::start(&code, &stranger.material.public_key, &asked.material.public_key);
+        answer_pairing(&asked.material, &asked.live, &mut asked.peers, &stranger_id, &message);
+        assert!(matches!(rx.try_recv(), Ok(Frame::PairFail { reason }) if reason == "busy"));
+        // The code is still there for the device it was shown for, and nothing was counted.
+        assert_eq!(shown_code(&asked), Some(code));
+        assert_eq!(asked.live.inner.lock().unwrap().pairing.guard.tries_left(), pairing::MAX_WRONG);
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::{drop_stale_unpaired, forgotten_by, put_offer, remove_here, Live, LiveInner, PeerOut};
+    use crate::db::{Db, PeerRow};
+    use crate::frames::Frame;
+    use crate::identity::{self, IdentityMaterial};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    fn open(name: &str) -> (Db, IdentityMaterial) {
+        let dir = std::env::temp_dir().join(format!("tunepeerly-removal-{name}-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).expect("db");
+        let material = identity::load_or_create(&db).expect("identity");
+        (db, material)
+    }
+
+    fn id(n: u8) -> String {
+        format!("{n:02x}").repeat(32)
+    }
+
+    fn save(db: &Db, device_id: &str, key: Vec<u8>, name: &str, trust: &str) {
+        db.upsert_peer(&PeerRow {
+            device_id: device_id.into(),
+            public_key: key,
+            cert_id: String::new(),
+            display_name: name.into(),
+            trust: trust.into(),
+        })
+        .expect("save");
+    }
+
+    fn saved(db: &Db, device_id: &str) -> bool {
+        db.peers().unwrap().iter().any(|peer| peer.device_id == device_id)
+    }
+
+    fn connection(device_id: &str, confirmed: bool, ready: bool) -> (PeerOut, mpsc::UnboundedReceiver<Frame>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (audio, _) = mpsc::channel(1);
+        let peer = PeerOut {
+            device_id: device_id.into(),
+            conn: 1,
+            dialed_by: String::new(),
+            confirmed,
+            ready,
+            incoming: true,
+            path: "lan".into(),
+            tx,
+            audio,
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            cert_der: Vec::new(),
+        };
+        (peer, rx)
+    }
+
+    fn live() -> Live {
+        Live { inner: Arc::new(Mutex::new(LiveInner::default())) }
+    }
+
+    fn sent(rx: &mut mpsc::UnboundedReceiver<Frame>) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    /// Removing C on this computer: C is told and cut off, its key goes, and it is refused here. B, still
+    /// paired with C, hears nothing about it, and its pairing here is untouched.
+    #[test]
+    fn removing_a_device_is_local_to_this_computer() {
+        let (db, _) = open("local");
+        let (b, c) = (id(0xbb), id(0xcc));
+        save(&db, &b, vec![1], "Tower", "full");
+        save(&db, &c, vec![2], "Laptop", "full");
+        let db = Arc::new(Mutex::new(db));
+        let live = live();
+        let mut peers = HashMap::new();
+        let mut inboxes = HashMap::new();
+        for device in [&b, &c] {
+            let (peer, rx) = connection(device, true, true);
+            peers.insert(device.clone(), peer);
+            inboxes.insert(device.clone(), rx);
+        }
+        remove_here(&db, &live, &mut peers, &mut HashMap::new(), &c);
+        assert!(!peers.contains_key(&c));
+        assert!(peers.contains_key(&b));
+        assert!(matches!(sent(inboxes.get_mut(&c).unwrap()).as_slice(), [Frame::Unpaired { pair: false }]));
+        assert!(sent(inboxes.get_mut(&b).unwrap()).is_empty());
+        let guard = db.lock().unwrap();
+        assert!(!saved(&guard, &c));
+        assert!(saved(&guard, &b));
+        assert!(guard.is_removed(&c));
+        assert!(!guard.is_removed(&b));
+        assert_eq!(guard.removals().unwrap().iter().map(|row| row.name.as_str()).collect::<Vec<_>>(), vec!["Laptop"]);
+        assert!(guard.notices().unwrap().iter().any(|notice| notice.kind == "removed" && notice.name == "Laptop"));
+        // Pairing again with a code ends the removal.
+        guard.end_removal(&c).unwrap();
+        assert!(!guard.is_removed(&c));
+    }
+
+    #[test]
+    fn an_unpaired_frame_makes_this_device_forget_the_sender_quietly() {
+        let (db, _) = open("forget");
+        let a = id(0xaa);
+        save(&db, &a, vec![1], "Desk", "full");
+        let db = Arc::new(Mutex::new(db));
+        let live = live();
+        let mut peers = HashMap::new();
+        let (peer, _rx) = connection(&a, true, true);
+        peers.insert(a.clone(), peer);
+        forgotten_by(&db, &live, &mut peers, &mut HashMap::new(), &a, false);
+        assert!(peers.is_empty());
+        assert!(live.inner.lock().unwrap().offer.is_none());
+        let guard = db.lock().unwrap();
+        assert!(!saved(&guard, &a));
+        // Forgetting is local: it does not keep the sender out or tell anyone else.
+        assert!(!guard.is_removed(&a));
+        assert!(guard.notices().unwrap().iter().any(|notice| notice.kind == "removedYou" && notice.name == "Desk"));
+    }
+
+    #[test]
+    fn pairing_again_from_the_remover_shows_a_code_here() {
+        let (db, _) = open("again");
+        let (_, remover) = open("remover");
+        save(&db, &remover.device_id, remover.public_key.clone(), "Desk", "full");
+        let db = Arc::new(Mutex::new(db));
+        let live = live();
+        let mut peers = HashMap::new();
+        let (mut peer, _rx) = connection(&remover.device_id, true, true);
+        peer.cert_der = remover.cert_der.clone();
+        peers.insert(remover.device_id.clone(), peer);
+        forgotten_by(&db, &live, &mut peers, &mut HashMap::new(), &remover.device_id, true);
+        let connection = peers.get(&remover.device_id).expect("kept");
+        assert!(!connection.confirmed && !connection.ready);
+        let offer = live.inner.lock().unwrap().offer.clone().expect("offer");
+        assert_eq!((offer.device_id.as_str(), offer.role.as_str()), (remover.device_id.as_str(), "incoming"));
+        assert!(offer.code.is_some());
+        assert!(!saved(&db.lock().unwrap(), &remover.device_id));
+    }
+
+    #[test]
+    fn an_unpaired_frame_from_an_unsaved_device_changes_nothing() {
+        let (db, _) = open("unsaved");
+        let a = id(0xaa);
+        let db = Arc::new(Mutex::new(db));
+        let live = live();
+        let mut peers = HashMap::new();
+        let (peer, _rx) = connection(&a, false, false);
+        peers.insert(a.clone(), peer);
+        forgotten_by(&db, &live, &mut peers, &mut HashMap::new(), &a, false);
+        assert!(peers.contains_key(&a));
+        assert!(db.lock().unwrap().notices().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unpaired_connections_without_a_pairing_are_let_go() {
+        let (db, _) = open("stale");
+        let (_, other) = open("other");
+        let (pairing, done, saved_verify) = (other.device_id.clone(), id(0xdd), id(0xee));
+        save(&db, &saved_verify, vec![5], "Ask", "verify");
+        let db = Arc::new(Mutex::new(db));
+        let live = live();
+        let mut peers = HashMap::new();
+        for device in [&pairing, &done, &saved_verify] {
+            peers.insert(device.clone(), connection(device, false, false).0);
+        }
+        put_offer(&live, &other.public_key, &other.cert_der, "Other", "incoming", "full");
+        assert!(drop_stale_unpaired(&db, &live, &mut peers));
+        let mut left: Vec<&String> = peers.keys().collect();
+        left.sort();
+        let mut want = vec![&pairing, &saved_verify];
+        want.sort();
+        assert_eq!(left, want);
+        // Once that try has ended, its connection goes too, though the dialog stays until closed.
+        live.inner.lock().unwrap().offer.as_mut().unwrap().status = "expired".into();
+        assert!(drop_stale_unpaired(&db, &live, &mut peers));
+        assert_eq!(peers.keys().collect::<Vec<_>>(), vec![&saved_verify]);
+        assert!(live.inner.lock().unwrap().offer.is_some());
+        assert!(!drop_stale_unpaired(&db, &live, &mut peers));
     }
 }
