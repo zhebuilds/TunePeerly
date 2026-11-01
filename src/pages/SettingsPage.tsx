@@ -3,11 +3,10 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, pickFolder, type Feature, type Grant } from "../api";
 import { useApp } from "../app/model";
-import { CommitInput, DoNotUse, NotImplemented, Revise, Row, Segmented, Select, Switch } from "../components/controls";
+import { CommitInput, Revise, Row, Segmented, Select, Switch } from "../components/controls";
 import { SyncButton } from "../components/SyncButton";
 import { problemGroups } from "../lib/library";
 import { Icons } from "../ui/icons";
-import { relayLabel } from "./DevicesPage";
 
 const SOURCE_URL = "https://github.com/zhebuilds/TunePeerly";
 const LICENSE_URL = "https://www.gnu.org/licenses/agpl-3.0.html";
@@ -31,26 +30,37 @@ export function SettingsPage() {
   const app = useApp();
   const boot = app.boot;
   const refs = useRef<Record<string, HTMLElement | null>>({});
+  const [nameEpoch, setNameEpoch] = useState(0);
   useEffect(() => {
-    if (app.route.name === "settings" && app.route.id) {
-      refs.current[app.route.id]?.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
+    if (app.route.name !== "settings" || !app.route.id) return;
+    const id = app.route.id;
+    // Wait a frame: the app scrolls back to the top on every route change after this effect runs.
+    const frame = window.requestAnimationFrame(() => refs.current[id]?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    return () => window.cancelAnimationFrame(frame);
   }, [app.route.name, app.route.id]);
   if (!boot) return null;
   const settings = app.settings;
   const set = (key: string, value: unknown) => void app.setSetting(key, value);
   const groups = problemGroups(app.tracks);
   const problems = groups.access.length + groups.playback.length;
-  const relay = relayLabel(boot.relay, t);
+  const net = boot.network;
+  const rename = (value: string) => {
+    const name = value.trim().slice(0, 64);
+    // A blank name is not saved; remounting the field puts the current name back.
+    if (!name) {
+      setNameEpoch((epoch) => epoch + 1);
+      return;
+    }
+    void app.setSetting("displayName", name).then(app.scheduleRefresh);
+  };
 
   const sections = [
     { id: "appearance", label: t("settings.appearance") },
     { id: "library", label: t("settings.library") },
+    { id: "sync", label: t("settings.sync") },
     { id: "history", label: t("settings.history") },
     { id: "notices", label: t("settings.notices") },
-    { id: "network", label: t("settings.network") },
-    { id: "sync", label: t("settings.sync") },
-    { id: "storage", label: t("settings.storage") },
+    { id: "device", label: t("settings.thisDevice") },
     { id: "about", label: t("settings.about") },
   ];
 
@@ -152,6 +162,55 @@ export function SettingsPage() {
             {t("settings.openProblems")} <Icons.chevronRight />
           </button>
         </Row>
+        <Row title={t("settings.downloadFolder")} help={settings.downloadFolder ? <span className="mono">{settings.downloadFolder}</span> : t("settings.downloadFolderNone")}>
+          <button
+            type="button"
+            className="btn soft"
+            onClick={() =>
+              void pickFolder()
+                .then((folder) => {
+                  if (folder) set("downloadFolder", folder);
+                })
+                .catch(app.say)
+            }
+          >
+            <Icons.folder /> {t("common.choose")}
+          </button>
+        </Row>
+      </section>
+
+      <section className="panel" ref={(node) => { refs.current.sync = node; }}>
+        <h2>{t("settings.sync")}<Revise /></h2>
+        <p className="setting-help">{t("settings.syncHelp")}</p>
+        <p className="setting-help">{t("settings.overwritePolicyHelp")}</p>
+        <Row title={t("settings.requestDevice")} help={t("settings.requestDeviceHelp")}>
+          <Select
+            label={t("settings.requestDevice")}
+            value={String(settings.syncRequestDevice ?? "")}
+            onChange={(value) => set("syncRequestDevice", value)}
+            options={[{ value: "", label: t("sync.requestNone") }, ...boot.links.map((link) => ({ value: link.deviceId, label: link.name || link.deviceId }))]}
+          />
+        </Row>
+        {FEATURES.map((feature) => {
+          const policy = settings.overwritePolicy?.[feature];
+          return (
+            <Row key={feature} title={t(`feature.${feature}`)} help={t("settings.overwritePolicy", { feature: t(`feature.${feature}`) })}>
+              <div className="sync-feature-controls">
+                <Select
+                  label={t("settings.overwritePolicy", { feature: t(`feature.${feature}`) })}
+                  value={policy === "ask" || policy === "deny" ? policy : "silent"}
+                  onChange={(value) => set("overwritePolicy", { ...(settings.overwritePolicy ?? {}), [feature]: value })}
+                  options={[
+                    { value: "silent", label: t("devices.overwriteSilent") },
+                    { value: "ask", label: t("devices.overwriteAsk") },
+                    { value: "deny", label: t("devices.overwriteDeny") },
+                  ]}
+                />
+                <SyncButton feature={feature} compact />
+              </div>
+            </Row>
+          );
+        })}
       </section>
 
       <section className="panel" ref={(node) => { refs.current.history = node; }}>
@@ -220,115 +279,28 @@ export function SettingsPage() {
         </Row>
       </section>
 
-      <section className="panel" ref={(node) => { refs.current.network = node; }}>
-        <h2>{t("settings.network")}</h2>
+      <section className="panel" ref={(node) => { refs.current.device = node; }}>
+        <h2>{t("settings.thisDevice")}</h2>
         {settings.incognito && (
           <div className="banner warn">
             <Icons.incognito /> <span>{t("settings.networkIncognito")}</span>
           </div>
         )}
-        <h3><span className="setting-title-line">{t("settings.relay")}<NotImplemented /><DoNotUse /></span></h3>
-        <p className="setting-help">
-          {t("settings.relayHelp")} <span className={`state-pill ${relay.tone}`}>{relay.text}</span>
-        </p>
-        <Row title={t("settings.relayHost")}>
-          <CommitInput label={t("settings.relayHost")} width={240} value={String(settings.relayHost ?? "")} placeholder="relay.example.com" onCommit={(value) => set("relayHost", value.trim())} />
+        <p className="setting-help">{t("settings.thisDeviceHelp")}</p>
+        <Row title={t("devices.name")} help={t("devices.nameHelp")}>
+          <CommitInput key={nameEpoch} label={t("devices.name")} value={boot.deviceName} width={260} onCommit={rename} />
         </Row>
-        <Row title={t("settings.relayPort")}>
-          <CommitInput
-            label={t("settings.relayPort")}
-            type="number"
-            width={110}
-            value={String(settings.relayPort ?? 22067)}
-            onCommit={(value) => {
-              const port = Number(value);
-              if (Number.isInteger(port) && port > 0 && port < 65536) set("relayPort", port);
-              else app.setNotice(t("settings.relayPortInvalid"));
-            }}
-          />
+        <Row title={<span className="setting-title-line">{t("settings.lanPort")}<Revise /></span>} help={t("settings.lanPortHelp")}>
+          <code className="mono small selectable" data-testid="lan-port">{net?.tcpPort || "—"}</code>
         </Row>
-        <Row title={t("settings.relayId")} help={t("settings.relayIdHelp")}>
-          <CommitInput label={t("settings.relayId")} width={320} value={String(settings.relayDeviceId ?? "")} placeholder="XXXXXXX-XXXXXXX-…" onCommit={(value) => set("relayDeviceId", value.trim())} />
+        <Row title={t("settings.discoveryUdp")}>
+          <code className="mono small selectable" data-testid="discovery-port">{net?.discovery ? net.udpPort : t("settings.discoveryOff")}</code>
         </Row>
-        <Row title={t("settings.relayToken")}>
-          <CommitInput label={t("settings.relayToken")} width={240} secret value={String(settings.relayToken ?? "")} onCommit={(value) => set("relayToken", value.trim())} />
+        <Row title={t("settings.discoveryGroup")}>
+          <code className="mono small selectable" data-testid="discovery-group">{net?.discovery ? net.multicastGroup : t("settings.discoveryOff")}</code>
         </Row>
-      </section>
-
-      <section className="panel" ref={(node) => { refs.current.sync = node; }}>
-        <h2>{t("settings.sync")}<Revise /></h2>
-        <p className="setting-help">{t("settings.syncHelp")}</p>
-        <p className="setting-help">{t("settings.overwritePolicyHelp")}</p>
-        <Row title={t("settings.requestDevice")} help={t("settings.requestDeviceHelp")}>
-          <Select
-            label={t("settings.requestDevice")}
-            value={String(settings.syncRequestDevice ?? "")}
-            onChange={(value) => set("syncRequestDevice", value)}
-            options={[{ value: "", label: t("sync.requestNone") }, ...boot.links.map((link) => ({ value: link.deviceId, label: link.name || link.deviceId }))]}
-          />
-        </Row>
-        {FEATURES.map((feature) => {
-          const policy = settings.overwritePolicy?.[feature];
-          return (
-            <Row key={feature} title={t(`feature.${feature}`)} help={t("settings.overwritePolicy", { feature: t(`feature.${feature}`) })}>
-              <div className="sync-feature-controls">
-                <Select
-                  label={t("settings.overwritePolicy", { feature: t(`feature.${feature}`) })}
-                  value={policy === "ask" || policy === "deny" ? policy : "silent"}
-                  onChange={(value) => set("overwritePolicy", { ...(settings.overwritePolicy ?? {}), [feature]: value })}
-                  options={[
-                    { value: "silent", label: t("devices.overwriteSilent") },
-                    { value: "ask", label: t("devices.overwriteAsk") },
-                    { value: "deny", label: t("devices.overwriteDeny") },
-                  ]}
-                />
-                <SyncButton feature={feature} compact />
-              </div>
-            </Row>
-          );
-        })}
-      </section>
-
-      <section className="panel" ref={(node) => { refs.current.storage = node; }}>
-        <h2>{t("settings.storage")}</h2>
-        <Row title={t("settings.downloadFolder")} help={settings.downloadFolder ? <span className="mono">{settings.downloadFolder}</span> : t("settings.downloadFolderNone")}>
-          <button
-            type="button"
-            className="btn soft"
-            onClick={() =>
-              void pickFolder()
-                .then((folder) => {
-                  if (folder) set("downloadFolder", folder);
-                })
-                .catch(app.say)
-            }
-          >
-            <Icons.folder /> {t("common.choose")}
-          </button>
-        </Row>
-        <Row
-          title={<span className="setting-title-line">{t("settings.lanPort")}<Revise /></span>}
-          help={
-            <>
-              <div>{t("settings.lanPortHelp", { port: boot.listenPort || "—" })}</div>
-              {boot.portFallback ? <div className="setting-error">{t("settings.portFallback", { saved: boot.portFallback, port: boot.listenPort || "—" })}</div> : null}
-            </>
-          }
-        >
-          <CommitInput
-            label={t("settings.lanPort")}
-            type="number"
-            width={110}
-            value={String(settings.listenPort || "")}
-            onCommit={(value) => {
-              const port = Number(value);
-              if (!Number.isInteger(port) || port < 1024 || port > 65535) {
-                app.setNotice(t("settings.portInvalid"));
-                return;
-              }
-              void app.setSetting("listenPort", port).then(() => app.scheduleRefresh());
-            }}
-          />
+        <Row title={t("settings.lanAddresses")} help={t("settings.lanAddressesHelp")}>
+          <code className="mono small selectable" data-testid="lan-addresses">{net?.discovery && net.addresses.length > 0 ? net.addresses.join(", ") : "—"}</code>
         </Row>
         <Row title={<span className="setting-title-line">{t("settings.deviceId")}<Revise /></span>}>
           <code className="mono small selectable">{boot.certId}</code>

@@ -131,7 +131,6 @@ const settings: Record<string, unknown> = {
   relayToken: "",
   discovery: true,
   displayName: "Desk PC",
-  listenPort: 22000,
 };
 
 const state = {
@@ -227,9 +226,9 @@ function bootstrap(): Bootstrap {
     history: [...state.history],
     tracks: orderedLibrary(),
     favoriteIds: orderedLibrary().map((track) => track.contentId).filter((id): id is string => Boolean(id && tracks.find((item) => item.contentId === id)?.favorite)),
-    listenPort: params.has("portbusy") ? 22111 : 22000,
-    portFallback: params.has("portbusy") ? 22000 : null,
+    listenPort: 49731,
     localAddresses: ["192.168.1.20", "10.0.0.8"],
+    network: { tcpPort: 49731, discovery: true, udpPort: 41220, multicastGroup: "224.0.0.168", addresses: ["192.168.1.20", "10.0.0.8"] },
     nearby: empty ? [] : [{ deviceId: "dev-living", name: "Living Room", host: "192.168.1.31", hosts: ["192.168.1.31", "10.0.0.31"], port: 22000 }],
     links: structuredClone(links),
     relay: "",

@@ -256,6 +256,7 @@ impl Db {
             )?;
         }
         self.drop_auto_sync()?;
+        self.drop_listen_port()?;
         self.split_overwrite_mode()?;
         let name = self.setting_string("displayName")?;
         if name.is_empty() {
@@ -280,8 +281,15 @@ impl Db {
         Ok(())
     }
 
-    /// Favorites and appearance sync only by hand now, and Recently Played only by Refresh. Drop the
-    /// settings that automatic sync left behind.
+    /// Favorites and appearance sync only by hand now, and another device's Recently Played is only
+    /// viewed. Drop the settings that automatic sync left behind.
+    /// The LAN port is picked by the system on every start now. A port saved by an older version is
+    /// not used anymore.
+    fn drop_listen_port(&self) -> AppResult<()> {
+        self.conn.execute("DELETE FROM device_settings WHERE key = 'listenPort'", [])?;
+        Ok(())
+    }
+
     fn drop_auto_sync(&self) -> AppResult<()> {
         self.conn.execute(
             "DELETE FROM device_settings WHERE key IN ('dirty', 'pendingSnapshots', 'syncSources', 'syncBlocks', 'autoSend', 'conflictPolicy', 'historySync', 'historyStartup')",
@@ -1566,7 +1574,6 @@ fn device_defaults() -> Vec<(&'static str, Value)> {
         ("miniTray", json!(true)),
         ("silenceSeconds", json!(60)),
         ("overwritePolicy", json!({"favorites": "silent", "appearance": "silent"})),
-        ("listenPort", json!(0)),
         ("syncRequestDevice", json!("")),
         ("downloadHistory", json!([])),
         ("noticeRead", json!("visible")),
@@ -1878,6 +1885,18 @@ mod tests {
         assert!(settings.get("overwritePolicy").is_some());
         let kinds: Vec<String> = db.notices().unwrap().into_iter().map(|row| row.kind).collect();
         assert_eq!(kinds, vec!["sync".to_string()]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_saved_lan_port_is_dropped() {
+        let (db, dir) = open_db("listen-port");
+        assert!(db.device_settings_map().unwrap().get("listenPort").is_none());
+        db.set_device_setting("listenPort", json!(22000)).unwrap();
+        drop(db);
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
+        assert!(db.device_settings_map().unwrap().get("listenPort").is_none());
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }

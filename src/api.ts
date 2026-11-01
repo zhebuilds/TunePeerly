@@ -95,7 +95,6 @@ export type Settings = {
   discovery?: boolean;
   syncRequestDevice?: string;
   displayName?: string;
-  listenPort?: number;
   silenceSeconds?: number;
   noticeRead?: "open" | "click" | "visible";
   noticeClear?: "ask" | "unpinned" | "all";
@@ -115,9 +114,11 @@ export type Bootstrap = {
   history: string[];
   tracks: Track[];
   favoriteIds?: string[];
+  /** The LAN port the system picked for this run; 0 while not listening. */
   listenPort: number;
-  portFallback?: number | null;
   localAddresses?: string[];
+  /** Read-only network facts from the backend; `discovery` is false while it is not announcing. */
+  network?: { tcpPort: number; discovery: boolean; udpPort: number; multicastGroup: string; addresses: string[] };
   nearby: Nearby[];
   links: Link[];
   relay: string;

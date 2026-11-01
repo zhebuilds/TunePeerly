@@ -1,9 +1,9 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, type Link } from "../api";
 import { useApp } from "../app/model";
-import { CommitInput, Revise, Row, Select, Switch } from "../components/controls";
+import { CommitInput, DoNotUse, NotImplemented, Revise, Row, Select, Switch } from "../components/controls";
 import { unpairedNearby } from "../lib/devices";
 import { Icons } from "../ui/icons";
 
@@ -19,15 +19,23 @@ export function DevicesPage() {
   const { t } = useTranslation();
   const app = useApp();
   const boot = app.boot;
-  const [nameEpoch, setNameEpoch] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
+  const relayRef = useRef<HTMLElement | null>(null);
+  // Old links to Settings → relay land here with id "relay" (see navigate in model.tsx).
+  useEffect(() => {
+    if (app.route.name !== "devices" || app.route.id !== "relay") return;
+    // Wait a frame: the app scrolls back to the top on every route change after this effect runs.
+    const frame = window.requestAnimationFrame(() => relayRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    return () => window.cancelAnimationFrame(frame);
+  }, [app.route.name, app.route.id, Boolean(boot)]);
   if (!boot) return null;
 
   const settings = app.settings;
+  const set = (key: string, value: unknown) => void app.setSetting(key, value);
+  const relay = relayLabel(boot.relay, t);
   const networkOff = Boolean(settings.incognito);
   // Nearby is only for devices that are not paired yet; a paired device stays under Paired even when it is offline.
   const nearby = unpairedNearby(boot.nearby, boot.links);
-  const relay = relayLabel(boot.relay, t);
 
   const run = (action: string, payload: unknown = null) => void api.network(action, payload).catch(app.say);
   const remove = (link: Link) =>
@@ -54,15 +62,6 @@ export function DevicesPage() {
     run("refresh-nearby");
     window.setTimeout(() => setRefreshing(false), 1000);
   };
-  const rename = (value: string) => {
-    const name = value.trim().slice(0, 64);
-    // A blank name is not saved; remounting the field puts the current name back.
-    if (!name) {
-      setNameEpoch((epoch) => epoch + 1);
-      return;
-    }
-    void app.setSetting("displayName", name).then(app.scheduleRefresh);
-  };
 
   return (
     <div className="page settings-page devices-page">
@@ -77,38 +76,6 @@ export function DevicesPage() {
           </button>
         </div>
       )}
-
-      <section className="panel">
-        <h2>{t("devices.thisDevice")}</h2>
-        <Row title={t("devices.name")} help={t("devices.nameHelp")}>
-          <CommitInput key={nameEpoch} label={t("devices.name")} value={boot.deviceName} width={260} onCommit={rename} />
-        </Row>
-        <Row title={t("devices.status")}>
-          <div className="pill-row">
-            <span className="state-pill online">{t("devices.port", { port: boot.listenPort || "—" })}</span>
-            <span className={`state-pill ${relay.tone}`} title={boot.relay}>
-              {relay.text}
-            </span>
-          </div>
-        </Row>
-        <Row title={t("devices.addresses")} help={t("devices.addressesHelp")}>
-          <div className="address-list">
-            {(boot.localAddresses ?? []).length === 0 ? (
-              <span className="muted small">{t("devices.noAddresses")}</span>
-            ) : (
-              (boot.localAddresses ?? []).map((address) => (
-                <span key={address} className="chip mono static">
-                  {address}
-                </span>
-              ))
-            )}
-          </div>
-        </Row>
-        <div className="setting-text">
-          <div className="setting-title">{t("devices.pairLan")}</div>
-          <div className="setting-help">{t("devices.pairLanHelp")}</div>
-        </div>
-      </section>
 
       <section className="panel">
         <h2>{t("devices.paired")}<Revise /></h2>
@@ -222,6 +189,40 @@ export function DevicesPage() {
             ))}
           </ul>
         )}
+      </section>
+
+      <section className="panel" ref={relayRef}>
+        <h2><span className="setting-title-line">{t("relay.server")}<NotImplemented /><DoNotUse /></span></h2>
+        {settings.incognito && (
+          <div className="banner warn">
+            <Icons.incognito /> <span>{t("settings.networkIncognito")}</span>
+          </div>
+        )}
+        <p className="setting-help">
+          {t("relay.help")} <span className={`state-pill ${relay.tone}`}>{relay.text}</span>
+        </p>
+        <Row title={t("relay.host")}>
+          <CommitInput label={t("relay.host")} width={240} value={String(settings.relayHost ?? "")} placeholder="relay.example.com" onCommit={(value) => set("relayHost", value.trim())} />
+        </Row>
+        <Row title={t("relay.port")}>
+          <CommitInput
+            label={t("relay.port")}
+            type="number"
+            width={110}
+            value={String(settings.relayPort ?? 22067)}
+            onCommit={(value) => {
+              const port = Number(value);
+              if (Number.isInteger(port) && port > 0 && port < 65536) set("relayPort", port);
+              else app.setNotice(t("relay.portInvalid"));
+            }}
+          />
+        </Row>
+        <Row title={t("relay.id")} help={t("relay.idHelp")}>
+          <CommitInput label={t("relay.id")} width={320} value={String(settings.relayDeviceId ?? "")} placeholder="XXXXXXX-XXXXXXX-…" onCommit={(value) => set("relayDeviceId", value.trim())} />
+        </Row>
+        <Row title={t("relay.token")}>
+          <CommitInput label={t("relay.token")} width={240} secret value={String(settings.relayToken ?? "")} onCommit={(value) => set("relayToken", value.trim())} />
+        </Row>
       </section>
 
       <section className="panel">

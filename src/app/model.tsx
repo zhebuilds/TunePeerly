@@ -685,7 +685,9 @@ function useModel() {
     scheduleRefresh();
   }, [say, scheduleRefresh, t, toast]);
 
-  const navigate = useCallback((next: Route) => {
+  const navigate = useCallback((target: Route) => {
+    // The relay settings moved from Settings to the Devices page; old links still land on them.
+    const next: Route = target.name === "settings" && target.id === "relay" ? { name: "devices", id: "relay" } : target;
     const state = nav.current;
     if (sameRoute(state.stack[state.index], next)) return;
     state.stack = [...state.stack.slice(0, state.index + 1), next].slice(-60);

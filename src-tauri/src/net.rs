@@ -158,9 +158,10 @@ pub struct Live {
 pub struct LiveInner {
     pub nearby: Vec<Nearby>,
     pub links: Vec<LinkStatus>,
+    /// The LAN port the system picked for this run. Not configurable and not saved.
     pub listen_port: u16,
-    /// Saved port that was busy, while `listen_port` is a temporary one.
-    pub port_fallback: Option<u16>,
+    /// Whether the discovery thread is announcing this computer right now.
+    pub discovery_on: bool,
     pub relay: String,
     pub download: Option<DownloadStatus>,
     /// Songs waiting because another download is already copying.
@@ -791,61 +792,31 @@ async fn restart_listener(
     actual_port: &mut u16,
     live: &Live,
 ) {
-    let ((incognito, discovery, sync, audio), port) = {
+    let (incognito, discovery, sync, audio) = {
         let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
-        let switches = switches(&guard);
-        let port = guard.setting_i64("listenPort").unwrap_or(0).clamp(0, u16::MAX as i64) as u16;
-        (switches, port)
+        switches(&guard)
     };
     let wanted = !incognito && (discovery || sync || audio);
     // Keep a healthy listener so the announced port stays valid across settings changes.
-    if wanted
-        && *actual_port != 0
-        && (port == 0 || port == *actual_port)
-        && listener.as_ref().is_some_and(|task| !task.is_finished())
-    {
+    if wanted && *actual_port != 0 && listener.as_ref().is_some_and(|task| !task.is_finished()) {
         return;
     }
     if let Some(task) = listener.take() {
         task.abort();
-        // Wait until the old socket is really closed, otherwise a fixed port is still busy.
         let _ = task.await;
     }
-    if !wanted {
-        *actual_port = 0;
-        if let Ok(mut live) = live.inner.lock() {
-            live.listen_port = 0;
-            live.port_fallback = None;
-        }
-        return;
-    }
-    let mut fell_back = false;
-    let bind = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await {
-        Ok(tcp) => Ok(tcp),
-        Err(_) if port != 0 => {
-            fell_back = true;
-            TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await
-        }
-        Err(err) => Err(err),
-    };
-    let Ok(tcp) = bind else {
-        *actual_port = 0;
-        if let Ok(mut live) = live.inner.lock() {
-            live.listen_port = 0;
-            live.port_fallback = None;
-        }
-        return;
-    };
-    *actual_port = tcp.local_addr().map(|addr| addr.port()).unwrap_or(0);
-    if port == 0 && *actual_port != 0 {
-        if let Ok(guard) = db.lock() {
-            let _ = guard.set_device_setting("listenPort", json!(*actual_port));
-        }
-    }
+    // The port is never chosen by the user: each new listener takes whatever free port the system
+    // gives it, and discovery announces that port.
+    let bind = if wanted { TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.ok() } else { None };
+    *actual_port = bind.as_ref().and_then(|tcp| tcp.local_addr().ok()).map(|addr| addr.port()).unwrap_or(0);
     if let Ok(mut live) = live.inner.lock() {
         live.listen_port = *actual_port;
-        live.port_fallback = (fell_back && *actual_port != 0 && *actual_port != port).then_some(port);
     }
+    let Some(tcp) = bind else { return };
+    if *actual_port == 0 {
+        return;
+    }
+    eprintln!("listening on port {}", *actual_port);
     let events = events.clone();
     let db = db.clone();
     let material = material.clone_parts();
@@ -1902,24 +1873,32 @@ async fn restart_discovery(
     if incognito || !enabled || port == 0 {
         if let Ok(mut guard) = live.inner.lock() {
             guard.nearby.clear();
+            guard.discovery_on = false;
         }
         return;
     }
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let events = events.clone();
     let device_id = material.device_id.clone();
+    if let Ok(mut guard) = live.inner.lock() {
+        guard.discovery_on = true;
+    }
+    let thread_live = live.clone();
     let _ = std::thread::Builder::new().name("lan-discovery".into()).spawn(move || {
         if let Err(err) = run_discovery(stop_rx, events, device_id, name, port) {
             eprintln!("discovery: {err}");
+            if let Ok(mut guard) = thread_live.inner.lock() {
+                guard.discovery_on = false;
+            }
         }
     });
     *discovery = Some(stop_tx);
 }
 
-const DISCOVERY_PORT: u16 = 41220;
+pub const DISCOVERY_PORT: u16 = 41220;
 const DISCOVERY_MAX_DEVICES: usize = 64;
 const DISCOVERY_NETS_REFRESH: Duration = Duration::from_secs(5);
-const DISCOVERY_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 168);
+pub const DISCOVERY_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 168);
 /// Multicast announces go out this often.
 const MULTICAST_EVERY: Duration = Duration::from_secs(3);
 /// Subnet broadcast reaches networks whose routers drop multicast, so it is sent less often.

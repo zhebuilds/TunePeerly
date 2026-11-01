@@ -1767,12 +1767,6 @@ body.resizing * {
   color: var(--bad);
 }
 
-.pill-row {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
 .count-badge {
   display: inline-grid;
   place-items: center;
@@ -3797,10 +3791,6 @@ button.device-name:hover {
   flex-wrap: wrap;
   gap: 6px;
   margin-top: 6px;
-}
-
-.chip.static {
-  cursor: default;
 }
 
 .panel h2 .panel-switch {

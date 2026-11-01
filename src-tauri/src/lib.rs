@@ -33,7 +33,7 @@ struct AppState {
     material: IdentityMaterial,
 }
 
-const NETWORK_KEYS: [&str; 8] = [
+const NETWORK_KEYS: [&str; 7] = [
     "discovery",
     "incognito",
     "relayHost",
@@ -41,7 +41,6 @@ const NETWORK_KEYS: [&str; 8] = [
     "relayDeviceId",
     "relayToken",
     "displayName",
-    "listenPort",
 ];
 
 fn online_ids(state: &AppState) -> Vec<String> {
@@ -72,8 +71,15 @@ fn bootstrap(state: State<'_, AppState>) -> AppResult<Value> {
         "tracks": catalog::library(&db, &online)?,
         "favoriteIds": db.favorite_content_ids()?,
         "listenPort": live.listen_port,
-        "portFallback": live.port_fallback,
         "localAddresses": local_addresses,
+        // Read-only network facts for Settings: the TCP port of this run and what discovery uses.
+        "network": {
+            "tcpPort": live.listen_port,
+            "discovery": live.discovery_on,
+            "udpPort": net::DISCOVERY_PORT,
+            "multicastGroup": net::DISCOVERY_GROUP.to_string(),
+            "addresses": local_addresses,
+        },
         "nearby": nearby,
         "links": live.links,
         "relay": live.relay,
@@ -364,17 +370,6 @@ fn set_track_exposure(state: State<'_, AppState>, local_file_id: String, expose:
 
 #[tauri::command(async)]
 fn update_setting(app: AppHandle, state: State<'_, AppState>, key: String, value: Value) -> AppResult<()> {
-    if key == "listenPort" {
-        let port = value.as_u64().unwrap_or(0);
-        if !(1024..=65535).contains(&port) {
-            return Err(AppError::Message("settings.portInvalid".into()));
-        }
-        let port = u16::try_from(port).unwrap_or_default();
-        let current = state.net.live.inner.lock().map(|live| live.listen_port).unwrap_or(0);
-        if port != current && std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_err() {
-            return Err(AppError::Message("settings.portBusy".into()));
-        }
-    }
     if key == "relayPort" && !value.as_u64().is_some_and(|port| (1..=65535).contains(&port)) {
         return Err(AppError::Message("settings.portInvalid".into()));
     }
