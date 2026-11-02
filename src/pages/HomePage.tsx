@@ -1,7 +1,7 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
-import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useSyncExternalStore, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { mirrorPosition, useApp } from "../app/model";
+import { useApp } from "../app/model";
 import { Card, Shelf } from "../components/Card";
 import { Cover, LikedCover } from "../components/Cover";
 import { Mascot } from "../components/Mascot";
@@ -131,18 +131,10 @@ function ContinueCard() {
   const time = useSyncExternalStore(clock.subscribe, clock.get);
   const { playing } = useSyncExternalStore(transport.subscribe, transport.get);
   const track = app.shown;
-  const mirror = app.following ? app.mirror : null;
-  const [now, setNow] = useState(() => performance.now());
-  useEffect(() => {
-    if (!mirror?.playing) return;
-    const timer = window.setInterval(() => setNow(performance.now()), 200);
-    return () => window.clearInterval(timer);
-  }, [mirror?.playing, mirror?.at]);
   if (!track) return null;
-  const followed = mirror ? mirrorPosition(mirror, now) : null;
-  const duration = mirror ? (mirror.duration > 0 ? mirror.duration : (track.durationMs ?? 0) / 1000) : time.duration || (track.durationMs ?? 0) / 1000;
-  const position = followed ?? time.position;
-  const live = mirror ? mirror.playing : playing;
+  const duration = time.duration || (track.durationMs ?? 0) / 1000;
+  const position = time.position;
+  const live = playing;
   const progress = duration > 0 ? Math.min(100, (position / duration) * 100) : 0;
   return (
     <section className="continue-card">
@@ -162,8 +154,8 @@ function ContinueCard() {
           </span>
         </div>
       </div>
-      <button type="button" className="play-fab" aria-label={live && !mirror ? t("player.pause") : t("player.play")} onClick={() => { if (!mirror) app.toggle(); }}>
-        {live && !mirror ? <Icons.pause /> : <Icons.play />}
+      <button type="button" className="play-fab" aria-label={live ? t("player.pause") : t("player.play")} onClick={app.toggle}>
+        {live ? <Icons.pause /> : <Icons.play />}
       </button>
     </section>
   );

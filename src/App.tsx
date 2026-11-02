@@ -1,6 +1,5 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { transport } from "./player/clock";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { setDropHandler } from "./app/drag";
@@ -12,6 +11,9 @@ import { Mascot } from "./components/Mascot";
 import { Banners, Overlays } from "./components/Overlays";
 import { PlayerBar } from "./components/PlayerBar";
 import { CloseGate, WindowControls } from "./components/WindowControls";
+import { MobileNav } from "./components/MobileNav";
+import { isAndroid } from "./lib/platform";
+import { closeTopPopover } from "./lib/back";
 import { QueuePanel } from "./components/QueuePanel";
 import { Sidebar, useSidebarWidth } from "./components/Sidebar";
 import { SEARCH_INPUT_ID, TopBar } from "./components/TopBar";
@@ -38,7 +40,7 @@ function Page({ route }: { route: Route }) {
     case "home":
       return <HomePage />;
     case "search":
-      return <SearchPage scope={route.id} />;
+      return <SearchPage />;
     case "artists":
     case "albums":
     case "folders":
@@ -73,12 +75,52 @@ function Shell() {
   const scroll = useRef<HTMLDivElement>(null);
   const [sidebar, setSidebar] = useSidebarWidth();
   const [dropping, setDropping] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
   const latest = useRef(app);
   latest.current = app;
 
   useEffect(() => {
     scroll.current?.scrollTo({ top: 0 });
+    setLibraryOpen(false);
   }, [app.route]);
+
+  // The Android back button: close what is open, then go back a page. False lets the app go to the background.
+  useEffect(() => {
+    if (!isAndroid) return;
+    const host = window as unknown as { __tpBack?: () => boolean };
+    host.__tpBack = () => {
+      const model = latest.current;
+      if (closeTopPopover()) return true;
+      if (model.dialog) {
+        model.setDialog(null);
+        return true;
+      }
+      if (model.menu) {
+        model.setMenu(null);
+        return true;
+      }
+      if (document.querySelector(".app.library-open")) {
+        setLibraryOpen(false);
+        return true;
+      }
+      if (model.queueOpen) {
+        model.setQueueOpen(false);
+        return true;
+      }
+      if (model.noticesOpen) {
+        model.setNoticesOpen(false);
+        return true;
+      }
+      if (model.navigation.canBack) {
+        model.back();
+        return true;
+      }
+      return false;
+    };
+    return () => {
+      delete host.__tpBack;
+    };
+  }, []);
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
@@ -87,21 +129,28 @@ function Shell() {
     void import("@tauri-apps/api/event").then(async ({ listen }) => {
       const unlisten = await listen<{ action: string }>("desktop-action", (event) => {
         const model = latest.current;
+        // The Android notification and lock screen drag the progress bar: "seek:<seconds>".
+        if (event.payload.action.startsWith("seek:")) {
+          const seconds = Number(event.payload.action.slice(5));
+          if (Number.isFinite(seconds)) model.seek(seconds);
+          return;
+        }
         switch (event.payload.action) {
+          // Media keys and the system controls steer the active device, here or elsewhere.
           case "toggle":
-            if (!model.following) model.toggle();
+            model.toggle();
             break;
           case "play":
-            if (!model.following && !transport.get().playing) model.toggle();
+            model.play();
             break;
           case "pause":
-            if (!model.following) model.engine.pause();
+            model.pause();
             break;
           case "next":
-            if (!model.following) model.next();
+            model.next();
             break;
           case "previous":
-            if (!model.following) model.previous();
+            model.previous();
             break;
           case "like":
             if (model.shown) void model.like(model.shown);
@@ -212,7 +261,7 @@ function Shell() {
         model.setVolume(model.volume - 0.05);
       } else if (!ctrl && !event.shiftKey && !onSlider && !onWidget && (event.key === "ArrowLeft" || event.key === "ArrowRight") && model.current) {
         event.preventDefault();
-        model.engine.skip(event.key === "ArrowRight" ? 5 : -5);
+        model.skip(event.key === "ArrowRight" ? 5 : -5);
       }
     };
     const onMouse = (event: MouseEvent) => {
@@ -250,7 +299,7 @@ function Shell() {
 
   return (
     <div
-      className={`app${app.queueOpen ? " queue-open" : ""}${app.noticesOpen ? " notices-open" : ""}`}
+      className={`app${app.queueOpen ? " queue-open" : ""}${app.noticesOpen ? " notices-open" : ""}${libraryOpen ? " library-open" : ""}`}
       onContextMenu={(event) => {
         if (!typing(event.target)) event.preventDefault();
       }}
@@ -282,8 +331,14 @@ function Shell() {
       {app.queueOpen && <QueuePanel />}
       {app.noticesOpen && <NoticePanel />}
       <PlayerBar />
-      <WindowControls />
-      <CloseGate />
+      {isAndroid ? (
+        <MobileNav libraryOpen={libraryOpen} onLibrary={setLibraryOpen} />
+      ) : (
+        <>
+          <WindowControls />
+          <CloseGate />
+        </>
+      )}
       <ContextMenu />
       <Tooltip />
       <Overlays dropping={dropping} />

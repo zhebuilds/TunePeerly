@@ -4,17 +4,24 @@
 //! Windows replaces the taskbar thumbnail with a media card (the whole cover) and shows the song on the lock screen.
 //! The optional corner bar is a second window that only sends commands back to the main one.
 //! It appears when the main window is minimized and/or hidden to the tray, as the settings say.
+//! Android and iOS have no tray, menus or second window, so those parts build only on desktop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
+#[cfg(desktop)]
 use tauri::menu::{Menu, MenuItem};
+#[cfg(desktop)]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+#[cfg(desktop)]
+use tauri::{WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WindowEvent};
 
 static ALLOW_CLOSE: AtomicBool = AtomicBool::new(false);
+#[cfg(desktop)]
 static TRAY_SHOW: Mutex<Option<MenuItem<tauri::Wry>>> = Mutex::new(None);
+#[cfg(desktop)]
 static TRAY_QUIT: Mutex<Option<MenuItem<tauri::Wry>>> = Mutex::new(None);
 
 /// Show the corner bar while the main window is minimized.
@@ -88,6 +95,7 @@ impl Default for DesktopTrack {
 }
 
 pub fn install(app: &AppHandle) {
+    #[cfg(desktop)]
     if let Ok(mini) = WebviewWindowBuilder::new(app, "mini", WebviewUrl::App("index.html".into()))
         .title("Now playing")
         .inner_size(400.0, 76.0)
@@ -114,6 +122,7 @@ pub fn install(app: &AppHandle) {
         });
     }
     install_close(app);
+    #[cfg(desktop)]
     install_tray(app);
     #[cfg(windows)]
     windows_media::attach(app);
@@ -133,6 +142,7 @@ fn install_close(app: &AppHandle) {
     });
 }
 
+#[cfg(desktop)]
 fn install_tray(app: &AppHandle) {
     let Ok(show_item) = MenuItem::with_id(app, "show", "Show", true, None::<&str>) else { return };
     let Ok(quit_item) = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>) else { return };
@@ -175,20 +185,21 @@ fn install_tray(app: &AppHandle) {
 }
 
 pub fn set_tray_tooltip(app: &AppHandle, name: &str) {
+    #[cfg(mobile)]
+    let _ = (app, name);
+    #[cfg(desktop)]
     if let Some(tray) = app.tray_by_id("main") {
         let _ = tray.set_tooltip(Some(name));
     }
 }
 
 pub fn set_tray_labels(show: &str, quit_label: &str) {
-    if let Ok(guard) = TRAY_SHOW.lock() {
-        if let Some(item) = guard.as_ref() {
-            let _ = item.set_text(show);
-        }
-    }
-    if let Ok(guard) = TRAY_QUIT.lock() {
-        if let Some(item) = guard.as_ref() {
-            let _ = item.set_text(quit_label);
+    #[cfg(mobile)]
+    let _ = (show, quit_label);
+    #[cfg(desktop)]
+    for (slot, text) in [(&TRAY_SHOW, show), (&TRAY_QUIT, quit_label)] {
+        if let Some(item) = slot.lock().ok().as_deref().and_then(Option::as_ref) {
+            let _ = item.set_text(text);
         }
     }
 }
@@ -205,6 +216,7 @@ pub fn hide_to_tray(app: &AppHandle) {
     refresh_mini(app);
 }
 
+#[cfg(desktop)]
 pub fn show_main(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else { return };
     let _ = window.unminimize();
@@ -218,6 +230,8 @@ pub fn update(app: &AppHandle, track: DesktopTrack) {
         *slot = track.clone();
     }
     let _ = app.emit_to("mini", "desktop-state", &track);
+    #[cfg(target_os = "android")]
+    crate::android::playback(&track);
     #[cfg(windows)]
     windows_media::publish(app, track);
 }
@@ -250,6 +264,7 @@ pub fn command(app: &AppHandle, action: &str) {
     match action {
         "restore" => {
             if let Some(main) = app.get_webview_window("main") {
+                #[cfg(desktop)]
                 let _ = main.unminimize();
                 let _ = main.show();
                 let _ = main.set_focus();
@@ -332,7 +347,7 @@ mod windows_media {
                 },
                 WindowsAndMessaging::{
                     CreateIconIndirect, GetClientRect, GetSystemMetrics, GetWindowPlacement, GetWindowRect, IsIconic,
-                    IsWindowVisible, RegisterWindowMessageW, ICONINFO, SM_CXSMICON, WINDOWPLACEMENT, WINDOWPOS, WM_COMMAND,
+                    IsWindowVisible, PostMessageW, RegisterWindowMessageW, ICONINFO, SM_CXSMICON, WINDOWPLACEMENT, WINDOWPOS, WM_COMMAND,
                     WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING,
                 },
             },
@@ -443,7 +458,9 @@ mod windows_media {
 
     fn apply(app: &AppHandle, track: &DesktopTrack) {
         SHELL.with(|slot| {
-            let mut guard = slot.borrow_mut();
+            // The taskbar calls below can let other window messages run first. If one of them is using the shell
+            // right now, skip this update; the next one comes within a second.
+            let Ok(mut guard) = slot.try_borrow_mut() else { return };
             let Some(shell) = guard.as_mut() else { return };
             let enabled = !track.title.is_empty();
             let signature = format!("{}|{}|{}|{}", track.title, track.artist, track.album, track.cover_path.as_deref().unwrap_or(""));
@@ -539,10 +556,15 @@ mod windows_media {
     /// and tells the window with this message once the button is back. Add them again from the current song.
     static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
-    fn taskbar_button_created(hwnd: HWND) {
+    fn taskbar_button_created(hwnd: HWND, msg: u32) {
         unsafe { mark_iconic(hwnd) };
         SHELL.with(|slot| {
-            let mut guard = slot.borrow_mut();
+            // This message can arrive while apply() is inside a taskbar call and still holds the shell.
+            // Borrowing again would panic, so ask for it again once the current work is done.
+            let Ok(mut guard) = slot.try_borrow_mut() else {
+                let _ = unsafe { PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0)) };
+                return;
+            };
             let Some(shell) = guard.as_mut() else { return };
             shell.buttons = false;
             refresh_buttons(shell, &super::current());
@@ -588,7 +610,7 @@ mod windows_media {
                 LRESULT(0)
             }
             _ if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) => {
-                taskbar_button_created(hwnd);
+                taskbar_button_created(hwnd, msg);
                 unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
             }
             WM_SYSCOMMAND => {
@@ -880,7 +902,11 @@ mod windows_media {
 
     fn remember_window(hwnd: HWND) {
         if let Some(snapshot) = capture_window(hwnd) {
-            SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(snapshot));
+            SNAPSHOT.with(|slot| {
+                if let Ok(mut slot) = slot.try_borrow_mut() {
+                    *slot = Some(snapshot);
+                }
+            });
         }
     }
 

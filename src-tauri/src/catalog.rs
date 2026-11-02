@@ -19,7 +19,6 @@ struct LocalRow {
     folder: String,
     file_name: String,
     added_at: String,
-    exposed: bool,
     access_status: String,
     metadata_status: String,
     playback_status: String,
@@ -35,8 +34,17 @@ struct LocalRow {
 pub fn library(db: &Db, online: &[String]) -> AppResult<Value> {
     let local = load_local(db)?;
     let holdings = load_holdings(db)?;
-    let remote_covers = load_remote_covers(db)?;
+    // One listing of the picture cache instead of a disk check per song.
+    let cached = CoverCache::read(db);
+    let remote_covers = load_remote_covers(db, &cached)?;
     let online: HashSet<&str> = online.iter().map(String::as_str).collect();
+    // Grouped once, so a large library is not scanned again for every song.
+    let mut holding_groups: HashMap<&str, Vec<&HoldingRow>> = HashMap::new();
+    for row in &holdings {
+        holding_groups.entry(row.content_id.as_str()).or_default().push(row);
+    }
+    let unplayable_content = db.unplayable_content_ids()?;
+    let favorite_content = db.favorite_content_set()?;
     let mut tracks = Vec::new();
     let mut seen_content = HashSet::new();
 
@@ -46,18 +54,19 @@ pub fn library(db: &Db, online: &[String]) -> AppResult<Value> {
             by_content.entry(content_id.clone()).or_default().push(row);
         } else {
             let badge = if row.access_status == "available" { "local" } else { "unavailable" };
-            tracks.push(stub_from_local(db, row, &[], badge));
+            tracks.push(stub_from_local(&cached, row, &[], badge));
         }
     }
     for (content_id, rows) in &by_content {
         seen_content.insert(content_id.clone());
-        let holders = holders_of(&holdings, content_id, &online);
+        let holders = holders_of(&holding_groups, content_id, &online);
         let readable = rows.iter().find(|row| row.access_status == "available" && !row.video);
-        let any_video = rows.iter().all(|row| row.video);
+        // Every local copy is a video file: it is never offered as audio from a paired device either.
+        let all_video = rows.iter().all(|row| row.video);
         let unplayable = rows.iter().any(|row| row.unplayable);
-        let badge = if readable.is_some() && !any_video {
+        let badge = if readable.is_some() && !all_video {
             "local"
-        } else if !unplayable && !holders.is_empty() && !any_video {
+        } else if !unplayable && !holders.is_empty() && !all_video {
             "remote"
         } else if readable.is_some() {
             "local"
@@ -65,7 +74,7 @@ pub fn library(db: &Db, online: &[String]) -> AppResult<Value> {
             "unavailable"
         };
         let source = readable.copied().unwrap_or(rows[0]);
-        let mut stub = stub_from_local(db, source, &holders, badge);
+        let mut stub = stub_from_local(&cached, source, &holders, badge);
         if stub.cover_url.is_none() {
             stub.cover_url = remote_covers.get(content_id).cloned();
         }
@@ -85,16 +94,9 @@ pub fn library(db: &Db, online: &[String]) -> AppResult<Value> {
         if seen_content.contains(&holding.content_id) || !emitted_remote.insert(holding.content_id.clone()) {
             continue;
         }
-        let group: Vec<&HoldingRow> = holdings
-            .iter()
-            .filter(|row| row.content_id == holding.content_id)
-            .collect();
-        let holders: Vec<String> = group
-            .iter()
-            .filter(|row| online.contains(row.device_id.as_str()))
-            .map(|row| row.device_id.clone())
-            .collect();
-        let unplayable = content_unplayable(db, &holding.content_id)?;
+        let group: &[&HoldingRow] = holding_groups.get(holding.content_id.as_str()).map(Vec::as_slice).unwrap_or_default();
+        let holders = holders_of(&holding_groups, &holding.content_id, &online);
+        let unplayable = unplayable_content.contains(&holding.content_id);
         let badge = if !unplayable && !holders.is_empty() { "remote" } else { "unavailable" };
         tracks.push(TrackStub {
             local_file_id: None,
@@ -107,8 +109,7 @@ pub fn library(db: &Db, online: &[String]) -> AppResult<Value> {
             folder: String::new(),
             file_name: String::new(),
             added_at: String::new(),
-            favorite: db.is_favorite(Some(&holding.content_id), None)?,
-            exposed: false,
+            favorite: favorite_content.contains(&holding.content_id),
             badge: badge.into(),
             access_status: "missing".into(),
             metadata_status: "ready".into(),
@@ -140,7 +141,7 @@ fn order_position(track: &TrackStub, positions: &HashMap<String, i64>) -> Option
         .or_else(|| track.local_file_id.as_ref().and_then(|id| positions.get(id).copied()))
 }
 
-fn stub_from_local(db: &Db, row: &LocalRow, holders: &[String], badge: &str) -> TrackStub {
+fn stub_from_local(cached: &CoverCache, row: &LocalRow, holders: &[String], badge: &str) -> TrackStub {
     let reason = if row.video {
         Some("playback.video".into())
     } else if row.access_status == "missing" {
@@ -164,14 +165,13 @@ fn stub_from_local(db: &Db, row: &LocalRow, holders: &[String], badge: &str) -> 
         file_name: row.file_name.clone(),
         added_at: row.added_at.clone(),
         favorite: row.favorite,
-        exposed: row.exposed,
         badge: badge.into(),
         access_status: row.access_status.clone(),
         metadata_status: row.metadata_status.clone(),
         playback_status: row.playback_status.clone(),
         reason_key: reason,
         video: row.video,
-        cover_url: cover_in_cache(db, &row.local_file_id, row.cover_path.as_deref()),
+        cover_url: cached.local_cover(&row.local_file_id, row.cover_path.as_deref()),
         absolute_path: Some(row.absolute_path.clone()),
         holder_ids: holders.to_vec(),
         playable: badge == "local" && !row.video && row.access_status == "available",
@@ -179,32 +179,51 @@ fn stub_from_local(db: &Db, row: &LocalRow, holders: &[String], badge: &str) -> 
     }
 }
 
-/// Only a file already in this install's cover cache is shown. Other stored paths are ignored.
-fn cover_in_cache(db: &Db, local_file_id: &str, stored: Option<&str>) -> Option<String> {
-    let dest = db.cache_dir.join("covers").join(format!("{local_file_id}.jpg"));
-    if dest.is_file() {
-        return Some(dest.to_string_lossy().into_owned());
+/// File names in this install's picture cache, read once per listing.
+struct CoverCache {
+    dir: std::path::PathBuf,
+    names: HashSet<std::ffi::OsString>,
+}
+
+impl CoverCache {
+    fn read(db: &Db) -> Self {
+        let dir = db.cache_dir.join("covers");
+        let names = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                    .map(|entry| entry.file_name())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { dir, names }
     }
-    let stored = stored?;
-    let path = std::path::Path::new(stored);
-    let covers = db.cache_dir.join("covers");
-    if path.is_file() && path.starts_with(&covers) {
-        Some(stored.to_string())
-    } else {
-        None
+
+    /// True for a file directly inside the cache folder.
+    fn holds(&self, path: &std::path::Path) -> bool {
+        path.parent() == Some(self.dir.as_path()) && path.file_name().is_some_and(|name| self.names.contains(name))
+    }
+
+    /// Only a file already in this install's cover cache is shown. Other stored paths are ignored.
+    fn local_cover(&self, local_file_id: &str, stored: Option<&str>) -> Option<String> {
+        let dest = self.dir.join(format!("{local_file_id}.jpg"));
+        if self.holds(&dest) {
+            return Some(dest.to_string_lossy().into_owned());
+        }
+        let stored = stored?;
+        self.holds(std::path::Path::new(stored)).then(|| stored.to_string())
     }
 }
 
-fn holders_of(holdings: &[HoldingRow], content_id: &str, online: &HashSet<&str>) -> Vec<String> {
-    holdings
-        .iter()
-        .filter(|row| row.content_id == content_id && online.contains(row.device_id.as_str()))
+fn holders_of(groups: &HashMap<&str, Vec<&HoldingRow>>, content_id: &str, online: &HashSet<&str>) -> Vec<String> {
+    groups
+        .get(content_id)
+        .into_iter()
+        .flatten()
+        .filter(|row| online.contains(row.device_id.as_str()))
         .map(|row| row.device_id.clone())
         .collect()
-}
-
-fn content_unplayable(db: &Db, content_id: &str) -> AppResult<bool> {
-    db.content_unplayable(content_id)
 }
 
 struct HoldingRow {
@@ -239,7 +258,7 @@ fn load_holdings(db: &Db) -> AppResult<Vec<HoldingRow>> {
 fn load_local(db: &Db) -> AppResult<Vec<LocalRow>> {
     let mut stmt = db.conn.prepare(
         "SELECT f.local_file_id, f.content_id, f.title, f.artist, f.album, f.track_number, f.duration_ms,
-                f.absolute_path, f.file_name, f.added_at, f.exposed, f.access_status, f.metadata_status,
+                f.absolute_path, f.file_name, f.added_at, f.access_status, f.metadata_status,
                 f.playback_status, f.playback_reason, f.access_reason, f.video, f.cover_path,
                 EXISTS(SELECT 1 FROM favorites fav WHERE fav.local_file_id = f.local_file_id OR (f.content_id IS NOT NULL AND fav.content_id = f.content_id)),
                 COALESCE((SELECT c.unplayable FROM content_items c WHERE c.content_id = f.content_id), 0)
@@ -262,17 +281,16 @@ fn load_local(db: &Db) -> AppResult<Vec<LocalRow>> {
             absolute_path: absolute,
             file_name: row.get(8)?,
             added_at: row.get(9)?,
-            exposed: row.get::<_, i64>(10)? != 0,
-            access_status: row.get(11)?,
-            metadata_status: row.get(12)?,
-            playback_status: row.get(13)?,
-            playback_reason: row.get(14)?,
-            access_reason: row.get(15)?,
-            video: row.get::<_, i64>(16)? != 0,
-            cover_path: row.get(17)?,
-            favorite: row.get::<_, i64>(18)? != 0,
+            access_status: row.get(10)?,
+            metadata_status: row.get(11)?,
+            playback_status: row.get(12)?,
+            playback_reason: row.get(13)?,
+            access_reason: row.get(14)?,
+            video: row.get::<_, i64>(15)? != 0,
+            cover_path: row.get(16)?,
+            favorite: row.get::<_, i64>(17)? != 0,
             folder,
-            unplayable: row.get::<_, i64>(19)? != 0,
+            unplayable: row.get::<_, i64>(18)? != 0,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -289,7 +307,7 @@ pub fn local_publishable(db: &Db) -> AppResult<Vec<crate::db::HoldingInput>> {
                 CASE WHEN metadata_status = 'failed' THEN '' ELSE album END,
                 track_number, duration_ms, codec, file_name
          FROM local_files
-         WHERE exposed = 1 AND access_status = 'available' AND content_id IS NOT NULL AND video = 0",
+         WHERE access_status = 'available' AND content_id IS NOT NULL AND video = 0",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(crate::db::HoldingInput {
@@ -320,7 +338,7 @@ fn blank_if_filename(title: String, file_name: String) -> String {
 pub fn readable_paths(db: &Db, content_id: &str) -> AppResult<Vec<(String, String)>> {
     let mut stmt = db.conn.prepare(
         "SELECT local_file_id, absolute_path FROM local_files
-         WHERE content_id = ?1 AND exposed = 1 AND access_status = 'available'",
+         WHERE content_id = ?1 AND access_status = 'available'",
     )?;
     let rows = stmt.query_map(params![content_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -341,7 +359,11 @@ pub fn search(db: &Db, query: &str, online: &[String]) -> AppResult<Value> {
     let all = library(db, online)?;
     let text = |track: &Value, key: &str| track.get(key).and_then(|value| value.as_str()).unwrap_or("").to_lowercase();
     let mut out = Vec::new();
-    for mut track in all.as_array().cloned().unwrap_or_default() {
+    let all = match all {
+        Value::Array(items) => items,
+        _ => Vec::new(),
+    };
+    for mut track in all {
         if !show_unavailable && track.get("badge").and_then(|value| value.as_str()) == Some("unavailable") {
             continue;
         }
@@ -369,11 +391,11 @@ pub fn search(db: &Db, query: &str, online: &[String]) -> AppResult<Value> {
     Ok(json!(out))
 }
 
-/// Cover pictures of exposed, readable local copies of this content.
+/// Cover pictures of readable local copies of this content.
 pub fn cover_paths(db: &Db, content_id: &str) -> AppResult<Vec<(String, String)>> {
     let mut stmt = db.conn.prepare(
         "SELECT local_file_id, cover_path FROM local_files
-         WHERE content_id = ?1 AND exposed = 1 AND access_status = 'available' AND cover_path IS NOT NULL",
+         WHERE content_id = ?1 AND access_status = 'available' AND cover_path IS NOT NULL",
     )?;
     let rows = stmt.query_map(params![content_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -383,7 +405,7 @@ pub fn cover_paths(db: &Db, content_id: &str) -> AppResult<Vec<(String, String)>
 pub fn cover_pending(db: &Db, content_id: &str) -> bool {
     db.conn
         .query_row(
-            "SELECT COUNT(*) FROM local_files WHERE content_id = ?1 AND exposed = 1 AND cover_checked = 0",
+            "SELECT COUNT(*) FROM local_files WHERE content_id = ?1 AND cover_checked = 0",
             params![content_id],
             |row| row.get::<_, i64>(0),
         )
@@ -413,15 +435,13 @@ pub fn save_remote_cover(db: &Db, content_id: &str, path: Option<&str>) -> AppRe
     Ok(())
 }
 
-fn load_remote_covers(db: &Db) -> AppResult<HashMap<String, String>> {
-    let covers = db.cache_dir.join("covers");
+fn load_remote_covers(db: &Db, cached: &CoverCache) -> AppResult<HashMap<String, String>> {
     let mut stmt = db.conn.prepare("SELECT content_id, path FROM remote_covers WHERE path IS NOT NULL")?;
     let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
     let mut map = HashMap::new();
     for row in rows {
         let (id, path) = row?;
-        let file = std::path::Path::new(&path);
-        if file.is_file() && file.starts_with(&covers) {
+        if cached.holds(std::path::Path::new(&path)) {
             map.insert(id, path);
         }
     }

@@ -65,7 +65,6 @@ if (!empty) {
           fileName: `${String(i + 1).padStart(2, "0")} ${title}.flac`,
           addedAt: new Date(Date.now() - n * 36e5 * 7).toISOString(),
           favorite: n % 4 === 0,
-          exposed: n % 3 === 0,
           badge: !local ? (n % 18 === 0 ? "unavailable" : "remote") : missing ? "unavailable" : "local",
           accessStatus: local ? (missing ? "missing" : "available") : "missing",
           metadataStatus: "ready",
@@ -87,9 +86,9 @@ const key = (track: Track) => track.contentId ?? track.localFileId ?? "";
 const playlists: Playlist[] = empty
   ? []
   : [
-      { id: "p1", name: "Late Night Drive", exposure: "follow", count: 0 },
-      { id: "p2", name: "Focus", exposure: "expose", count: 0 },
-      { id: "p3", name: "周末早晨", exposure: "hide", count: 0 },
+      { id: "p1", name: "Late Night Drive", count: 0 },
+      { id: "p2", name: "Focus", count: 0 },
+      { id: "p3", name: "周末早晨", count: 0 },
     ];
 const members: Record<string, MemberRef[]> = {
   p1: tracks.filter((_, at) => at % 3 === 0).slice(0, 14).map((track) => ({ contentId: track.contentId, localFileId: track.localFileId })),
@@ -122,10 +121,6 @@ const settings: Record<string, unknown> = {
   showUnavailable: true,
   historyCap: 100,
   incognito: false,
-  syncSources: { favorites: "dev-studio" },
-  syncBlocks: {},
-  exposeDefault: "hide",
-  positionSyncDevice: "",
   downloadFolder: "",
   volume: 0.8,
   relayHost: "",
@@ -133,13 +128,7 @@ const settings: Record<string, unknown> = {
   relayDeviceId: "",
   relayToken: "",
   discovery: true,
-  syncEnabled: true,
-  audioShare: true,
-  autoSend: {},
   displayName: "Desk PC",
-  listenPort: 22000,
-  manualAddresses: ["192.168.1.24:22000"],
-  dirty: {},
 };
 
 const state = {
@@ -147,8 +136,9 @@ const state = {
   language: params.get("lang") === "zh" ? "zh" : "en",
   player: {} as Record<string, unknown>,
   history: tracks.slice(0, 9).filter((track) => track.playable).map(key),
-  pending: params.has("conflict") ? [{ feature: "favorites", source: "dev-studio" }] : [],
-  offer: params.has("offer") ? { deviceId: "dev-new", name: "Living Room", safetyNumber: "12345 67890 24680 13579 11223 34455 66778 89900", role: "incoming" as const } : null,
+  offer: params.has("offer")
+    ? { deviceId: "dev-new", name: "Living Room", role: (params.get("offer") === "enter" ? "outgoing" : "incoming") as "incoming" | "outgoing", code: params.get("offer") === "enter" ? null : "042137", expiresAt: Date.now() + 90_000, status: "", triesLeft: 3, lockedUntil: null, trust: "full" }
+    : (null as Bootstrap["offer"]),
   blocks: [] as Bootstrap["blocks"],
   notices: [
     { id: 2, at: "2026-10-18T14:02:00.000Z", kind: "connected", deviceId: "dev-studio", name: "Studio PC", detail: "lan", read: false, pinned: false },
@@ -156,34 +146,10 @@ const state = {
   ] as NonNullable<Bootstrap["notices"]>,
   failures: {} as Bootstrap["failures"],
   download: null as Bootstrap["download"],
-  manual: null as string | null,
 };
 
 function emit(event: string, payload: unknown = {}) {
   for (const id of listeners.get(event) ?? []) callbacks.get(id)?.({ event, id, payload });
-}
-
-let playbackPreview = 0;
-function previewPlayback(deviceId: string) {
-  window.clearInterval(playbackPreview);
-  if (!deviceId) return;
-  const song = tracks.find((track) => track.playable);
-  if (!song) return;
-  const started = Date.now();
-  const send = () => {
-    emit("playback-mirror", {
-      deviceId,
-      contentId: song.contentId,
-      seconds: 20 + (Date.now() - started) / 1000,
-      playing: true,
-      duration: (song.durationMs ?? 180000) / 1000,
-      title: song.title,
-      artist: song.artist,
-      album: song.album,
-    });
-  };
-  send();
-  playbackPreview = window.setInterval(send, 1000);
 }
 
 const audio = new Map<string, string>();
@@ -249,20 +215,18 @@ function bootstrap(): Bootstrap {
     deviceId: "dev-self",
     certId: "MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD",
     deviceName: String(settings.displayName),
-    pairingText: "DMP1:eyJpZCI6IkRlc2sgUEMiLCJrZXkiOiJCYXNlNjRJZGVudGl0eUtleUJ5dGVzRm9yUGFpcmluZyIsImNlcnQiOiJNSUlCZFRDQ0FSdWdBd0lCQWdJVSJ9",
     settings: structuredClone(settings),
     theme: state.theme,
     language: state.language,
-    grants: empty ? [] : [{ id: 1, kind: "directory", path: "D:\\Music", exposure: "follow" }, { id: 2, kind: "file", path: "C:\\Users\\me\\Downloads\\single.mp3", exposure: "hide" }],
+    grants: empty ? [] : [{ id: 1, kind: "directory", path: "D:\\Music" }, { id: 2, kind: "file", path: "C:\\Users\\me\\Downloads\\single.mp3" }],
     playlists: structuredClone(playlists),
     player: structuredClone(state.player),
     history: [...state.history],
-    pending: structuredClone(state.pending) as Bootstrap["pending"],
     tracks: orderedLibrary(),
     favoriteIds: orderedLibrary().map((track) => track.contentId).filter((id): id is string => Boolean(id && tracks.find((item) => item.contentId === id)?.favorite)),
-    listenPort: params.has("portbusy") ? 22111 : 22000,
-    portFallback: params.has("portbusy") ? 22000 : null,
+    listenPort: 49731,
     localAddresses: ["192.168.1.20", "10.0.0.8"],
+    network: { tcpPort: 49731, discovery: true, udpPort: 41220, multicastGroup: "224.0.0.168", addresses: ["192.168.1.20", "10.0.0.8"] },
     nearby: empty ? [] : [{ deviceId: "dev-living", name: "Living Room", host: "192.168.1.31", hosts: ["192.168.1.31", "10.0.0.31"], port: 22000 }],
     links: structuredClone(links),
     relay: "",
@@ -270,7 +234,6 @@ function bootstrap(): Bootstrap {
     downloadHistory: [],
     offer: state.offer,
     download: state.download,
-    manual: state.manual,
     failures: state.failures,
     blocks: state.blocks,
     notices: state.notices,
@@ -349,7 +312,7 @@ async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<
       const name = String(args.name).trim();
       if (!name) throw "playlist.nameEmpty";
       const id = `p${Date.now()}`;
-      playlists.push({ id, name, exposure: "follow", count: 0 });
+      playlists.push({ id, name, count: 0 });
       members[id] = [];
       return id;
     }
@@ -384,21 +347,15 @@ async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<
       if (args.key === "theme") state.theme = String(args.value);
       else if (args.key === "language") state.language = String(args.value);
       else settings[String(args.key)] = args.value;
-      if (args.key === "positionSyncDevice") previewPlayback(String(args.value ?? ""));
       return null;
-    case "set_exposure": {
-      const playlist = playlists.find((item) => item.id === args.id);
-      if (playlist) playlist.exposure = args.value as Playlist["exposure"];
-      return null;
-    }
-    case "set_track_exposure": {
-      const track = tracks.find((item) => item.localFileId === args.localFileId);
-      if (track) track.exposed = Boolean(args.expose);
-      return null;
-    }
     case "network_command": {
       const action = String(args.action);
-      if (action === "confirm" || action === "reject") state.offer = null;
+      if (action === "reject") state.offer = null;
+      if (action === "confirm" && state.offer) {
+        // The mock pairs on 042137 and treats every other code as wrong.
+        const code = (args.payload as { code?: string }).code;
+        state.offer = state.offer.role === "outgoing" && code !== "042137" ? { ...state.offer, status: "wrong" } : null;
+      }
       if (action === "notice" || action === "clear-notices") {
         const payload = (args.payload ?? {}) as { action?: string; id?: number; ids?: number[] };
         const op = action === "clear-notices" ? "clear-all" : payload.action;
@@ -412,19 +369,16 @@ async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<
         if (op === "clear-unpinned") state.notices = state.notices?.filter((item) => item.pinned);
         if (op === "clear-all") state.notices = [];
       }
-      if (action === "resolve") state.pending = state.pending.filter((item) => item.feature !== (args.payload as { feature: string }).feature);
-      if (action === "paste") state.manual = String(args.payload).startsWith("DMP1:") ? null : "badText";
-      if (action === "manual") {
-        state.manual = "dialing";
-        setTimeout(() => {
-          state.manual = "failed";
-          emit("network-updated");
-        }, 1200);
+      if (action === "view-history") {
+        const deviceId = String((args.payload as { deviceId?: string }).deviceId ?? "");
+        const entries = tracks.slice(3, 12).filter((track) => track.contentId).map((track, index) => ({ contentId: String(track.contentId), at: new Date(Date.now() - index * 600_000).toISOString() }));
+        setTimeout(() => emit("remote-history", { deviceId, entries }), 300);
+        return null;
       }
       if (action === "download") {
-        state.download = { contentId: String(args.payload), state: "started", detail: "" };
+        state.download = { seq: Date.now(), contentId: String(args.payload), state: "started", detail: "" };
         setTimeout(() => {
-          state.download = { contentId: String(args.payload), state: "need-folder", detail: "" };
+          state.download = { seq: Date.now(), contentId: String(args.payload), state: "need-folder", detail: "" };
           emit("network-updated");
         }, 900);
       }
@@ -441,7 +395,6 @@ async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<
     case "remove_grant":
     case "playback_result":
     case "remote_failure":
-    case "expose_members":
     case "reveal_path":
     case "move_membership":
     case "show_in_folder":

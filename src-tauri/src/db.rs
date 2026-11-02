@@ -9,13 +9,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::dbkey::{self, KEY_LEN};
 use crate::error::{AppError, AppResult};
-use crate::sync_logic::{merge_history, HistoryEntry, MemberRef};
+use crate::sync_logic::{HistoryEntry, MemberRef};
 
-pub const FEATURES: [&str; 3] = [
+/// What Send and Override copy between devices. Recently Played has its own Refresh.
+pub const FEATURES: [&str; 2] = [
     "favorites",
     "appearance",
-    "history",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,7 +33,6 @@ pub struct TrackStub {
     pub file_name: String,
     pub added_at: String,
     pub favorite: bool,
-    pub exposed: bool,
     pub badge: String,
     pub access_status: String,
     pub metadata_status: String,
@@ -52,7 +52,6 @@ pub struct GrantRow {
     pub id: i64,
     pub kind: String,
     pub path: String,
-    pub exposure: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +59,6 @@ pub struct GrantRow {
 pub struct PlaylistRow {
     pub id: String,
     pub name: String,
-    pub exposure: String,
     pub count: i64,
 }
 
@@ -70,13 +68,67 @@ pub struct Db {
     pub cache_dir: PathBuf,
 }
 
+/// The library database, encrypted with the key in `db.key` beside it.
+/// A database that key cannot open (the key file lost, or sealed under another Windows account) is
+/// renamed aside with its key file and a new library starts, so the app still opens and the old
+/// file stays recoverable by whoever has the right key. On Android a key that cannot be read stops the
+/// start instead, because the Keystore can fail for a moment and the library must not be replaced then.
+fn open_encrypted(database: &Path) -> AppResult<Connection> {
+    let key_file = database.with_file_name(dbkey::KEY_NAME);
+    let key = match dbkey::load_or_create(&key_file) {
+        Ok(key) => key,
+        // Android: a Keystore error can be passing. Failing to start keeps the library and the device
+        // identity (and with it every pairing); moving them aside would lose both. Windows keeps its
+        // documented behaviour: a key sealed under another account starts a new library.
+        Err(err) if database.exists() && !cfg!(target_os = "android") => {
+            set_aside(database, &key_file, &err.to_string())?;
+            dbkey::load_or_create(&key_file)?
+        }
+        Err(err) => return Err(err),
+    };
+    match unlock(database, &key) {
+        Err(AppError::Sql(err)) if err.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase) => {
+            set_aside(database, &key_file, &err.to_string())?;
+            unlock(database, &dbkey::load_or_create(&key_file)?)
+        }
+        other => other,
+    }
+}
+
+fn unlock(database: &Path, key: &[u8; KEY_LEN]) -> AppResult<Connection> {
+    // A raw 256-bit key in SQLCipher's `x'…'` form skips its passphrase KDF; the key is random already.
+    let key = format!("x'{}'", data_encoding::HEXUPPER.encode(key));
+    let conn = Connection::open(database)?;
+    conn.pragma_update(None, "key", &key)?;
+    // A wrong key only shows on the first read.
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
+    Ok(conn)
+}
+
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn set_aside(database: &Path, key_file: &Path, reason: &str) -> AppResult<()> {
+    let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+    eprintln!("database {} cannot be opened ({reason}); starting a new library and keeping the old one beside it", database.display());
+    for path in [database.to_path_buf(), beside(database, "-wal"), beside(database, "-shm"), key_file.to_path_buf()] {
+        if path.exists() {
+            std::fs::rename(&path, beside(&path, &format!(".unreadable-{stamp}")))?;
+        }
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(database: &Path, app_dir: PathBuf, cache_dir: PathBuf) -> AppResult<Self> {
         if let Some(parent) = database.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::create_dir_all(cache_dir.join("covers"))?;
-        let conn = Connection::open(database)?;
+        let conn = open_encrypted(database)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -85,41 +137,14 @@ impl Db {
             app_dir,
             cache_dir,
         };
-        db.migrate()?;
+        db.create_schema()?;
         db.seed()?;
         db.queue_missing_covers()?;
         Ok(db)
     }
 
-    fn migrate(&self) -> AppResult<()> {
+    fn create_schema(&self) -> AppResult<()> {
         self.conn.execute_batch(SCHEMA)?;
-        self.add_column_if_missing("local_files", "cover_checked", "INTEGER NOT NULL DEFAULT 0")?;
-        // Time and size of the `.lrc` next to the song, so a lyrics file added later is noticed.
-        self.add_column_if_missing("local_files", "lyrics_stamp", "TEXT")?;
-        self.add_column_if_missing("peers", "trust", "TEXT NOT NULL DEFAULT 'full'")?;
-        self.add_column_if_missing("notices", "read", "INTEGER NOT NULL DEFAULT 1")?;
-        self.add_column_if_missing("notices", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
-        // Tables and switches left behind when sync revisions, the mailbox, and the old on/off toggles were removed.
-        self.conn.execute_batch(
-            "DROP TABLE IF EXISTS mailbox_acks;
-             DROP TABLE IF EXISTS mailbox;
-             DROP TABLE IF EXISTS applied_ops;
-             DROP TABLE IF EXISTS snapshots;
-             DROP TABLE IF EXISTS feature_revisions;
-             DELETE FROM device_settings WHERE key IN ('historySyncMode', 'syncEnabled', 'audioShare', 'positionSync');",
-        )?;
-        Ok(())
-    }
-
-    fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> AppResult<()> {
-        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let names = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?;
-        if !names.iter().any(|name| name == column) {
-            self.conn
-                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))?;
-        }
         Ok(())
     }
 
@@ -138,48 +163,26 @@ impl Db {
                 params![key, value],
             )?;
         }
-        self.drop_queue_sync()?;
         let name = self.setting_string("displayName")?;
         if name.is_empty() {
             let host = whoami::fallible::hostname().unwrap_or_else(|_| "This computer".into());
             self.set_device_setting("displayName", json!(host))?;
         }
-        let applied = self
-            .conn
-            .query_row(
-                "SELECT value FROM device_settings WHERE key = 'darkDefaultApplied'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .unwrap_or_default();
-        if applied != "true" {
-            if self.synced("theme")?.is_empty() || self.synced("theme")? == "light" {
-                self.set_synced("theme", "dark")?;
-            }
-            self.set_device_setting("darkDefaultApplied", json!(true))?;
-        }
         Ok(())
     }
 
-    /// The play queue stays on this computer. Drop leftovers from when it was synced.
-    fn drop_queue_sync(&self) -> AppResult<()> {
-        for key in ["dirty", "pendingSnapshots", "syncSources", "syncBlocks"] {
-            let mut map = self.setting_json(key)?;
-            let Some(object) = map.as_object_mut() else { continue };
-            let mut changed = object.remove("queue").is_some();
-            if key == "syncBlocks" {
-                for value in object.values_mut() {
-                    if value.as_object_mut().is_some_and(|flags| flags.remove("timestamp").is_some()) {
-                        changed = true;
-                    }
-                }
-            }
-            if changed {
-                self.set_device_setting(key, map)?;
-            }
+    /// Uses `name` (the phone's own name on Android) when this device has no real name yet: none, or
+    /// the "localhost" an Android phone reports as its host name. A name the user chose stays.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn adopt_device_name(&self, name: &str) -> AppResult<bool> {
+        let name = name.trim();
+        let saved = self.setting_string("displayName")?;
+        let placeholder = saved.trim().is_empty() || saved.trim().eq_ignore_ascii_case("localhost");
+        if name.is_empty() || !placeholder || name.eq_ignore_ascii_case("localhost") {
+            return Ok(false);
         }
-        Ok(())
+        self.set_device_setting("displayName", json!(name))?;
+        Ok(true)
     }
 
     /// Whether the corner bar shows when the window is minimized, and when it is hidden in the tray.
@@ -261,20 +264,20 @@ impl Db {
         Ok(Value::Object(out))
     }
 
-    pub fn signal_blob(&self, key: &str) -> AppResult<Option<Vec<u8>>> {
+    pub fn identity_blob(&self, key: &str) -> AppResult<Option<Vec<u8>>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT value FROM signal_state WHERE key = ?1",
+                "SELECT value FROM device_identity WHERE key = ?1",
                 params![key],
                 |row| row.get(0),
             )
             .optional()?)
     }
 
-    pub fn set_signal_blob(&self, key: &str, value: &[u8]) -> AppResult<()> {
+    pub fn set_identity_blob(&self, key: &str, value: &[u8]) -> AppResult<()> {
         self.conn.execute(
-            "INSERT INTO signal_state(key, value) VALUES(?1, ?2)
+            "INSERT INTO device_identity(key, value) VALUES(?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
@@ -284,21 +287,40 @@ impl Db {
     pub fn grants(&self) -> AppResult<Vec<GrantRow>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, kind, path, exposure FROM grants ORDER BY path")?;
+            .prepare("SELECT id, kind, path FROM grants ORDER BY path")?;
         let rows = stmt.query_map([], |row| {
             Ok(GrantRow {
                 id: row.get(0)?,
                 kind: row.get(1)?,
                 path: row.get(2)?,
-                exposure: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn insert_grant(&self, kind: &str, path: &str) -> AppResult<i64> {
+        // The same folder written another way (trailing slash, other letter case on Windows) is the same grant.
+        let path = grant_path(path);
+        let path = path.as_str();
+        let same: Option<i64> = {
+            let mut stmt = self.conn.prepare("SELECT id, path FROM grants")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+            let mut found = None;
+            for row in rows {
+                let (id, stored) = row?;
+                if same_grant_path(&stored, path) {
+                    found = Some(id);
+                    break;
+                }
+            }
+            found
+        };
+        if let Some(id) = same {
+            self.conn.execute("UPDATE grants SET kind = ?1 WHERE id = ?2", params![kind, id])?;
+            return Ok(id);
+        }
         self.conn.execute(
-            "INSERT INTO grants(kind, path, exposure) VALUES(?1, ?2, 'follow')
+            "INSERT INTO grants(kind, path) VALUES(?1, ?2)
              ON CONFLICT(path) DO UPDATE SET kind = excluded.kind",
             params![kind, path],
         )?;
@@ -317,19 +339,20 @@ impl Db {
         let grant = self
             .conn
             .query_row(
-                "SELECT id, kind, path, exposure FROM grants WHERE id = ?1",
+                "SELECT id, kind, path FROM grants WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(GrantRow {
                         id: row.get(0)?,
                         kind: row.get(1)?,
                         path: row.get(2)?,
-                        exposure: row.get(3)?,
                     })
                 },
             )
             .optional()?;
         if grant.is_some() {
+            // All or nothing, so a failure never leaves half of the folder's songs behind.
+            let tx = self.conn.unchecked_transaction()?;
             // A song that another folder also covers is already in the library through that folder.
             let ids: Vec<String> = {
                 let mut stmt = self.conn.prepare(if keep_tracks {
@@ -356,6 +379,7 @@ impl Db {
             }
             self.conn
                 .execute("DELETE FROM grants WHERE id = ?1", params![id])?;
+            tx.commit()?;
         }
         Ok(grant)
     }
@@ -389,84 +413,9 @@ impl Db {
         Ok(())
     }
 
-    pub fn mark_dirty(&self, feature: &str, dirty: bool) -> AppResult<()> {
-        let mut map = self.setting_json("dirty")?;
-        if !map.is_object() {
-            map = json!({});
-        }
-        map[feature] = json!(dirty);
-        self.set_device_setting("dirty", map)
-    }
-
-    pub fn is_dirty(&self, feature: &str) -> AppResult<bool> {
-        Ok(self
-            .setting_json("dirty")?
-            .get(feature)
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false))
-    }
-
-    pub fn block_flags(&self, feature: &str) -> AppResult<BlockFlags> {
-        let all = self.setting_json("syncBlocks")?;
-        let item = all.get(feature).cloned().unwrap_or(json!({}));
-        Ok(BlockFlags {
-            manual: item.get("manual").and_then(|v| v.as_bool()).unwrap_or(false),
-            source: item.get("source").and_then(|v| v.as_bool()).unwrap_or(false),
-            all: item.get("all").and_then(|v| v.as_bool()).unwrap_or(false),
-        })
-    }
-
-    pub fn sync_source(&self, feature: &str) -> AppResult<Option<String>> {
-        let map = self.setting_json("syncSources")?;
-        Ok(map
-            .get(feature)
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string()))
-    }
-
-    pub fn exposure_for_new_folder_file(&self, grant_id: i64) -> AppResult<bool> {
-        let exposure: String = self.conn.query_row(
-            "SELECT exposure FROM grants WHERE id = ?1",
-            params![grant_id],
-            |row| row.get(0),
-        )?;
-        self.resolve_exposure(&exposure)
-    }
-
-    pub fn resolve_exposure(&self, exposure: &str) -> AppResult<bool> {
-        let mode = if exposure == "follow" {
-            self.setting_string("exposeDefault")?
-        } else {
-            exposure.to_string()
-        };
-        Ok(mode == "expose")
-    }
-
-    pub fn set_grant_exposure(&self, id: i64, exposure: &str) -> AppResult<()> {
-        self.conn.execute(
-            "UPDATE grants SET exposure = ?1 WHERE id = ?2",
-            params![exposure, id],
-        )?;
-        Ok(())
-    }
-
-    pub fn expose_grant_members(&self, id: i64, expose: bool) -> AppResult<()> {
-        self.conn.execute(
-            "UPDATE local_files SET exposed = ?1 WHERE grant_id = ?2",
-            params![expose, id],
-        )?;
-        Ok(())
-    }
-
-    pub fn expose_library_members(&self, expose: bool) -> AppResult<()> {
-        self.conn.execute("UPDATE local_files SET exposed = ?1", params![expose])?;
-        Ok(())
-    }
-
     pub fn playlists(&self) -> AppResult<Vec<PlaylistRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.name, p.exposure,
+            "SELECT p.id, p.name,
                     (SELECT COUNT(*) FROM playlist_tracks t WHERE t.playlist_id = p.id)
              FROM playlists p ORDER BY p.position, p.name",
         )?;
@@ -474,8 +423,7 @@ impl Db {
             Ok(PlaylistRow {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                exposure: row.get(2)?,
-                count: row.get(3)?,
+                count: row.get(2)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -489,7 +437,7 @@ impl Db {
                 row.get(0)
             })?;
         self.conn.execute(
-            "INSERT INTO playlists(id, name, position, exposure, revision) VALUES(?1, ?2, ?3, 'follow', 0)",
+            "INSERT INTO playlists(id, name, position, revision) VALUES(?1, ?2, ?3, 0)",
             params![id, name, position],
         )?;
         Ok(id)
@@ -504,10 +452,10 @@ impl Db {
     }
 
     pub fn delete_playlist(&self, id: &str) -> AppResult<()> {
-        self.conn
-            .execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", params![id])?;
-        self.conn
-            .execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", params![id])?;
+        tx.execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -536,18 +484,6 @@ impl Db {
              VALUES(?1, ?2, ?3, ?4)",
             params![playlist_id, position, content_id, local_file_id],
         )?;
-        if let Some(local_file_id) = local_file_id {
-            let exposure: String = self.conn.query_row(
-                "SELECT exposure FROM playlists WHERE id = ?1",
-                params![playlist_id],
-                |row| row.get(0),
-            )?;
-            let exposed = self.resolve_exposure(&exposure)?;
-            self.conn.execute(
-                "UPDATE local_files SET exposed = ?1 WHERE local_file_id = ?2",
-                params![exposed, local_file_id],
-            )?;
-        }
         Ok(())
     }
 
@@ -638,42 +574,6 @@ impl Db {
                 params![playlist_id, local_file_id],
             )?;
         }
-        Ok(())
-    }
-
-    pub fn set_playlist_exposure(&self, id: &str, exposure: &str) -> AppResult<()> {
-        self.conn.execute(
-            "UPDATE playlists SET exposure = ?1 WHERE id = ?2",
-            params![exposure, id],
-        )?;
-        Ok(())
-    }
-
-    pub fn expose_playlist_members(&self, id: &str, expose: bool) -> AppResult<()> {
-        let ids = self.playlist_local_ids(id)?;
-        for local_file_id in ids {
-            self.conn.execute(
-                "UPDATE local_files SET exposed = ?1 WHERE local_file_id = ?2",
-                params![expose, local_file_id],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn playlist_local_ids(&self, id: &str) -> AppResult<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT local_file_id FROM playlist_tracks
-             WHERE playlist_id = ?1 AND local_file_id IS NOT NULL",
-        )?;
-        let rows = stmt.query_map(params![id], |row| row.get(0))?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    pub fn set_track_exposure(&self, local_file_id: &str, expose: bool) -> AppResult<()> {
-        self.conn.execute(
-            "UPDATE local_files SET exposed = ?1 WHERE local_file_id = ?2",
-            params![expose, local_file_id],
-        )?;
         Ok(())
     }
 
@@ -792,25 +692,6 @@ impl Db {
         Ok(saved)
     }
 
-    pub fn is_favorite(&self, content_id: Option<&str>, local_file_id: Option<&str>) -> AppResult<bool> {
-        let count: i64 = if let Some(content_id) = content_id {
-            self.conn.query_row(
-                "SELECT COUNT(*) FROM favorites WHERE content_id = ?1",
-                params![content_id],
-                |row| row.get(0),
-            )?
-        } else if let Some(local_file_id) = local_file_id {
-            self.conn.query_row(
-                "SELECT COUNT(*) FROM favorites WHERE local_file_id = ?1",
-                params![local_file_id],
-                |row| row.get(0),
-            )?
-        } else {
-            0
-        };
-        Ok(count > 0)
-    }
-
     pub fn favorite_content_ids(&self) -> AppResult<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT COALESCE(f.content_id, lf.content_id)
@@ -849,15 +730,10 @@ impl Db {
             return Ok(false);
         }
         // One transaction, so a failure never leaves this device's catalog empty without a new revision.
-        self.conn.execute_batch("BEGIN")?;
-        let written = self.write_peer_holdings(device_id, revision, rows);
-        match written {
-            Ok(()) => self.conn.execute_batch("COMMIT")?,
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                return Err(err);
-            }
-        }
+        // Dropping it without a commit, including after a failed commit, rolls it back.
+        let tx = self.conn.unchecked_transaction()?;
+        self.write_peer_holdings(device_id, revision, rows)?;
+        tx.commit()?;
         Ok(true)
     }
 
@@ -963,20 +839,6 @@ impl Db {
             }
         }
         Ok(out)
-    }
-
-    pub fn replace_synced_history(&self, entries: &[HistoryEntry]) -> AppResult<()> {
-        self.conn.execute(
-            "DELETE FROM play_history WHERE content_id IS NOT NULL",
-            [],
-        )?;
-        for entry in entries {
-            self.conn.execute(
-                "INSERT INTO play_history(content_id, local_file_id, played_at) VALUES(?1, NULL, ?2)",
-                params![entry.content_id, entry.at.to_rfc3339()],
-            )?;
-        }
-        Ok(())
     }
 
     pub fn player_json(&self) -> AppResult<Value> {
@@ -1123,17 +985,18 @@ impl Db {
             .optional()?)
     }
 
-    pub fn content_unplayable(&self, content_id: &str) -> AppResult<bool> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT unplayable FROM content_items WHERE content_id = ?1",
-                params![content_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .unwrap_or(0)
-            == 1)
+    /// Content marked unplayable, for listing many songs at once.
+    pub fn unplayable_content_ids(&self) -> AppResult<HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT content_id FROM content_items WHERE unplayable = 1")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<HashSet<_>, _>>()?)
+    }
+
+    /// Content ids marked as favorites, for listing many songs at once.
+    pub fn favorite_content_set(&self) -> AppResult<HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT content_id FROM favorites WHERE content_id IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<HashSet<_>, _>>()?)
     }
 
     /// Returns each matching local file with a lyrics excerpt when the lyrics column matched.
@@ -1171,17 +1034,15 @@ impl Db {
 
     pub fn peers(&self) -> AppResult<Vec<PeerRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT device_id, identity_public, cert_der, cert_id, display_name, safety_number, trust FROM peers",
+            "SELECT device_id, public_key, cert_id, display_name, trust FROM peers",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(PeerRow {
                 device_id: row.get(0)?,
-                identity_public: row.get(1)?,
-                cert_der: row.get(2)?,
-                cert_id: row.get(3)?,
-                display_name: row.get(4)?,
-                safety_number: row.get(5)?,
-                trust: row.get(6)?,
+                public_key: row.get(1)?,
+                cert_id: row.get(2)?,
+                display_name: row.get(3)?,
+                trust: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1189,24 +1050,62 @@ impl Db {
 
     pub fn upsert_peer(&self, peer: &PeerRow) -> AppResult<()> {
         self.conn.execute(
-            "INSERT INTO peers(device_id, identity_public, cert_der, cert_id, display_name, safety_number, trust)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO peers(device_id, public_key, cert_id, display_name, trust)
+             VALUES(?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(device_id) DO UPDATE SET
-               identity_public = excluded.identity_public,
-               cert_der = excluded.cert_der,
+               public_key = excluded.public_key,
                cert_id = excluded.cert_id,
                display_name = excluded.display_name,
-               safety_number = excluded.safety_number,
                trust = excluded.trust",
             params![
                 peer.device_id,
-                peer.identity_public,
-                peer.cert_der,
+                peer.public_key,
                 peer.cert_id,
                 peer.display_name,
-                peer.safety_number,
                 peer.trust
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Where a paired device last accepted connections: its IPv4 addresses, best first, and its port.
+    pub fn peer_address(&self, device_id: &str) -> AppResult<Option<(Vec<String>, u16)>> {
+        let row: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT hosts, port FROM peer_addresses WHERE device_id = ?1",
+                params![device_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(hosts, port)| {
+            let hosts: Vec<String> = hosts.split(',').filter(|host| !host.is_empty()).map(str::to_string).collect();
+            let port = u16::try_from(port).ok().filter(|port| *port != 0)?;
+            (!hosts.is_empty()).then_some((hosts, port))
+        }))
+    }
+
+    /// Remembers where a paired device can be reached, so it is called there again without discovery.
+    /// `hosts` come first; addresses saved before follow, up to `PEER_ADDRESS_LIMIT` in all.
+    pub fn save_peer_address(&self, device_id: &str, hosts: &[String], port: u16, at_ms: i64) -> AppResult<()> {
+        if port == 0 || hosts.is_empty() {
+            return Ok(());
+        }
+        let saved = self.peer_address(device_id)?.map(|(hosts, _)| hosts).unwrap_or_default();
+        let mut merged: Vec<String> = Vec::new();
+        for host in hosts.iter().chain(saved.iter()) {
+            if host.parse::<std::net::Ipv4Addr>().is_ok() && !merged.contains(host) {
+                merged.push(host.clone());
+            }
+        }
+        merged.truncate(PEER_ADDRESS_LIMIT);
+        if merged.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO peer_addresses(device_id, hosts, port, seen_at) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(device_id) DO UPDATE SET hosts = excluded.hosts, port = excluded.port, seen_at = excluded.seen_at",
+            params![device_id, merged.join(","), i64::from(port), at_ms],
         )?;
         Ok(())
     }
@@ -1222,21 +1121,49 @@ impl Db {
     pub fn remove_peer(&self, device_id: &str) -> AppResult<()> {
         self.delete_peer_holdings(device_id)?;
         self.conn
+            .execute("DELETE FROM peer_addresses WHERE device_id = ?1", params![device_id])?;
+        self.conn
             .execute("DELETE FROM peers WHERE device_id = ?1", params![device_id])?;
-        self.conn.execute(
-            "DELETE FROM peer_list_prefs WHERE device_id = ?1",
-            params![device_id],
-        )?;
-        let mut sources = self.setting_json("syncSources")?;
-        if let Some(map) = sources.as_object_mut() {
-            for value in map.values_mut() {
-                if value.as_str() == Some(device_id) {
-                    *value = Value::Null;
-                }
-            }
-        }
-        self.set_device_setting("syncSources", sources)?;
         Ok(())
+    }
+
+    /// Pairing with the code again lets a removed device back in.
+    pub fn end_removal(&self, device_id: &str) -> AppResult<()> {
+        self.conn.execute("DELETE FROM removed_devices WHERE device_id = ?1", params![device_id])?;
+        Ok(())
+    }
+
+    /// Keeps a device removed on this computer out, here only.
+    pub fn record_removal(&self, device_id: &str, name: &str, at_ms: i64) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO removed_devices(device_id, name, removed_at) VALUES(?1, ?2, ?3)
+             ON CONFLICT(device_id) DO UPDATE SET name = excluded.name, removed_at = excluded.removed_at",
+            params![device_id, name, at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// When the device was removed, if it is still kept out.
+    pub fn removed_at(&self, device_id: &str) -> AppResult<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT removed_at FROM removed_devices WHERE device_id = ?1", params![device_id], |row| row.get(0))
+            .optional()?)
+    }
+
+    pub fn is_removed(&self, device_id: &str) -> bool {
+        self.removed_at(device_id).ok().flatten().is_some()
+    }
+
+    /// Removed devices, newest first.
+    pub fn removals(&self) -> AppResult<Vec<RemovalRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT device_id, name, removed_at FROM removed_devices ORDER BY removed_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RemovalRow { device_id: row.get(0)?, name: row.get(1)?, removed_at: row.get(2)? })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn set_peer_trust(&self, device_id: &str, trust: &str) -> AppResult<()> {
@@ -1245,10 +1172,15 @@ impl Db {
         Ok(())
     }
 
-    /// This computer's own policy for incoming manual overwrites: `silent` or `ask`.
-    pub fn overwrite_mode(&self) -> AppResult<String> {
-        let value = self.setting_json("overwriteMode")?;
-        Ok(if value.as_str() == Some("ask") { "ask" } else { "silent" }.into())
+    /// What this computer does when another device presses Send for `feature`: `silent` applies it,
+    /// `ask` asks first, `deny` refuses it. Override, asked for from here, is not affected.
+    pub fn overwrite_policy(&self, feature: &str) -> &'static str {
+        let value = self.setting_json("overwritePolicy").unwrap_or(Value::Null);
+        match value.get(feature).and_then(|item| item.as_str()) {
+            Some("ask") => "ask",
+            Some("deny") => "deny",
+            _ => "silent",
+        }
     }
 
     pub fn is_blocked(&self, device_id: &str) -> AppResult<bool> {
@@ -1309,11 +1241,6 @@ impl Db {
     }
 
     pub fn notices(&self) -> AppResult<Vec<NoticeRow>> {
-        // Block, unblock, and decline are local actions. Drop any already stored.
-        self.conn.execute(
-            "DELETE FROM notices WHERE kind IN ('blocked', 'unblocked', 'declined') OR (kind = 'disconnected' AND detail = 'incognito') OR (kind = 'sync' AND detail = 'queue') OR (kind = 'conflict' AND detail LIKE 'queue:%')",
-            [],
-        )?;
         let mut stmt = self.conn.prepare(
             "SELECT id, at, kind, device_id, name, detail, read, pinned FROM notices ORDER BY pinned DESC, id DESC",
         )?;
@@ -1369,15 +1296,27 @@ impl Db {
     }
 }
 
+/// Saved addresses kept per paired device.
+pub const PEER_ADDRESS_LIMIT: usize = 6;
+
 #[derive(Debug, Clone)]
 pub struct PeerRow {
     pub device_id: String,
-    pub identity_public: Vec<u8>,
-    pub cert_der: Vec<u8>,
+    /// DER SubjectPublicKeyInfo of the device's TLS key; the device id is its hash.
+    pub public_key: Vec<u8>,
+    /// strelaysrv id of the device's certificate, used to meet it through a relay.
     pub cert_id: String,
     pub display_name: String,
-    pub safety_number: String,
     pub trust: String,
+}
+
+/// A device removed on this computer. Its key is deleted here and this computer refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalRow {
+    pub device_id: String,
+    pub name: String,
+    /// Milliseconds since 1970.
+    pub removed_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1413,13 +1352,6 @@ pub struct HoldingInput {
     pub codec: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct BlockFlags {
-    pub manual: bool,
-    pub source: bool,
-    pub all: bool,
-}
-
 pub fn fts_query(query: &str) -> String {
     query
         .split_whitespace()
@@ -1443,41 +1375,24 @@ pub fn fts_query(query: &str) -> String {
 fn device_defaults() -> Vec<(&'static str, Value)> {
     vec![
         ("historyCap", json!(100)),
-        ("historySyncMode", json!("utc")),
-        ("historySync", json!(false)),
-        ("historyStartup", json!(false)),
         ("historyPaused", json!(false)),
         ("incognito", json!(false)),
-        ("syncSources", json!({})),
-        ("dirty", json!({})),
-        ("exposeDefault", json!("hide")),
-        ("positionSync", json!(false)),
-        ("positionSyncDevice", json!("")),
         ("downloadFolder", json!("")),
         ("volume", json!(1.0)),
         ("window", json!({})),
         ("relayHost", json!("")),
         ("relayPort", json!(22067)),
         ("relayDeviceId", json!("")),
-        ("syncEnabled", json!(true)),
-        ("audioShare", json!(true)),
-        ("autoSend", json!({})),
         ("displayName", json!("")),
         ("holdingsRevision", json!(0)),
-        ("pendingSnapshots", json!({})),
-        ("manualAddresses", json!([])),
         ("closeAction", json!("")),
         ("miniTray", json!(true)),
         ("silenceSeconds", json!(60)),
-        ("conflictPolicy", json!("ask")),
-        ("overwriteMode", json!("silent")),
-        ("listenPort", json!(0)),
-        ("syncRequestDevice", json!("")),
+        ("overwritePolicy", json!({"favorites": "silent", "appearance": "silent"})),
         ("downloadHistory", json!([])),
         ("noticeRead", json!("visible")),
         ("noticeClear", json!("ask")),
         ("silenced", json!({})),
-        ("syncBlocks", json!({})),
     ]
 }
 
@@ -1499,8 +1414,7 @@ CREATE TABLE IF NOT EXISTS content_items (
 CREATE TABLE IF NOT EXISTS grants (
     id INTEGER PRIMARY KEY,
     kind TEXT NOT NULL,
-    path TEXT NOT NULL UNIQUE,
-    exposure TEXT NOT NULL DEFAULT 'follow'
+    path TEXT NOT NULL UNIQUE
 );
 CREATE TABLE IF NOT EXISTS local_files (
     local_file_id TEXT PRIMARY KEY,
@@ -1515,7 +1429,6 @@ CREATE TABLE IF NOT EXISTS local_files (
     access_reason TEXT,
     playback_status TEXT NOT NULL,
     playback_reason TEXT,
-    exposed INTEGER NOT NULL,
     added_at TEXT NOT NULL,
     mtime_ms INTEGER,
     size_bytes INTEGER,
@@ -1531,6 +1444,8 @@ CREATE TABLE IF NOT EXISTS local_files (
     video INTEGER NOT NULL DEFAULT 0,
     cover_path TEXT,
     cover_checked INTEGER NOT NULL DEFAULT 0,
+    -- Time and size of the `.lrc` next to the song, so a lyrics file added later is noticed.
+    lyrics_stamp TEXT,
     UNIQUE(grant_id, relative_path)
 );
 CREATE TABLE IF NOT EXISTS favorites (
@@ -1572,7 +1487,6 @@ CREATE TABLE IF NOT EXISTS playlists (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     position INTEGER NOT NULL,
-    exposure TEXT NOT NULL DEFAULT 'follow',
     revision INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS playlist_tracks (
@@ -1596,18 +1510,23 @@ CREATE TABLE IF NOT EXISTS synced_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS peer_list_prefs (
-    device_id TEXT PRIMARY KEY,
-    exposure TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS peers (
     device_id TEXT PRIMARY KEY,
-    identity_public BLOB NOT NULL,
-    cert_der BLOB NOT NULL,
+    public_key BLOB NOT NULL,
     cert_id TEXT NOT NULL,
     display_name TEXT NOT NULL,
-    safety_number TEXT NOT NULL,
     trust TEXT NOT NULL DEFAULT 'full'
+);
+CREATE TABLE IF NOT EXISTS peer_addresses (
+    device_id TEXT PRIMARY KEY,
+    hosts TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    seen_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS removed_devices (
+    device_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    removed_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS blocks (
     device_id TEXT PRIMARY KEY,
@@ -1620,9 +1539,11 @@ CREATE TABLE IF NOT EXISTS notices (
     kind TEXT NOT NULL,
     device_id TEXT NOT NULL,
     name TEXT NOT NULL,
-    detail TEXT NOT NULL
+    detail TEXT NOT NULL,
+    read INTEGER NOT NULL DEFAULT 1,
+    pinned INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS signal_state (
+CREATE TABLE IF NOT EXISTS device_identity (
     key TEXT PRIMARY KEY,
     value BLOB NOT NULL
 );
@@ -1638,6 +1559,13 @@ CREATE TABLE IF NOT EXISTS library_order (
     track_key TEXT PRIMARY KEY,
     position INTEGER NOT NULL
 );
+-- Lookups by song and by file. Without these, large libraries scan whole tables on every listing.
+CREATE INDEX IF NOT EXISTS local_files_content ON local_files(content_id);
+CREATE INDEX IF NOT EXISTS holdings_content ON holdings(content_id);
+CREATE INDEX IF NOT EXISTS play_history_content ON play_history(content_id);
+CREATE INDEX IF NOT EXISTS play_history_file ON play_history(local_file_id);
+CREATE INDEX IF NOT EXISTS playlist_tracks_content ON playlist_tracks(content_id);
+CREATE INDEX IF NOT EXISTS playlist_tracks_file ON playlist_tracks(local_file_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS library_fts USING fts5(
     local_file_id,
     content_id,
@@ -1648,10 +1576,205 @@ CREATE VIRTUAL TABLE IF NOT EXISTS library_fts USING fts5(
 );
 "#;
 
-pub fn merge_history_into_db(db: &Db, remote: Vec<HistoryEntry>) -> AppResult<Vec<HistoryEntry>> {
-    let local = db.history_for_sync()?;
-    let cap = db.setting_i64("historyCap")?.max(1) as usize;
-    let merged = merge_history(local, remote, Utc::now(), cap);
-    db.replace_synced_history(&merged)?;
-    Ok(merged)
+/// A grant path without trailing separators. A drive root such as `D:\` or `/` keeps its separator.
+fn grant_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        let root_len = trimmed.len() + usize::from(path.len() > trimmed.len());
+        return path[..root_len].to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Windows paths ignore letter case and accept either slash.
+fn same_grant_path(left: &str, right: &str) -> bool {
+    let left = grant_path(left);
+    let right = grant_path(right);
+    if cfg!(windows) {
+        left.replace('/', "\\").to_lowercase() == right.replace('/', "\\").to_lowercase()
+    } else {
+        left == right
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_db(name: &str) -> (Db, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("tunepeerly-db-{name}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn peer_addresses_are_saved_merged_and_dropped_with_the_device() {
+        let (db, dir) = open_db("addresses");
+        assert_eq!(db.peer_address("phone").unwrap(), None);
+        db.save_peer_address("phone", &["192.168.1.20".into()], 5000, 1).unwrap();
+        db.save_peer_address("phone", &["10.0.0.5".into(), "not-an-ip".into(), "192.168.1.20".into()], 5001, 2).unwrap();
+        assert_eq!(db.peer_address("phone").unwrap(), Some((vec!["10.0.0.5".to_string(), "192.168.1.20".to_string()], 5001)));
+        // Nothing usable changes nothing.
+        db.save_peer_address("phone", &[], 6000, 3).unwrap();
+        db.save_peer_address("phone", &["10.0.0.9".into()], 0, 3).unwrap();
+        assert_eq!(db.peer_address("phone").unwrap().map(|(_, port)| port), Some(5001));
+        let many: Vec<String> = (1..=10).map(|n| format!("10.1.0.{n}")).collect();
+        db.save_peer_address("phone", &many, 5001, 4).unwrap();
+        assert_eq!(db.peer_address("phone").unwrap().unwrap().0.len(), PEER_ADDRESS_LIMIT);
+        db.remove_peer("phone").unwrap();
+        assert_eq!(db.peer_address("phone").unwrap(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_phone_named_localhost_takes_its_own_name_but_a_chosen_name_stays() {
+        let (db, dir) = open_db("devname");
+        db.set_device_setting("displayName", json!("localhost")).unwrap();
+        assert!(db.adopt_device_name("Pixel 9").unwrap());
+        assert_eq!(db.setting_string("displayName").unwrap(), "Pixel 9");
+        assert!(!db.adopt_device_name("Other").unwrap());
+        assert_eq!(db.setting_string("displayName").unwrap(), "Pixel 9");
+        db.set_device_setting("displayName", json!("")).unwrap();
+        assert!(!db.adopt_device_name("localhost").unwrap());
+        assert!(db.adopt_device_name("  Kuang's phone ").unwrap());
+        assert_eq!(db.setting_string("displayName").unwrap(), "Kuang's phone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn put_marker(db: &Db, value: &str) {
+        db.conn.execute("INSERT OR REPLACE INTO device_settings (key, value) VALUES ('marker', ?1)", [value]).unwrap();
+    }
+
+    fn marker(db: &Db) -> Option<String> {
+        db.conn.query_row("SELECT value FROM device_settings WHERE key = 'marker'", [], |row| row.get(0)).optional().unwrap()
+    }
+
+    fn not_a_database(conn: &Connection) -> bool {
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .is_err_and(|err| err.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase))
+    }
+
+    #[test]
+    fn the_library_file_is_encrypted_and_opens_only_with_its_key() {
+        let (db, dir) = open_db("encrypted");
+        let cipher: String = db.conn.query_row("PRAGMA cipher_version", [], |row| row.get(0)).unwrap();
+        assert!(!cipher.is_empty());
+        put_marker(&db, "plain-marker-1234");
+        drop(db);
+        let file = dir.join("library.db");
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(!bytes.starts_with(b"SQLite format 3\0"));
+        assert!(!bytes.windows(17).any(|part| part == b"plain-marker-1234"));
+        assert!(not_a_database(&Connection::open(&file).unwrap()));
+        let other = Connection::open(&file).unwrap();
+        other.pragma_update(None, "key", format!("x'{}'", "ab".repeat(KEY_LEN))).unwrap();
+        assert!(not_a_database(&other));
+        let db = Db::open(&file, dir.clone(), dir.join("cache")).unwrap();
+        assert_eq!(marker(&db).as_deref(), Some("plain-marker-1234"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn removals_are_kept_until_ended() {
+        let (db, dir) = open_db("removals");
+        db.record_removal("gone", "Laptop", 5).unwrap();
+        assert!(db.is_removed("gone"));
+        db.record_removal("gone", "Laptop", 9).unwrap();
+        db.record_removal("other", "Tower", 7).unwrap();
+        let rows = db.removals().unwrap();
+        assert_eq!(rows.iter().map(|row| (row.device_id.as_str(), row.removed_at)).collect::<Vec<_>>(), vec![("gone", 9), ("other", 7)]);
+        db.end_removal("gone").unwrap();
+        assert!(!db.is_removed("gone"));
+        assert!(db.is_removed("other"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn overwrite_choices_are_kept_per_feature() {
+        let (db, dir) = open_db("overwrite-policy");
+        assert_eq!(db.overwrite_policy("favorites"), "silent");
+        db.set_device_setting("overwritePolicy", json!({"favorites": "deny", "appearance": "ask"})).unwrap();
+        drop(db);
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
+        assert_eq!(db.overwrite_policy("favorites"), "deny");
+        assert_eq!(db.overwrite_policy("appearance"), "ask");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_library_without_its_key_is_set_aside_not_wiped() {
+        let (db, dir) = open_db("lost-key");
+        put_marker(&db, "old");
+        drop(db);
+        std::fs::remove_file(dir.join(dbkey::KEY_NAME)).unwrap();
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
+        assert_eq!(marker(&db), None);
+        let aside: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|entry| entry.ok()?.file_name().into_string().ok()).collect();
+        assert!(aside.iter().any(|name| name.starts_with("library.db.unreadable-")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn grant_paths_lose_trailing_separators_but_roots_stay() {
+        assert_eq!(grant_path(r"D:\Music\"), r"D:\Music");
+        assert_eq!(grant_path("/home/me/music//"), "/home/me/music");
+        assert_eq!(grant_path(r"D:\"), r"D:\");
+        assert_eq!(grant_path("D:"), "D:");
+        assert_eq!(grant_path("/"), "/");
+        assert!(same_grant_path(r"D:\Music", r"D:\Music\"));
+        assert_eq!(same_grant_path(r"D:\Music", r"d:\music"), cfg!(windows));
+    }
+
+    #[test]
+    fn the_same_folder_added_twice_is_one_grant() {
+        let (db, dir) = open_db("grant");
+        let first = db.insert_grant("directory", r"D:\Music").unwrap();
+        let second = db.insert_grant("directory", r"D:\Music\").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(db.grants().unwrap().len(), 1);
+        assert_eq!(db.grants().unwrap()[0].path, r"D:\Music");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opening_twice_keeps_the_indexes_in_place() {
+        let (db, dir) = open_db("reopen");
+        drop(db);
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
+        let indexes: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'holdings_content'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(indexes, 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_holdings_write_keeps_the_earlier_catalog() {
+        let (db, dir) = open_db("holdings");
+        let row = |id: &str| HoldingInput {
+            content_id: id.into(),
+            title: "t".into(),
+            artist: String::new(),
+            album: String::new(),
+            track_number: None,
+            duration_ms: None,
+            codec: String::new(),
+        };
+        assert!(db.replace_peer_holdings("peer", 1, &[row("a")]).unwrap());
+        db.conn.execute_batch("CREATE TRIGGER fail_b BEFORE INSERT ON holdings WHEN NEW.content_id = 'b' BEGIN SELECT RAISE(ABORT, 'no'); END;").unwrap();
+        assert!(db.replace_peer_holdings("peer", 2, &[row("c"), row("b")]).is_err());
+        assert!(db.conn.is_autocommit());
+        let held: Vec<String> = {
+            let mut stmt = db.conn.prepare("SELECT content_id FROM holdings WHERE device_id = 'peer'").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(held, vec!["a".to_string()]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

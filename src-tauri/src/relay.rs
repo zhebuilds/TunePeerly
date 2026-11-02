@@ -99,7 +99,10 @@ pub fn invitation_target(invitation: &Invitation, fallback_host: Ipv4Addr, fallb
     } else if invitation.address.is_empty() {
         fallback_host
     } else if invitation.address.len() == 16 {
-        fallback_host
+        // An IPv4 address may arrive in IPv6 form (::ffff:a.b.c.d); other IPv6 addresses use the relay's own.
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&invitation.address);
+        std::net::Ipv6Addr::from(octets).to_ipv4_mapped().unwrap_or(fallback_host)
     } else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "relay address"));
     };
@@ -138,4 +141,27 @@ fn read_bytes(input: &[u8]) -> io::Result<(Vec<u8>, &[u8])> {
 fn read_string(input: &[u8]) -> io::Result<(String, &[u8])> {
     let (bytes, rest) = read_bytes(input)?;
     Ok((String::from_utf8_lossy(&bytes).to_string(), rest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{invitation_target, Invitation};
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    fn invitation(address: Vec<u8>, port: u16) -> Invitation {
+        Invitation { from: vec![1], key: vec![2], address, port, server_socket: false }
+    }
+
+    #[test]
+    fn invitation_addresses_in_ipv6_form_are_read() {
+        let relay = Ipv4Addr::new(203, 0, 113, 9);
+        let mut mapped = vec![0u8; 10];
+        mapped.extend_from_slice(&[0xff, 0xff, 198, 51, 100, 7]);
+        assert_eq!(invitation_target(&invitation(mapped, 443), relay, 22067).unwrap(), "198.51.100.7:443".parse::<SocketAddr>().unwrap());
+        let mut v6 = vec![0x20, 0x01, 0x0d, 0xb8];
+        v6.extend_from_slice(&[0u8; 12]);
+        assert_eq!(invitation_target(&invitation(v6, 0), relay, 22067).unwrap(), "203.0.113.9:22067".parse::<SocketAddr>().unwrap());
+        assert_eq!(invitation_target(&invitation(vec![10, 0, 0, 2], 5000), relay, 22067).unwrap(), "10.0.0.2:5000".parse::<SocketAddr>().unwrap());
+        assert!(invitation_target(&invitation(vec![1, 2, 3], 5000), relay, 22067).is_err());
+    }
 }

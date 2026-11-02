@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -17,11 +17,12 @@ use tokio_rustls::TlsConnector;
 
 use crate::catalog::{local_publishable, readable_paths};
 use crate::media::{self, AudioBus, AudioPiece, Pull};
-use crate::db::{merge_history_into_db, Db, HoldingInput};
+use crate::db::{Db, HoldingInput};
 use crate::error::{AppError, AppResult};
 use crate::frames::{self, Frame};
-use crate::identity::{self, IdentityMaterial, SignalStore};
+use crate::identity::{self, IdentityMaterial};
 use crate::ids::{self, smaller_device};
+use crate::pairing;
 use crate::relay;
 use crate::sync_logic::{self, HistoryEntry, PlaySource, SourceChoice, SourceKind};
 use crate::tls;
@@ -56,24 +57,83 @@ pub(crate) struct OverwriteAsk {
     feature: String,
     items: Value,
     shown: Option<Instant>,
+    /// The sender's id for this Send, so the answer can go back to it.
+    send_id: Option<String>,
 }
+
+/// A Send from this computer that is waiting for one device's result.
+pub(crate) struct SendWait {
+    device_id: String,
+    feature: String,
+    deadline: Instant,
+}
+
+/// How long a device has to report what it did with a Send. A device that is asking its user
+/// reports that first, and then has until the question times out on its side.
+const SEND_RESULT_WINDOW: Duration = Duration::from_secs(15);
+const SEND_ASK_WINDOW: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingOffer {
     pub device_id: String,
     pub name: String,
-    pub safety_number: String,
-    pub cert_der: Vec<u8>,
-    pub identity_public: Vec<u8>,
+    /// DER SubjectPublicKeyInfo that pairing pins and that the code check is bound to.
+    #[serde(skip)]
+    pub public_key: Vec<u8>,
+    #[serde(skip)]
     pub cert_id: String,
-    /// "incoming" asks this device to accept or decline. "outgoing" is waiting on the other side.
+    /// "incoming": the other device asked, and this one shows the code. "outgoing": this device asked
+    /// and the user types the code shown on the other one. "approve": a paired device set to
+    /// Ask each time is connecting again.
     pub role: String,
+    /// The code to show. Only on the "incoming" side, and only while it can still be used.
+    pub code: Option<String>,
+    /// When the shown code stops working, in milliseconds since 1970.
+    pub expires_at: Option<i64>,
+    /// "" waiting, "checking", "wrong", "badCode", or a finished state (see `finished`).
+    pub status: String,
+    /// Wrong codes still allowed before pairing locks.
+    pub tries_left: u32,
+    /// When a lock after too many wrong codes ends, in milliseconds since 1970.
+    pub locked_until: Option<i64>,
+    /// Trust saved once paired: "full" or "verify".
+    pub trust: String,
+}
+
+impl PairingOffer {
+    /// This pairing try is over. The dialog stays until the user closes it.
+    fn finished(&self) -> bool {
+        matches!(self.status.as_str(), "expired" | "locked" | "busy" | "cancelled" | "failed")
+    }
+}
+
+/// Pairing state that never leaves this computer.
+#[derive(Default)]
+pub struct PairSession {
+    /// Wrong codes and the lock they cause, for every device that asks to pair with this one.
+    guard: pairing::Guard,
+    /// The code on screen for the device in `offer`. The first try takes it, so it works once.
+    code: Option<pairing::Code>,
+    /// Asked side: answered a try and waits until the deadline for the other side's tag.
+    expecting: Option<(String, pairing::Expected, Instant)>,
+    /// Asking side: sent a try and waits until the deadline for the answer.
+    asking: Option<(String, pairing::Asking, Instant)>,
+}
+
+impl PairSession {
+    fn reset(&mut self) {
+        self.code = None;
+        self.expecting = None;
+        self.asking = None;
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadStatus {
+    /// Bumped by `store_download` on every new status, so the UI can tell a repeated request from a refresh.
+    pub seq: u64,
     pub content_id: String,
     pub state: String,
     pub detail: String,
@@ -98,17 +158,17 @@ pub struct Live {
 pub struct LiveInner {
     pub nearby: Vec<Nearby>,
     pub links: Vec<LinkStatus>,
+    /// The LAN port the system picked for this run. Not configurable and not saved.
     pub listen_port: u16,
-    /// Saved port that was busy, while `listen_port` is a temporary one.
-    pub port_fallback: Option<u16>,
+    /// Whether the discovery thread is announcing this computer right now.
+    pub discovery_on: bool,
     pub relay: String,
     pub download: Option<DownloadStatus>,
     /// Songs waiting because another download is already copying.
     pub download_queue: VecDeque<QueuedDownload>,
     pub offer: Option<PairingOffer>,
-    pub manual: Option<String>,
+    pub pairing: PairSession,
     pub failures: HashMap<String, String>,
-    pub addresses: HashMap<String, String>,
     pub playing: bool,
     pub current_local: Option<String>,
     pub buffer_enough: bool,
@@ -124,23 +184,34 @@ pub struct LiveInner {
     pub pending_snapshots: HashMap<String, SnapshotBuild>,
     /// Paired devices this computer disconnected on purpose. Automatic redial waits until Connect.
     pub paused: HashSet<String>,
+    /// Paired devices that disconnected this computer on purpose (they sent `Frame::Hold`).
+    /// They are not dialed again until they connect back or the user presses Connect here.
+    pub held: HashSet<String>,
     pub overwrite_waiting: VecDeque<OverwriteAsk>,
     pub overwrite_shown: Vec<OverwriteAsk>,
     pub overwrite_next: u64,
-    /// Devices we asked for Recently Played during the one startup merge.
-    pub history_asked: HashSet<String>,
-    pub history_waiting: HashSet<String>,
-    pub history_deadline: Option<Instant>,
-    pub history_done: bool,
+    /// Recently Played asked of one connected device for viewing, and when the answer stops counting.
+    pub history_view: Option<(String, Instant)>,
+    /// Copies this computer asked for with "sync-request", keyed by device and feature, until the deadline.
+    /// Only these replies may skip the overwrite question.
+    pub sync_requests: HashMap<String, Instant>,
+    /// Sync requests this computer answered recently, keyed like `sync_requests`.
+    pub sync_replies: HashMap<String, Instant>,
+    /// Sends from this computer waiting for results, keyed like `sync_requests` with the send id.
+    pub send_waits: HashMap<String, SendWait>,
 }
+
+/// How long a device has to answer when its Recently Played is opened here.
+const HISTORY_REPLY_WINDOW: Duration = Duration::from_secs(8);
 
 pub enum Cmd {
     Apply,
     Publish,
-    AutoSync(String),
+    /// Show a connected device's Recently Played here. Read-only: it is never stored or merged.
+    ViewHistory(String),
     Pair { device_id: String, host: Option<String> },
-    Manual { host: String, port: u16 },
-    Confirm { device_id: String, trust: String },
+    /// Approves a saved Ask-each-time device, or sends the typed code to the device that shows it.
+    Confirm { device_id: String, trust: String, code: String },
     Reject(String),
     Block(String),
     Unblock(String),
@@ -148,22 +219,17 @@ pub enum Cmd {
     ClearNotices,
     Notice { action: String, id: i64, ids: Vec<i64> },
     Remove(String),
-    Paste(String),
-    Sync { feature: String, refresh: bool },
+    /// Sends this computer's copy. `target` None means every connected device.
+    Sync { feature: String, target: Option<String> },
     RequestSync { feature: String, device_id: String },
-    Resolve { feature: String, take: bool },
     Download(String),
     Activity { playing: bool, local_file_id: Option<String>, buffer_enough: bool },
-    Position {
-        content_id: String,
-        seconds: f64,
-        playing: bool,
-        duration: f64,
-        title: String,
-        artist: String,
-        album: String,
-    },
     CloseRoutes,
+    /// Announces this device at once and collects the Nearby list again; does nothing while discovery is off.
+    RefreshNearby,
+    /// The phone moved to another network or woke from Doze: join discovery again, register with the
+    /// relay at once instead of after its back-off, and call the known devices. The listener stays.
+    NetworkChanged,
     Disconnect(String),
     ResolveOverwrite { id: u64, accept: bool },
 }
@@ -190,10 +256,14 @@ pub fn spawn(
     let live_thread = live.clone();
     let bus_thread = bus.clone();
     std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("network runtime");
+        // A failure here must not take the whole app down: dropping media_ready_tx makes spawn report the error.
+        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                eprintln!("network runtime: {err}");
+                return;
+            }
+        };
         let local = tokio::task::LocalSet::new();
         runtime.block_on(local.run_until(async move {
             tokio::task::spawn_local(media::serve(bus_thread.clone(), pull_tx, media_ready_tx));
@@ -211,6 +281,8 @@ struct PeerOut {
     conn: u64,
     dialed_by: String,
     confirmed: bool,
+    /// The device said hello on this connection, so it has confirmed this one too and takes messages.
+    ready: bool,
     incoming: bool,
     path: String,
     tx: mpsc::UnboundedSender<Frame>,
@@ -218,6 +290,8 @@ struct PeerOut {
     audio: mpsc::Sender<Frame>,
     /// Turns false when this connection is dropped, so transfers still reading a file stop at once.
     alive: Arc<std::sync::atomic::AtomicBool>,
+    /// The certificate the device showed on this connection, for a pairing it asks for later.
+    cert_der: Vec<u8>,
 }
 
 impl Drop for PeerOut {
@@ -236,9 +310,6 @@ async fn run(
     live: Live,
     bus: Arc<AudioBus>,
 ) {
-    let mut store = SignalStore::open(db.clone(), material.identity, material.registration_id)
-        .expect("signal store");
-    let _ = store.ensure_prekeys().await;
     // Read the Windows network profiles once now so the first screen already knows which adapters are usable.
     std::thread::spawn(|| {
         let _ = lan_ipv4();
@@ -247,22 +318,33 @@ async fn run(
     let mut pending: HashSet<String> = HashSet::new();
     let mut listener: Option<tokio::task::JoinHandle<()>> = None;
     let mut relay_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut discovery: Option<std::sync::mpsc::Sender<()>> = None;
+    let mut discovery: Option<std::sync::mpsc::Sender<DiscoveryCtl>> = None;
     let mut actual_port = 0u16;
-    let mut ready_sessions: HashSet<String> = HashSet::new();
     let mut pending_holdings: HashMap<String, HoldingsBuild> = HashMap::new();
+    // Connections to devices just removed, kept until they answer the Unpaired frame or time runs out.
+    let mut farewells: HashMap<String, (PeerOut, Instant)> = HashMap::new();
     let mut published_holdings = String::new();
     let provider = tls::provider();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<NetEvent>();
-    trust_saved_peers(&db, &mut store);
     publish(&app, &db, &live, &peers);
-    let mut reconnect = tokio::time::interval(Duration::from_secs(30));
+    // Paired devices that are not connected are called again by this, with growing waits (`Redial`).
+    let mut redial = Redial::default();
+    let mut redial_tick = tokio::time::interval(REDIAL_TICK);
+    redial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The address each connected device came from, until its hello tells the port it listens on.
+    let mut came_from: HashMap<String, (u64, String)> = HashMap::new();
     let mut overwrite_tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             _ = overwrite_tick.tick() => {
-                expire_overwrites(&app, &db, &live);
-                tick_history_startup(&db, &material, &mut store, &peers, &live).await;
+                farewells.retain(|_, (_, since)| since.elapsed() < UNPAIR_ANSWER_WINDOW);
+                expire_overwrites(&app, &db, &live, &peers);
+                expire_send_waits(&app, &db, &live, &peers);
+                tick_history_view(&app, &peers, &live);
+                let ticked = tick_pairing(&live, &mut peers, Instant::now());
+                if drop_stale_unpaired(&db, &live, &mut peers) || ticked {
+                    publish(&app, &db, &live, &peers);
+                }
             }
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break };
@@ -270,32 +352,49 @@ async fn run(
                     Cmd::Apply => {
                         let open = db.lock().map(|guard| network_open(&guard)).unwrap_or(false);
                         if !open {
-                            publish_holdings(&db, &material, &mut store, &peers, &mut published_holdings).await;
+                            publish_holdings(&db, &peers, &mut published_holdings);
                             peers.clear();
-                            ready_sessions.clear();
                             bus.close_routes();
                             if let Ok(mut guard) = live.inner.lock() {
                                 guard.offer = None;
+                                guard.pairing.reset();
                             }
                         }
                         restart_listener(&db, &material, &provider, &event_tx, &mut listener, &mut actual_port, &live).await;
                         restart_discovery(&db, &material, actual_port, &event_tx, &mut discovery, &live).await;
                         restart_relay(&db, &material, &provider, &event_tx, &mut relay_task, &live).await;
                         if open {
-                            publish_holdings(&db, &material, &mut store, &peers, &mut published_holdings).await;
-                            dial_known(&db, &material, &provider, &event_tx, &live, &peers).await;
+                            publish_holdings(&db, &peers, &mut published_holdings);
+                            redial.kick_all();
+                            redial_due(&db, &material, &provider, &event_tx, &live, &peers, &mut redial).await;
                         }
                         publish(&app, &db, &live, &peers);
                     }
                     Cmd::Publish => {
-                        publish_holdings(&db, &material, &mut store, &peers, &mut published_holdings).await;
+                        publish_holdings(&db, &peers, &mut published_holdings);
                     }
-                    Cmd::AutoSync(feature) => {
-                        auto_sync(&db, &material, &mut store, &peers, &feature).await;
+                    Cmd::NetworkChanged => {
+                        if db.lock().map(|guard| network_open(&guard)).unwrap_or(false) {
+                            restart_discovery(&db, &material, actual_port, &event_tx, &mut discovery, &live).await;
+                            restart_relay(&db, &material, &provider, &event_tx, &mut relay_task, &live).await;
+                            // A new network: every saved address may work now, so call at once and start the waits over.
+                            eprintln!("network changed: calling paired devices again");
+                            redial.kick_all();
+                            redial_due(&db, &material, &provider, &event_tx, &live, &peers, &mut redial).await;
+                            publish(&app, &db, &live, &peers);
+                        }
+                    }
+                    Cmd::ViewHistory(device_id) => {
+                        view_history(&app, &db, &peers, &live, &device_id);
                     }
                     Cmd::Pair { device_id, host } => {
+                        // Pairing again on purpose replaces a removal the other device was not told about yet.
+                        if let Ok(guard) = db.lock() {
+                            let _ = guard.end_removal(&device_id);
+                        }
                         if let Ok(mut guard) = live.inner.lock() {
                             guard.paused.remove(&device_id);
+                            guard.held.remove(&device_id);
                             guard.failures.remove(&device_id);
                         }
                         pending.insert(device_id.clone());
@@ -310,45 +409,45 @@ async fn run(
                             let _ = event_tx.send(NetEvent::DialFailed { device_id: Some(device_id), target: None });
                         }
                     }
-                    Cmd::Manual { host, port } => {
-                        let valid = host.parse::<Ipv4Addr>().is_ok() && port != 0;
-                        let allowed = db.lock().map(|guard| {
-                            let (incognito, _, sync, audio) = switches(&guard);
-                            !incognito && (sync || audio)
-                        }).unwrap_or(false);
-                        if !valid || !allowed {
-                            set_manual(&live, "failed");
-                            publish(&app, &db, &live, &peers);
-                            continue;
-                        }
-                        set_manual(&live, "dialing");
-                        remember_address(&db, &host, port);
-                        pending.insert(format!("manual:{host}:{port}"));
-                        publish(&app, &db, &live, &peers);
-                        dial_peer(&db, &material, &provider, &event_tx, vec![host], port, None, &material.device_id).await;
-                    }
-                    Cmd::Confirm { device_id, trust } => {
-                        if confirm_peer(&db, &material, &live, &mut peers, &device_id, &trust) {
-                            trust_saved_peers(&db, &mut store);
-                            let _ = peers.get(&device_id).and_then(|peer| peer.tx.send(Frame::PairAccept).ok());
-                            send_bundle(&db, &mut store, &peers, &device_id).await;
+                    Cmd::Confirm { device_id, trust, code } => {
+                        let role = live.inner.lock().ok().and_then(|guard| {
+                            guard.offer.as_ref().filter(|offer| offer.device_id == device_id).map(|offer| offer.role.clone())
+                        });
+                        match role.as_deref() {
+                            Some("approve") => {
+                                if approve_peer(&db, &live, &mut peers, &device_id, &trust) {
+                                    say_hello(&db, &peers, &device_id);
+                                }
+                            }
+                            Some("outgoing") => start_pairing(&material, &live, &peers, &device_id, &trust, &code),
+                            _ => {}
                         }
                         publish(&app, &db, &live, &peers);
                     }
                     Cmd::Reject(device_id) => {
                         pending.remove(&device_id);
+                        // Closing a dialog whose try already ended neither tells the other side nor silences it.
+                        let finished = live.inner.lock().ok().is_some_and(|guard| {
+                            guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id && offer.finished())
+                        });
+                        let unconfirmed = peers.get(&device_id).is_some_and(|peer| !peer.confirmed);
+                        if unconfirmed && !finished {
+                            send_frame(&peers, &device_id, Frame::PairFail { reason: "cancelled".into() });
+                        }
                         let incoming = peers.get(&device_id).is_some_and(|peer| peer.incoming && !peer.confirmed);
                         if incoming
+                            && !finished
                             && let Ok(guard) = db.lock()
                         {
                             let _ = guard.silence(&device_id);
                         }
-                        if peers.get(&device_id).is_some_and(|peer| !peer.confirmed) {
+                        if unconfirmed {
                             peers.remove(&device_id);
                         }
                         if let Ok(mut guard) = live.inner.lock() {
                             if guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id) {
                                 guard.offer = None;
+                                guard.pairing.reset();
                             }
                         }
                         publish(&app, &db, &live, &peers);
@@ -360,12 +459,19 @@ async fn run(
                         }
                         peers.remove(&device_id);
                         pending.remove(&device_id);
-                        ready_sessions.remove(&device_id);
+                        pending_holdings.remove(&device_id);
+                        drop_partial_snapshots(&live, &device_id);
                         if let Ok(mut guard) = live.inner.lock() {
                             if guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id) {
                                 guard.offer = None;
+                                guard.pairing.reset();
                             }
+                            // Questions this device asked before it was blocked are dropped.
+                            guard.overwrite_waiting.retain(|ask| ask.device_id != device_id);
+                            guard.overwrite_shown.retain(|ask| ask.device_id != device_id);
+                            promote_overwrites(&mut guard);
                         }
+                        emit_overwrite_asks(&app, &live);
                         publish(&app, &db, &live, &peers);
                     }
                     Cmd::Unblock(device_id) => {
@@ -377,6 +483,12 @@ async fn run(
                     Cmd::Trust { device_id, trust } => {
                         if let Ok(guard) = db.lock() {
                             let _ = guard.set_peer_trust(&device_id, &trust);
+                        }
+                        // Chosen in the pairing dialog before the device is saved: kept for when it is.
+                        if let Ok(mut guard) = live.inner.lock()
+                            && let Some(offer) = guard.offer.as_mut().filter(|offer| offer.device_id == device_id)
+                        {
+                            offer.trust = clean_trust(&trust).into();
                         }
                         publish(&app, &db, &live, &peers);
                     }
@@ -404,39 +516,15 @@ async fn run(
                         publish(&app, &db, &live, &peers);
                     }
                     Cmd::Remove(device_id) => {
-                        peers.remove(&device_id);
+                        remove_here(&db, &live, &mut peers, &mut farewells, &mut pending_holdings, &device_id);
                         pending.remove(&device_id);
-                        ready_sessions.remove(&device_id);
-                        if let Ok(guard) = db.lock() {
-                            let _ = guard.remove_peer(&device_id);
-                        }
-                        store.forget_peer(&device_id);
-                        store.forget_sender_key(&material.device_id, material.distribution_id);
-                        let remaining: Vec<String> = peers.keys().filter(|id| ready_sessions.contains(*id)).cloned().collect();
-                        for peer_id in remaining {
-                            send_sender_key(&material, &mut store, &peers, &peer_id).await;
-                        }
                         publish(&app, &db, &live, &peers);
                     }
-                    Cmd::Paste(text) => {
-                        match identity::parse_pairing_text(&text) {
-                            Ok(parsed) => {
-                                stage_offer(&db, &material, &live, &parsed.identity_public, &parsed.cert_der, &parsed.display_name, "incoming", &app);
-                            }
-                            Err(_) => {
-                                set_manual(&live, "badText");
-                                publish(&app, &db, &live, &peers);
-                            }
-                        }
-                    }
-                    Cmd::Sync { feature, refresh } => {
-                        send_sync(&db, &material, &mut store, &peers, &feature, refresh).await;
+                    Cmd::Sync { feature, target } => {
+                        send_sync(&app, &db, &peers, &live, &feature, target.as_deref());
                     }
                     Cmd::RequestSync { feature, device_id } => {
-                        request_sync(&db, &material, &mut store, &peers, &feature, &device_id).await;
-                    }
-                    Cmd::Resolve { feature, take } => {
-                        resolve_pending(&app, &db, &feature, take);
+                        request_sync(&db, &peers, &live, &feature, &device_id);
                     }
                     Cmd::Download(content_id) => {
                         start_download(&app, &db, &peers, &live, &bus, &tx, content_id).await;
@@ -448,21 +536,28 @@ async fn run(
                             guard.buffer_enough = buffer_enough;
                         }
                     }
-                    Cmd::Position { content_id, seconds, playing, duration, title, artist, album } => {
-                        send_position(&db, &material, &mut store, &peers, &content_id, seconds, playing, duration, &title, &artist, &album).await;
-                    }
                     Cmd::CloseRoutes => bus.close_routes(),
+                    Cmd::RefreshNearby => {
+                        // Only the discovery list starts over; links to paired devices are left alone.
+                        if let Some(control) = &discovery {
+                            let _ = control.send(DiscoveryCtl::Refresh);
+                        }
+                    }
                     Cmd::Disconnect(device_id) => {
                         if let Ok(mut guard) = live.inner.lock() {
                             guard.paused.insert(device_id.clone());
                         }
+                        // Queued before the writer is dropped, so it still goes out; the other side stops dialing back.
+                        if let Some(peer) = peers.get(&device_id) {
+                            let _ = peer.tx.send(Frame::Hold);
+                        }
                         peers.remove(&device_id);
-                        ready_sessions.remove(&device_id);
                         pending_holdings.remove(&device_id);
+                        drop_partial_snapshots(&live, &device_id);
                         publish(&app, &db, &live, &peers);
                     }
                     Cmd::ResolveOverwrite { id, accept } => {
-                        resolve_overwrite(&app, &db, &live, id, accept);
+                        resolve_overwrite(&app, &db, &live, &peers, id, accept);
                     }
                 }
             }
@@ -470,52 +565,120 @@ async fn run(
                 let Some(event) = event else { break };
                 match event {
                     NetEvent::Nearby(list) => {
-                        if let Ok(mut guard) = live.inner.lock() {
-                            guard.nearby = list;
+                        let appeared: Vec<String> = live
+                            .inner
+                            .lock()
+                            .map(|mut guard| {
+                                let appeared = list
+                                    .iter()
+                                    .filter(|item| !guard.nearby.iter().any(|old| old.device_id == item.device_id && old.port == item.port))
+                                    .map(|item| item.device_id.clone())
+                                    .collect();
+                                guard.nearby = list;
+                                appeared
+                            })
+                            .unwrap_or_default();
+                        // A device just showed up (or moved to another port): call it now instead of after its wait.
+                        for device_id in &appeared {
+                            redial.kick(device_id);
                         }
-                        dial_known(&db, &material, &provider, &event_tx, &live, &peers).await;
+                        redial_due(&db, &material, &provider, &event_tx, &live, &peers, &mut redial).await;
                         publish(&app, &db, &live, &peers);
                     }
-                    NetEvent::Connected { device_id, conn, target, dialed_by, path, writer, audio, identity_public, cert_der, name, incoming } => {
+                    NetEvent::Connected { device_id, conn, target, dialed_by, path, writer, audio, public_key, cert_der, name, incoming } => {
                         if let Ok(mut guard) = live.inner.lock() {
                             guard.failures.remove(&device_id);
-                            if guard.manual.as_deref() == Some("dialing") {
-                                guard.manual = Some("connected".into());
-                            }
+                            guard.held.remove(&device_id);
                         }
-                        if let Some(target) = &target {
-                            if let Ok(mut guard) = live.inner.lock() {
-                                guard.addresses.insert(target.clone(), device_id.clone());
-                            }
+                        if let Some(target) = target.as_ref().filter(|_| !incoming) {
+                            eprintln!("connected to {} at {target}", short_id(&device_id));
                         }
+                        let lan = path == "lan";
                         let before = peers.get(&device_id).map(|peer| peer.conn);
-                        adopt_connection(&db, &material, &live, &mut peers, &pending, &app, device_id.clone(), conn, dialed_by, incoming, path, writer, audio, identity_public, cert_der, name);
+                        adopt_connection(&db, &material, &live, &mut peers, &pending, &app, device_id.clone(), conn, dialed_by, incoming, path, writer, audio, public_key, cert_der, name);
+                        if peers.get(&device_id).is_some_and(|peer| peer.conn == conn) {
+                            redial.connected(&device_id);
+                            let host = target.as_deref().and_then(|text| text.parse::<SocketAddr>().ok());
+                            match host {
+                                Some(SocketAddr::V4(addr)) if lan => {
+                                    came_from.insert(device_id.clone(), (conn, addr.ip().to_string()));
+                                    // We dialed its listening address, so that address works: remember it.
+                                    if !incoming && peers.get(&device_id).is_some_and(|peer| peer.confirmed) {
+                                        remember_address(&db, &device_id, &[addr.ip().to_string()], addr.port());
+                                    }
+                                }
+                                _ => {
+                                    came_from.remove(&device_id);
+                                }
+                            }
+                        }
                         if before != Some(conn) && peers.get(&device_id).is_some_and(|peer| peer.confirmed && peer.conn == conn) {
-                            ready_sessions.remove(&device_id);
-                            send_bundle(&db, &mut store, &peers, &device_id).await;
+                            say_hello(&db, &peers, &device_id);
                         }
                         publish(&app, &db, &live, &peers);
                     }
                     NetEvent::DialFailed { device_id, target } => {
+                        if let Some(target) = &target {
+                            eprintln!("could not connect to {target}");
+                        }
+                        if let Some(device_id) = &device_id {
+                            redial.dial_failed(device_id);
+                        }
                         if let Ok(mut guard) = live.inner.lock() {
                             if let Some(device_id) = device_id {
                                 guard.failures.insert(device_id, "failed".into());
-                            }
-                            if guard.manual.as_deref() == Some("dialing") && target.is_some() {
-                                guard.manual = Some("failed".into());
                             }
                         }
                         publish(&app, &db, &live, &peers);
                     }
                     NetEvent::Frame { device_id, frame } => {
-                        if matches!(frame, Frame::PairAccept) {
-                            if accept_remote_pair(&db, &live, &mut peers, &device_id) {
-                                trust_saved_peers(&db, &mut store);
-                                send_bundle(&db, &mut store, &peers, &device_id).await;
+                        if farewells.contains_key(&device_id) {
+                            // A removed device answering means it forgot this computer: nothing is owed to it.
+                            if matches!(frame, Frame::Unpaired { pair: false }) {
+                                farewells.remove(&device_id);
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.end_removal(&device_id);
+                                }
                             }
-                            publish(&app, &db, &live, &peers);
+                            continue;
+                        }
+                        if matches!(frame, Frame::PairStart { .. } | Frame::PairAnswer { .. } | Frame::PairConfirm { .. } | Frame::PairFail { .. }) {
+                            // Only a connection that is not paired yet runs the code check.
+                            if peers.get(&device_id).is_some_and(|peer| !peer.confirmed) {
+                                if pairing_frame(&db, &material, &live, &mut peers, &device_id, frame) {
+                                    say_hello(&db, &peers, &device_id);
+                                }
+                                publish(&app, &db, &live, &peers);
+                            }
+                        } else if let Frame::Unpaired { pair } = frame {
+                            if peers.contains_key(&device_id) {
+                                if let Some(name) = forgotten_by(&db, &live, &mut peers, &mut pending_holdings, &device_id, pair) {
+                                    let _ = app.emit("unpaired", json!({"deviceId": device_id, "name": name}));
+                                }
+                                publish(&app, &db, &live, &peers);
+                            }
+                        } else if matches!(frame, Frame::Hold) {
+                            // Arrives before the close, so the redial that follows the close already skips it.
+                            if peers.contains_key(&device_id)
+                                && let Ok(mut guard) = live.inner.lock()
+                            {
+                                guard.held.insert(device_id.clone());
+                            }
                         } else {
-                            handle_frame(&app, &db, &material, &mut store, &peers, &live, &bus, &mut ready_sessions, &mut pending_holdings, &mut published_holdings, &device_id, frame).await;
+                            if let Some((port, addrs)) = hello_address(&frame)
+                                && peers.get(&device_id).is_some_and(|peer| peer.confirmed)
+                            {
+                                // The address it came from first (it works now), then the ones it says it has.
+                                let conn = peers.get(&device_id).map(|peer| peer.conn);
+                                let mut hosts: Vec<String> = came_from
+                                    .get(&device_id)
+                                    .filter(|(seen, _)| Some(*seen) == conn)
+                                    .map(|(_, ip)| vec![ip.clone()])
+                                    .unwrap_or_default();
+                                hosts.extend(addrs);
+                                remember_address(&db, &device_id, &hosts, port);
+                            }
+                            handle_frame(&app, &db, &mut peers, &live, &bus, &mut pending_holdings, &mut published_holdings, &device_id, frame);
                             let wanted: Vec<String> = live
                                 .inner
                                 .lock()
@@ -527,12 +690,16 @@ async fn run(
                         }
                     }
                     NetEvent::Closed { device_id, conn } => {
+                        if farewells.get(&device_id).is_some_and(|(peer, _)| peer.conn == conn) {
+                            farewells.remove(&device_id);
+                        }
                         if peers.get(&device_id).is_none_or(|peer| peer.conn != conn) {
                             continue;
                         }
                         let removed = peers.remove(&device_id);
-                        ready_sessions.remove(&device_id);
+                        let was_linked = removed.as_ref().is_some_and(|peer| peer.confirmed);
                         pending_holdings.remove(&device_id);
+                        drop_partial_snapshots(&live, &device_id);
                         if let Some(peer) = removed {
                             if peer.confirmed {
                                 let paused = live.inner.lock().map(|guard| guard.paused.contains(&device_id)).unwrap_or(false);
@@ -547,16 +714,18 @@ async fn run(
                                     guard.failures.insert(device_id.clone(), "failed".into());
                                 }
                             }
-                            if let Ok(mut guard) = live.inner.lock() {
-                                if guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id) {
-                                    guard.offer = None;
-                                }
-                            }
+                            pairing_closed(&live, &device_id);
                         }
+                        came_from.remove(&device_id);
                         publish(&app, &db, &live, &peers);
-                        // Try the LAN again right away; the nearby list does not change when a connection drops.
-                        dial_known(&db, &material, &provider, &event_tx, &live, &peers).await;
-                        maybe_relay_fallback(&db, &material, &provider, &event_tx, &device_id).await;
+                        // A link that worked is called again right away (saved address, Nearby, then the
+                        // relay), then with growing waits. One that closed before it was ready waits first.
+                        if was_linked {
+                            redial.link_lost(&device_id);
+                        } else {
+                            redial.closed_early(&device_id, Instant::now(), rand::random::<f64>());
+                        }
+                        redial_due(&db, &material, &provider, &event_tx, &live, &peers, &mut redial).await;
                     }
                     NetEvent::Invitation(invitation) => {
                         join_invited(&db, &material, &provider, &event_tx, invitation).await;
@@ -567,25 +736,13 @@ async fn run(
                     }
                 }
             }
-            _ = reconnect.tick() => {
-                let open = db.lock().map(|guard| network_open(&guard)).unwrap_or(false);
-                if open {
-                    dial_known(&db, &material, &provider, &event_tx, &live, &peers).await;
-                    let offline: Vec<String> = {
-                        let Ok(guard) = db.lock() else { continue };
-                        guard.peers().unwrap_or_default().into_iter().filter(|peer| {
-                            peer.trust != "verify" && !guard.is_blocked(&peer.device_id).unwrap_or(false) && !peers.contains_key(&peer.device_id)
-                        }).map(|peer| peer.device_id).collect()
-                    };
-                    for device_id in offline {
-                        maybe_relay_fallback(&db, &material, &provider, &event_tx, &device_id).await;
-                    }
-                }
+            _ = redial_tick.tick() => {
+                redial_due(&db, &material, &provider, &event_tx, &live, &peers, &mut redial).await;
             }
             pull = pull_rx.recv() => {
                 match pull {
-                    Some(Pull::Open { id, device_id, content_id, start, end, reply }) => {
-                        bus.register(id, reply);
+                    Some(Pull::Open { id, device_id, content_id, start, end, reply, queued }) => {
+                        bus.register_limited(id, reply, queued);
                         if let Some(peer) = peers.get(&device_id).filter(|peer| peer.confirmed) {
                             if peer.tx.send(Frame::AudioReq { id, content_id, start, end }).is_err() {
                                 bus.deliver(id, AudioPiece::failed("offline"));
@@ -617,7 +774,7 @@ enum NetEvent {
         path: String,
         writer: mpsc::UnboundedSender<Frame>,
         audio: mpsc::Sender<Frame>,
-        identity_public: Vec<u8>,
+        public_key: Vec<u8>,
         cert_der: Vec<u8>,
         name: String,
         incoming: bool,
@@ -630,42 +787,192 @@ enum NetEvent {
 }
 
 fn network_open(db: &Db) -> bool {
-    let (incognito, discovery, sync, audio) = switches(db);
-    !incognito && (discovery || sync || audio)
+    // Paired devices can always reach this computer unless incognito is on.
+    !switches(db).0
 }
 
-fn set_manual(live: &Live, state: &str) {
-    if let Ok(mut guard) = live.inner.lock() {
-        guard.manual = Some(state.to_string());
+
+/// How long a dial waits for one address to answer, and then for TLS.
+const DIAL_CONNECT_TIMEOUT: Duration = Duration::from_millis(2500);
+const DIAL_TLS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the redial schedule is checked.
+const REDIAL_TICK: Duration = Duration::from_secs(1);
+/// The longest wait between two calls to a paired device that is not connected.
+const REDIAL_MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// When each paired device that is not connected is called next. Rust keeps the links by itself,
+/// whether the window shows, discovery is on, or the phone's screen is off: a dropped device is
+/// called at once, then after 1, 2, 4 ... up to 60 seconds (plus up to a quarter more at random, so
+/// two devices do not keep calling each other at the same moment).
+#[derive(Default)]
+struct Redial {
+    due: HashMap<String, RedialState>,
+    /// Connections in a row that closed before the device was ready (e.g. it turned the link down).
+    /// Kept apart from `due`, which forgets a device while it is connected.
+    early_closes: HashMap<String, u32>,
+}
+
+#[derive(Clone, Copy)]
+struct RedialState {
+    tries: u32,
+    next: Instant,
+    /// A call is still under way until then (or until it fails on the LAN with no relay call).
+    busy_until: Option<Instant>,
+    relay: bool,
+}
+
+impl RedialState {
+    fn fresh(now: Instant) -> Self {
+        RedialState { tries: 0, next: now, busy_until: None, relay: false }
     }
 }
 
-fn remember_address(db: &Arc<Mutex<Db>>, host: &str, port: u16) {
-    let Ok(guard) = db.lock() else { return };
-    let mut list = guard.setting_json("manualAddresses").unwrap_or(json!([]));
-    let entry = format!("{host}:{port}");
-    if let Some(items) = list.as_array_mut() {
-        items.retain(|item| item.as_str() != Some(entry.as_str()));
-        items.insert(0, json!(entry));
-        items.truncate(8);
-    } else {
-        list = json!([entry]);
+impl Redial {
+    /// Call this device at the next check and start its waits over.
+    fn kick(&mut self, device_id: &str) {
+        let now = Instant::now();
+        let state = self.due.entry(device_id.to_string()).or_insert(RedialState::fresh(now));
+        state.tries = 0;
+        state.next = now;
     }
-    let _ = guard.set_device_setting("manualAddresses", list);
+
+    fn kick_all(&mut self) {
+        let now = Instant::now();
+        for state in self.due.values_mut() {
+            state.tries = 0;
+            state.next = now;
+        }
+    }
+
+    fn connected(&mut self, device_id: &str) {
+        self.due.remove(device_id);
+    }
+
+    /// A working link closed: call the device again at once, with the waits started over.
+    fn link_lost(&mut self, device_id: &str) {
+        self.early_closes.remove(device_id);
+        self.kick(device_id);
+    }
+
+    /// A connection closed before the device was ready. That counts as a failed call, so the next
+    /// one waits as usual instead of following at once, again and again.
+    fn closed_early(&mut self, device_id: &str, now: Instant, jitter: f64) {
+        let tries = self.early_closes.entry(device_id.to_string()).or_insert(0);
+        *tries = tries.saturating_add(1);
+        let tries = *tries;
+        self.due.insert(device_id.to_string(), RedialState { tries, next: now + redial_wait(tries, jitter), busy_until: None, relay: false });
+    }
+
+    /// The LAN call failed; unless the relay was asked too, the device may be called again on time.
+    fn dial_failed(&mut self, device_id: &str) {
+        if let Some(state) = self.due.get_mut(device_id).filter(|state| !state.relay) {
+            state.busy_until = None;
+        }
+    }
+
+    /// Records the call just started for `device_id`: how long it may take, and whether the relay was asked.
+    fn calling(&mut self, device_id: &str, now: Instant, lan_targets: usize, relay: bool) {
+        if let Some(state) = self.due.get_mut(device_id) {
+            let lan = DIAL_CONNECT_TIMEOUT * u32::try_from(lan_targets).unwrap_or(u32::MAX).min(8) + DIAL_TLS_TIMEOUT;
+            let took = if relay { lan.max(HANDSHAKE_TIMEOUT) } else { lan };
+            state.busy_until = Some(now + took);
+            state.relay = relay;
+        }
+    }
+
+    /// The devices to call now, out of `missing` (paired, not connected, not on hold). Each one
+    /// returned counts as tried: `.1` is how many times it was tried before.
+    fn take_due(&mut self, missing: &[String], now: Instant, jitter: impl Fn() -> f64) -> Vec<(String, u32)> {
+        self.due.retain(|id, _| missing.contains(id));
+        let mut out = Vec::new();
+        for id in missing {
+            let state = self.due.entry(id.clone()).or_insert(RedialState::fresh(now));
+            if now < state.next || state.busy_until.is_some_and(|until| now < until) {
+                continue;
+            }
+            out.push((id.clone(), state.tries));
+            state.tries = state.tries.saturating_add(1);
+            state.next = now + redial_wait(state.tries, jitter());
+        }
+        out
+    }
 }
 
-/// Paired devices that are not connected get dialed at their discovered address, then at saved manual addresses.
-async fn dial_known(
+/// The wait after the `tries`-th call: 1, 2, 4 ... seconds, at most `REDIAL_MAX_WAIT`, plus `jitter`
+/// (0 to 1) times a quarter of it.
+fn redial_wait(tries: u32, jitter: f64) -> Duration {
+    let base = Duration::from_secs(1u64 << tries.saturating_sub(1).min(6)).min(REDIAL_MAX_WAIT);
+    base + base.mul_f64(jitter.clamp(0.0, 1.0) * 0.25)
+}
+
+/// Where to call a device: its saved addresses first, then what Nearby found, each address once.
+fn redial_targets(saved: Option<(Vec<String>, u16)>, nearby: Option<&Nearby>) -> Vec<(String, u16)> {
+    let mut out: Vec<(String, u16)> = Vec::new();
+    if let Some((hosts, port)) = saved {
+        for host in hosts {
+            if !out.contains(&(host.clone(), port)) {
+                out.push((host, port));
+            }
+        }
+    }
+    if let Some(item) = nearby {
+        for host in &item.hosts {
+            if !out.contains(&(host.clone(), item.port)) {
+                out.push((host.clone(), item.port));
+            }
+        }
+    }
+    out
+}
+
+/// The port and addresses a paired device put in its hello (older versions send neither).
+fn hello_address(frame: &Frame) -> Option<(u16, Vec<String>)> {
+    let Frame::Message(bytes) = frame else { return None };
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    if value.get("kind").and_then(Value::as_str) != Some("hello") {
+        return None;
+    }
+    let port = value.get("port").and_then(Value::as_u64).and_then(|port| u16::try_from(port).ok()).filter(|port| *port != 0)?;
+    let addrs = value
+        .get("addrs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|text| text.parse::<Ipv4Addr>().is_ok_and(|ip| !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()))
+                .take(crate::db::PEER_ADDRESS_LIMIT)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((port, addrs))
+}
+
+fn remember_address(db: &Arc<Mutex<Db>>, device_id: &str, hosts: &[String], port: u16) {
+    if let Ok(guard) = db.lock() {
+        let _ = guard.save_peer_address(device_id, hosts, port, now_ms());
+    }
+}
+
+/// Calls the paired devices whose turn it is: on the LAN at their saved addresses and where Nearby
+/// found them, and through the relay when there is no address or the last call did not connect.
+/// Removed devices not told yet are called on the LAN too, only to tell them (see `tell_removed`).
+async fn redial_due(
     db: &Arc<Mutex<Db>>,
     material: &IdentityMaterial,
     provider: &Arc<rustls::crypto::CryptoProvider>,
     events: &mpsc::UnboundedSender<NetEvent>,
     live: &Live,
     peers: &HashMap<String, PeerOut>,
+    redial: &mut Redial,
 ) {
-    let (saved, manual, allowed) = {
+    let (saved, removed, relay) = {
         let Ok(guard) = db.lock() else { return };
-        let (incognito, _, sync, audio) = switches(&guard);
+        if !network_open(&guard) {
+            redial.due.clear();
+            return;
+        }
         let saved: Vec<String> = guard
             .peers()
             .unwrap_or_default()
@@ -673,73 +980,73 @@ async fn dial_known(
             .filter(|peer| peer.trust != "verify" && !guard.is_blocked(&peer.device_id).unwrap_or(false))
             .map(|peer| peer.device_id)
             .collect();
-        let manual: Vec<String> = guard
-            .setting_json("manualAddresses")
-            .ok()
-            .and_then(|value| value.as_array().cloned())
+        let removed: Vec<String> = guard
+            .removals()
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|value| value.as_str().map(str::to_string))
+            .map(|row| row.device_id)
+            .filter(|id| !guard.is_blocked(id).unwrap_or(false))
             .collect();
-        (saved, manual, !incognito && (sync || audio))
+        (saved, removed, relay_ready(&guard))
     };
-    if !allowed {
-        return;
+    let paused = live.inner.lock().map(|guard| guard.on_hold()).unwrap_or_default();
+    let mut missing = redial_ids(saved.clone(), |id| peers.contains_key(id), &paused);
+    for id in removed {
+        if !peers.contains_key(&id) && !missing.contains(&id) {
+            missing.push(id);
+        }
     }
-    let paused = live.inner.lock().map(|guard| guard.paused.clone()).unwrap_or_default();
-    let missing: Vec<String> = saved.into_iter().filter(|id| !peers.contains_key(id) && !paused.contains(id)).collect();
     if missing.is_empty() {
+        redial.due.clear();
         return;
     }
-    let (nearby, addresses) = live
-        .inner
-        .lock()
-        .map(|guard| (guard.nearby.clone(), guard.addresses.clone()))
-        .unwrap_or_default();
-    for device_id in &missing {
-        if let Some(target) = nearby.iter().find(|item| &item.device_id == device_id) {
-            if !dial_gate(device_id) {
-                continue;
-            }
-            dial_peer(db, material, provider, events, target.hosts.clone(), target.port, Some(device_id.clone()), &material.device_id).await;
-        }
-    }
-    for address in manual {
-        let Some((host, port)) = address.rsplit_once(':') else { continue };
-        let Ok(port) = port.parse::<u16>() else { continue };
-        if nearby.iter().any(|item| item.hosts.iter().any(|known| known == host) && item.port == port) {
-            continue;
-        }
-        if addresses.get(&address).is_some_and(|id| peers.contains_key(id) || !missing.contains(id)) {
-            continue;
-        }
-        dial_peer(db, material, provider, events, vec![host.to_string()], port, None, &material.device_id).await;
-    }
-}
-
-/// Lets automatic reconnects dial one device at most every 6 seconds.
-fn dial_gate(device_id: &str) -> bool {
-    static GATE: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
-    let Ok(mut map) = GATE.get_or_init(Default::default).lock() else { return true };
     let now = Instant::now();
-    if map.get(device_id).is_some_and(|last| now.duration_since(*last) < Duration::from_secs(6)) {
-        return false;
+    let due = redial.take_due(&missing, now, rand::random::<f64>);
+    if due.is_empty() {
+        return;
     }
-    map.insert(device_id.to_string(), now);
-    true
+    let nearby = live.inner.lock().map(|guard| guard.nearby.clone()).unwrap_or_default();
+    for (device_id, tries) in due {
+        let address = db.lock().ok().and_then(|guard| guard.peer_address(&device_id).ok().flatten());
+        let targets = redial_targets(address, nearby.iter().find(|item| item.device_id == device_id));
+        let lan = targets.len();
+        // The relay only carries data between paired devices; pairing itself stays on the LAN.
+        let via_relay = relay && saved.contains(&device_id) && (lan == 0 || tries > 0);
+        redial.calling(&device_id, now, lan, via_relay);
+        let short: String = device_id.chars().take(8).collect();
+        eprintln!("calling {short} again (try {}): {lan} address(es){}", tries + 1, if via_relay { " and the relay" } else { "" });
+        if lan > 0 {
+            dial_targets(db, material, provider, events, targets, Some(device_id.clone()), &material.device_id).await;
+        }
+        if via_relay {
+            maybe_relay_fallback(db, material, provider, events, &device_id).await;
+        }
+    }
 }
 
-fn switches(db: &Db) -> (bool, bool, bool, bool) {
+/// Whether the device unpaired this computer in the last 10 seconds. `mark` records that it just did.
+fn unpaired_lately(device_id: &str, mark: bool) -> bool {
+    static SEEN: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+    let Ok(mut map) = SEEN.get_or_init(Default::default).lock() else { return false };
+    let now = Instant::now();
+    map.retain(|_, at| now.duration_since(*at) < Duration::from_secs(10));
+    if mark {
+        map.insert(device_id.to_string(), now);
+    }
+    map.contains_key(device_id)
+}
+
+/// (incognito, discovery). Incognito is the only thing that stops sharing: otherwise every paired,
+/// connected device sees, plays and downloads every local song. Discovery only controls Nearby.
+fn switches(db: &Db) -> (bool, bool) {
     let incognito = db.setting_bool("incognito").unwrap_or(false);
     let discovery = db.setting_bool("discovery").unwrap_or(false);
-    // Sync and audio stay available. Exposure decides which songs leave this computer,
-    // and Auto send decides which of your edits are pushed out.
-    (incognito, discovery, true, true)
+    (incognito, discovery)
 }
 
 fn relay_ready(db: &Db) -> bool {
-    let (incognito, _, sync, audio) = switches(db);
-    if incognito || (!sync && !audio) {
+    let (incognito, _) = switches(db);
+    if incognito {
         return false;
     }
     let host = db.setting_string("relayHost").unwrap_or_default();
@@ -757,78 +1064,98 @@ async fn restart_listener(
     actual_port: &mut u16,
     live: &Live,
 ) {
-    let ((incognito, discovery, sync, audio), port) = {
-        let guard = db.lock().expect("db");
-        let switches = switches(&guard);
-        let port = guard.setting_i64("listenPort").unwrap_or(0).clamp(0, u16::MAX as i64) as u16;
-        (switches, port)
+    let (incognito, _) = {
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+        switches(&guard)
     };
-    let wanted = !incognito && (discovery || sync || audio);
+    // The listener runs whenever incognito is off, so paired devices can always connect.
+    let wanted = !incognito;
     // Keep a healthy listener so the announced port stays valid across settings changes.
-    if wanted
-        && *actual_port != 0
-        && (port == 0 || port == *actual_port)
-        && listener.as_ref().is_some_and(|task| !task.is_finished())
-    {
+    if wanted && *actual_port != 0 && listener.as_ref().is_some_and(|task| !task.is_finished()) {
         return;
     }
     if let Some(task) = listener.take() {
         task.abort();
-        // Wait until the old socket is really closed, otherwise a fixed port is still busy.
         let _ = task.await;
     }
-    if !wanted {
-        *actual_port = 0;
-        if let Ok(mut live) = live.inner.lock() {
-            live.listen_port = 0;
-            live.port_fallback = None;
-        }
-        return;
-    }
-    let mut fell_back = false;
-    let bind = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await {
-        Ok(tcp) => Ok(tcp),
-        Err(_) if port != 0 => {
-            fell_back = true;
-            TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await
-        }
-        Err(err) => Err(err),
-    };
-    let Ok(tcp) = bind else {
-        *actual_port = 0;
-        if let Ok(mut live) = live.inner.lock() {
-            live.listen_port = 0;
-            live.port_fallback = None;
-        }
-        return;
-    };
-    *actual_port = tcp.local_addr().map(|addr| addr.port()).unwrap_or(0);
-    if port == 0 && *actual_port != 0 {
-        if let Ok(guard) = db.lock() {
-            let _ = guard.set_device_setting("listenPort", json!(*actual_port));
-        }
-    }
+    // The port is never chosen by the user: each new listener takes whatever free port the system
+    // gives it, and discovery announces that port.
+    let bind = if wanted { TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.ok() } else { None };
+    *actual_port = bind.as_ref().and_then(|tcp| tcp.local_addr().ok()).map(|addr| addr.port()).unwrap_or(0);
     if let Ok(mut live) = live.inner.lock() {
         live.listen_port = *actual_port;
-        live.port_fallback = (fell_back && *actual_port != 0 && *actual_port != port).then_some(port);
     }
+    LISTEN_PORT.store(*actual_port, std::sync::atomic::Ordering::Relaxed);
+    let Some(tcp) = bind else { return };
+    if *actual_port == 0 {
+        return;
+    }
+    eprintln!("listening on port {}", *actual_port);
     let events = events.clone();
     let db = db.clone();
     let material = material.clone_parts();
     let provider = provider.clone();
     *listener = Some(tokio::task::spawn_local(async move {
+        // Anyone on the network can connect, so only a few handshakes run at once and each one is timed.
+        let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_HANDSHAKES));
         loop {
-            let Ok((stream, _)) = tcp.accept().await else { break };
+            let stream = match tcp.accept().await {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    // For example too many open sockets; wait instead of spinning.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
+            let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
             let events = events.clone();
             let db = db.clone();
             let material = material.clone();
             let provider = provider.clone();
             tokio::task::spawn_local(async move {
-                let _ = accept_lan(stream, db, material, provider, events).await;
+                let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, accept_lan(stream, db, material, provider, events)).await;
+                drop(permit);
             });
         }
     }));
 }
+
+/// The port this device listens on now, sent in hellos.
+static LISTEN_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// The path of a connection that goes through the relay.
+const RELAY_PATH: &str = "relay";
+
+/// Pairing happens only on the local network. The relay only carries data between devices that are
+/// already paired, so a relay connection is kept only for a device saved here, holding the key that
+/// was pinned when it was paired. Anyone else is dropped at once: no first contact, no pairing dialog.
+fn relay_admits(saved: Option<&crate::db::PeerRow>, public_key: &[u8]) -> bool {
+    saved.is_some_and(|peer| peer.public_key == public_key)
+}
+
+/// Frames that never cross the relay, in either direction: the pairing code check, and asking the
+/// other device to forget this one and show a new code, which is pairing again.
+fn relay_forbids(frame: &Frame) -> bool {
+    matches!(
+        frame,
+        Frame::PairStart { .. } | Frame::PairAnswer { .. } | Frame::PairConfirm { .. } | Frame::PairFail { .. } | Frame::Unpaired { pair: true }
+    )
+}
+
+/// Handshakes from unknown devices that may run at the same time.
+const MAX_HANDSHAKES: usize = 16;
+/// Time allowed for TCP, relay and TLS setup before a connection is dropped.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often each side sends a keepalive on an idle connection.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+/// A connection silent this long is gone. Older versions send a keepalive every 45 seconds, so this
+/// stays above that.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Unconfirmed devices that may wait for an answer at the same time.
+const MAX_UNCONFIRMED: usize = 8;
 
 async fn accept_lan(
     stream: TcpStream,
@@ -837,6 +1164,9 @@ async fn accept_lan(
     provider: Arc<rustls::crypto::CryptoProvider>,
     events: mpsc::UnboundedSender<NetEvent>,
 ) -> AppResult<()> {
+    // Where it came from; the port it listens on comes in its hello.
+    let remote = stream.peer_addr().ok().map(|addr| addr.to_string());
+    // Any device key gets through TLS; `finish_handshake` decides from the device id.
     let verifier = Arc::new(tls::IdentityVerifier::peer(provider.clone(), None));
     let config = tls::server_config(provider, &material.cert_der, &material.cert_key, verifier)
         .map_err(|err| crate::error::AppError::Message(err.to_string()))?;
@@ -844,7 +1174,7 @@ async fn accept_lan(
     let tls = acceptor.accept(stream).await.map_err(|err| crate::error::AppError::Message(err.to_string()))?;
     let certs = tls.get_ref().1.peer_certificates().map(|certs| certs.to_vec()).unwrap_or_default();
     let dialed_by = material.device_id.clone();
-    finish_handshake(tls, certs, db, material, events, "lan".into(), dialed_by, true, None).await
+    finish_handshake(tls, certs, db, material, events, "lan".into(), dialed_by, true, remote).await
 }
 
 async fn dial_peer(
@@ -857,29 +1187,43 @@ async fn dial_peer(
     expected_device: Option<String>,
     dialed_by: &str,
 ) {
+    let targets = hosts.into_iter().map(|host| (host, port)).collect();
+    dial_targets(db, material, provider, events, targets, expected_device, dialed_by).await;
+}
+
+/// Connects to the first of `targets` (address, port) that answers.
+async fn dial_targets(
+    db: &Arc<Mutex<Db>>,
+    material: &IdentityMaterial,
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+    events: &mpsc::UnboundedSender<NetEvent>,
+    targets: Vec<(String, u16)>,
+    expected_device: Option<String>,
+    dialed_by: &str,
+) {
     let events = events.clone();
     let db = db.clone();
     let parts = material.clone_parts();
     let provider = provider.clone();
     let dialed_by = dialed_by.to_string();
     tokio::task::spawn_local(async move {
-        let mut target = format!("{}:{port}", hosts.first().cloned().unwrap_or_default());
+        let mut target = targets.first().map(|(host, port)| format!("{host}:{port}")).unwrap_or_default();
         let failed = |events: &mpsc::UnboundedSender<NetEvent>, target: &str| {
             let _ = events.send(NetEvent::DialFailed { device_id: expected_device.clone(), target: Some(target.to_string()) });
         };
         // The device may be reachable on only one of its addresses, so try them in order.
         let mut connected = None;
-        for host in &hosts {
+        for (host, port) in &targets {
             target = format!("{host}:{port}");
-            let connect = TcpStream::connect((host.as_str(), port));
-            if let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_millis(2500), connect).await {
+            let connect = TcpStream::connect((host.as_str(), *port));
+            if let Ok(Ok(stream)) = tokio::time::timeout(DIAL_CONNECT_TIMEOUT, connect).await {
                 connected = Some(stream);
                 break;
             }
         }
         let Some(stream) = connected else { return failed(&events, &target) };
         let failed = |events: &mpsc::UnboundedSender<NetEvent>| failed(events, &target);
-        let expected = expected_device.as_ref().and_then(|id| ids::identity_bytes_from_app_id(id));
+        let expected = expected_device.as_ref().and_then(|id| ids::key_hash_from_device_id(id));
         let verifier = Arc::new(tls::IdentityVerifier::peer(provider.clone(), expected));
         let config = match tls::client_config(provider, &parts.cert_der, &parts.cert_key, verifier, None) {
             Ok(config) => config,
@@ -887,7 +1231,7 @@ async fn dial_peer(
         };
         let connector = TlsConnector::from(Arc::new(config));
         let name = rustls::pki_types::ServerName::try_from(crate::identity::TLS_DNS_NAME).expect("name");
-        let Ok(Ok(tls)) = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, stream)).await else {
+        let Ok(Ok(tls)) = tokio::time::timeout(DIAL_TLS_TIMEOUT, connector.connect(name, stream)).await else {
             return failed(&events);
         };
         let certs = tls.get_ref().1.peer_certificates().map(|certs| certs.to_vec()).unwrap_or_default();
@@ -912,18 +1256,38 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
 {
     let peer_cert = certs.first().ok_or_else(|| crate::error::AppError::Message("missing peer cert".into()))?;
-    let identity_public = identity_of(peer_cert.as_ref())?;
-    if !identity::certificate_binds(peer_cert.as_ref(), &identity_public)? {
-        return Err(crate::error::AppError::Message("bad peer cert".into()));
-    }
-    let device_id = ids::app_device_id(&identity_public);
+    let public_key = identity::public_key_of(peer_cert.as_ref())?;
+    let device_id = ids::app_device_id(&public_key);
     // On a connection we accepted, the other device is the one that dialed. Both sides must agree on this
     // so that, when two devices dial each other at once, they keep the same connection.
-    let dialed_by = if incoming { device_id.clone() } else { dialed_by };
-    let refuse = db.lock().ok().is_some_and(|guard| {
-        guard.is_blocked(&device_id).unwrap_or(false) || (incoming && guard.silence_active(&device_id))
-    });
-    if refuse {
+    // An empty value marks a relay session where the other device is the TLS client, so both sides
+    // name the same dialer and keep the same connection.
+    let dialed_by = if incoming || dialed_by.is_empty() { device_id.clone() } else { dialed_by };
+    let (blocked, removed, silenced) = db.lock().map(|guard| {
+        (guard.is_blocked(&device_id).unwrap_or(false), guard.is_removed(&device_id), guard.silence_active(&device_id))
+    }).unwrap_or((true, false, false));
+    if blocked {
+        return Err(crate::error::AppError::Message("unreachable".into()));
+    }
+    let relay = path == RELAY_PATH;
+    if relay {
+        let saved = db
+            .lock()
+            .ok()
+            .and_then(|guard| guard.peers().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|peer| peer.device_id == device_id);
+        if !relay_admits(saved.as_ref(), &public_key) {
+            eprintln!("relay: dropped {}, it is not a paired device", short_id(&device_id));
+            return Err(crate::error::AppError::Message("not paired".into()));
+        }
+    }
+    if removed {
+        tell_removed(stream, &db, &device_id).await;
+        return Ok(());
+    }
+    if incoming && silenced {
         return Err(crate::error::AppError::Message("unreachable".into()));
     }
     let conn = rand::random::<u64>();
@@ -937,7 +1301,7 @@ where
         path,
         writer: tx,
         audio: audio_tx,
-        identity_public,
+        public_key,
         cert_der: peer_cert.as_ref().to_vec(),
         name: device_id.clone(),
         incoming,
@@ -945,26 +1309,40 @@ where
     let (mut reader, mut writer) = tokio::io::split(stream);
     let events_read = events.clone();
     let device_read = device_id.clone();
+    // Dropped when the writer stops (connection not used, replaced or removed), so the reader stops too.
+    let (writer_done, mut stop_reading) = tokio::sync::oneshot::channel::<()>();
     tokio::task::spawn_local(async move {
         loop {
-            match frames::read_frame(&mut reader).await {
-                Ok(frame) => {
+            let next = tokio::select! {
+                _ = &mut stop_reading => break,
+                next = tokio::time::timeout(READ_IDLE_TIMEOUT, frames::read_frame(&mut reader)) => next,
+            };
+            match next {
+                Ok(Ok(frame)) => {
+                    if relay && relay_forbids(&frame) {
+                        eprintln!("relay: dropped a pairing frame from {}", short_id(&device_read));
+                        continue;
+                    }
                     if events_read.send(NetEvent::Frame { device_id: device_read.clone(), frame }).is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+                _ => break,
             }
         }
         let _ = events_read.send(NetEvent::Closed { device_id: device_read, conn });
     });
     tokio::task::spawn_local(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(45));
+        let _writer_done = writer_done;
+        let mut interval = tokio::time::interval(KEEPALIVE_INTERVAL);
         loop {
             tokio::select! {
                 biased;
                 frame = rx.recv() => {
                     let Some(frame) = frame else { break };
+                    if relay && relay_forbids(&frame) {
+                        continue;
+                    }
                     if write_or_stop(&mut writer, &frame).await {
                         break;
                     }
@@ -987,15 +1365,38 @@ where
     Ok(())
 }
 
-fn identity_of(cert_der: &[u8]) -> AppResult<Vec<u8>> {
-    let (_, cert) = x509_parser::parse_x509_certificate(cert_der)
-        .map_err(|err| crate::error::AppError::Message(err.to_string()))?;
-    for extension in cert.extensions() {
-        if extension.oid.to_id_string() == "1.3.6.1.4.1.55529.1" {
-            return Ok(extension.value.to_vec());
-        }
+/// How long a device that was told it was removed has to answer before the connection is dropped.
+const UNPAIR_ANSWER_WINDOW: Duration = Duration::from_secs(5);
+
+/// This computer removed the device while it was not connected. TLS just proved that this is that
+/// device, so tell it now, on this connection, and nothing else: it forgets this computer, stops
+/// dialing it, and answers with its own Unpaired. Only that answer ends the removal record; without
+/// it (the connection broke, or the device held it) the device is told again next time.
+async fn tell_removed<S>(mut stream: S, db: &Arc<Mutex<Db>>, device_id: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if frames::write_frame(&mut stream, &Frame::Unpaired { pair: false }).await.is_err() {
+        return;
     }
-    Err(crate::error::AppError::Message("no identity".into()))
+    let answered = tokio::time::timeout(UNPAIR_ANSWER_WINDOW, async {
+        loop {
+            match frames::read_frame(&mut stream).await {
+                Ok(Frame::Unpaired { pair: false }) => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    let _ = stream.shutdown().await;
+    if answered {
+        if let Ok(guard) = db.lock() {
+            let _ = guard.end_removal(device_id);
+        }
+        eprintln!("told {} it was removed", short_id(device_id));
+    }
 }
 
 fn adopt_connection(
@@ -1012,7 +1413,7 @@ fn adopt_connection(
     path: String,
     writer: mpsc::UnboundedSender<Frame>,
     audio: mpsc::Sender<Frame>,
-    identity_public: Vec<u8>,
+    public_key: Vec<u8>,
     cert_der: Vec<u8>,
     name: String,
 ) {
@@ -1023,26 +1424,59 @@ fn adopt_connection(
         guard.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id)
     });
     let blocked = db.lock().ok().is_some_and(|guard| guard.is_blocked(&device_id).unwrap_or(false));
-    if blocked || live.inner.lock().ok().is_some_and(|guard| guard.paused.contains(&device_id)) {
+    if blocked {
         return;
     }
-    let waiting = pending.contains(&device_id) || pending.iter().any(|item| item.starts_with("manual:"));
+    // Checked again here, against the device list as it is now: over the relay only a paired device.
+    let relay = path == RELAY_PATH;
+    if relay && !relay_admits(known.as_ref(), &public_key) {
+        return;
+    }
+    if live.inner.lock().ok().is_some_and(|guard| guard.paused.contains(&device_id)) {
+        let _ = writer.send(Frame::Hold);
+        return;
+    }
+    let waiting = pending.contains(&device_id);
     // First contact is only accepted on a connection the other device opened, or one we dialed on purpose.
     if known.is_none() && !incoming && !waiting {
         return;
     }
+    // A device that just unpaired this computer may have dialed it twice at once; the second
+    // connection is not a pairing request.
+    if known.is_none() && !waiting && unpaired_lately(&device_id, false) {
+        return;
+    }
+    // Strangers cannot fill the device list: only a few unconfirmed devices wait at once.
+    if known.is_none()
+        && !waiting
+        && !peers.contains_key(&device_id)
+        && peers.values().filter(|peer| !peer.confirmed).count() >= MAX_UNCONFIRMED
+    {
+        return;
+    }
     if let Some(peer) = &known {
-        if peer.identity_public != identity_public {
+        if peer.public_key != public_key {
             return;
         }
     }
-    let name = live
-        .inner
-        .lock()
-        .ok()
-        .and_then(|guard| guard.nearby.iter().find(|item| item.device_id == device_id).map(|item| item.name.clone()))
-        .filter(|text| !text.is_empty())
-        .unwrap_or(name);
+    // After too many wrong codes, new devices cannot start pairing until the lock ends.
+    if known.is_none()
+        && incoming
+        && live.inner.lock().is_ok_and(|mut guard| guard.pairing.guard.locked(Instant::now()))
+    {
+        let _ = writer.send(Frame::PairFail { reason: "locked".into() });
+        return;
+    }
+    // A paired device keeps its saved name; an unauthenticated announce must not rename it.
+    let saved_name = known.as_ref().map(|peer| peer.display_name.clone()).filter(|text| !text.is_empty() && *text != device_id);
+    let name = saved_name.unwrap_or_else(|| {
+        live.inner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.nearby.iter().find(|item| item.device_id == device_id).map(|item| item.name.clone()))
+            .filter(|text| !text.is_empty())
+            .unwrap_or(name)
+    });
     if let Some(existing) = peers.get(&device_id) {
         let smaller = smaller_device(&material.device_id, &device_id);
         let preferred = match smaller {
@@ -1054,17 +1488,36 @@ fn adopt_connection(
             return;
         }
     }
+    // An unasked request does not replace a pairing still going on with another device.
     let confirmed = known.as_ref().is_some_and(|peer| peer.trust != "verify");
+    let busy = !confirmed
+        && incoming
+        && !waiting
+        && live.inner.lock().ok().is_some_and(|guard| {
+            guard.offer.as_ref().is_some_and(|offer| offer.device_id != device_id && !offer.finished())
+        });
+    // A new device is told at once and let go, so it does not wait in the list.
+    if busy && known.is_none() {
+        let _ = writer.send(Frame::PairFail { reason: "busy".into() });
+        return;
+    }
+    // Pairing from here with a device that may still have this one saved: it forgets this device
+    // and shows a code, instead of treating the connection as already paired.
+    if known.is_none() && !incoming && !relay {
+        let _ = writer.send(Frame::Unpaired { pair: true });
+    }
     peers.insert(device_id.clone(), PeerOut {
         device_id: device_id.clone(),
         conn,
         dialed_by,
         confirmed,
+        ready: false,
         incoming,
         path: path.clone(),
         tx: writer,
         audio,
         alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        cert_der: cert_der.clone(),
     });
     if confirmed {
         let shown = name.clone();
@@ -1078,24 +1531,29 @@ fn adopt_connection(
         {
             let _ = guard.add_notice("request", &device_id, &name, &path);
         }
-        stage_offer(db, material, live, &identity_public, &cert_der, &name, if incoming { "incoming" } else { "outgoing" }, app);
+        if !busy {
+            // A saved device set to Ask each time is already known by its key: it only needs a yes.
+            let role = if known.is_some() { "approve" } else if incoming { "incoming" } else { "outgoing" };
+            // Allow keeps the trust saved for a known device unless the user changes it in the dialog.
+            let trust = known.as_ref().map_or("full", |peer| clean_trust(&peer.trust));
+            stage_offer(live, &public_key, &cert_der, &name, role, trust, app);
+        }
     }
 }
 
-fn stage_offer(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    live: &Live,
-    identity_public: &[u8],
-    cert_der: &[u8],
-    name: &str,
-    role: &str,
-    app: &AppHandle,
-) {
-    let Ok(remote_key) = libsignal_protocol::IdentityKey::decode(identity_public) else { return };
-    let number = identity::safety_number(material.identity.identity_key(), &remote_key).unwrap_or_default();
-    let device_id = ids::app_device_id(identity_public);
+fn stage_offer(live: &Live, public_key: &[u8], cert_der: &[u8], name: &str, role: &str, trust: &str, app: &AppHandle) {
+    put_offer(live, public_key, cert_der, name, role, trust);
+    let _ = app.emit("network-updated", json!({}));
+}
+
+/// Puts the pairing dialog for this device on screen. The "incoming" side gets a fresh code.
+fn put_offer(live: &Live, public_key: &[u8], cert_der: &[u8], name: &str, role: &str, trust: &str) {
+    let device_id = ids::app_device_id(public_key);
     if let Ok(mut guard) = live.inner.lock() {
+        // A new connection from the same device keeps the code already on screen.
+        if guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id && offer.role == role && !offer.finished()) {
+            return;
+        }
         let shown = guard
             .nearby
             .iter()
@@ -1103,42 +1561,61 @@ fn stage_offer(
             .map(|item| item.name.clone())
             .filter(|text| !text.is_empty())
             .unwrap_or_else(|| if name.is_empty() || name == device_id { short_id(&device_id) } else { name.to_string() });
+        guard.pairing.reset();
+        let now = Instant::now();
+        let code = (role == "incoming").then(|| pairing::Code::new(now));
+        let tries_left = guard.pairing.guard.tries_left();
         guard.offer = Some(PairingOffer {
             device_id,
             name: shown,
-            safety_number: number,
-            cert_der: cert_der.to_vec(),
-            identity_public: identity_public.to_vec(),
+            public_key: public_key.to_vec(),
             cert_id: ids::cert_id_display(cert_der),
             role: role.to_string(),
+            code: code.as_ref().map(|code| code.value().to_string()),
+            expires_at: code.as_ref().map(|code| code_deadline_ms(code, now)),
+            status: String::new(),
+            tries_left,
+            locked_until: None,
+            trust: clean_trust(trust).into(),
         });
+        guard.pairing.code = code;
     }
-    let _ = db;
-    let _ = app.emit("network-updated", json!({}));
 }
 
-fn confirm_peer(
-    db: &Arc<Mutex<Db>>,
-    _material: &IdentityMaterial,
-    live: &Live,
-    peers: &mut HashMap<String, PeerOut>,
-    device_id: &str,
-    trust: &str,
-) -> bool {
-    let offer = live.inner.lock().ok().and_then(|guard| guard.offer.clone());
-    let Some(offer) = offer.filter(|offer| offer.device_id == device_id && offer.role == "incoming") else { return false };
-    let number = offer.safety_number.clone();
-    let trust = if trust == "verify" { "verify" } else { "full" };
+fn clean_trust(trust: &str) -> &'static str {
+    if trust == "verify" { "verify" } else { "full" }
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn code_deadline_ms(code: &pairing::Code, now: Instant) -> i64 {
+    now_ms() + i64::try_from(code.seconds_left(now)).unwrap_or(0) * 1000
+}
+
+fn send_frame(peers: &HashMap<String, PeerOut>, device_id: &str, frame: Frame) {
+    if let Some(peer) = peers.get(device_id) {
+        let _ = peer.tx.send(frame);
+    }
+}
+
+/// Ends a connection that is not paired. Frames queued before this still go out.
+fn drop_unpaired(peers: &mut HashMap<String, PeerOut>, device_id: &str) {
+    if peers.get(device_id).is_some_and(|peer| !peer.confirmed) {
+        peers.remove(device_id);
+    }
+}
+
+/// A saved device set to Ask each time is connecting again and the user said yes. TLS already
+/// checked that it holds the key saved when it was paired.
+fn approve_peer(db: &Arc<Mutex<Db>>, live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str, trust: &str) -> bool {
+    let asked = live.inner.lock().is_ok_and(|guard| guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id && offer.role == "approve"));
+    if !asked {
+        return false;
+    }
     if let Ok(guard) = db.lock() {
-        let _ = guard.upsert_peer(&crate::db::PeerRow {
-            device_id: offer.device_id.clone(),
-            identity_public: offer.identity_public,
-            cert_der: offer.cert_der,
-            cert_id: offer.cert_id,
-            display_name: offer.name.clone(),
-            safety_number: number,
-            trust: trust.to_string(),
-        });
+        let _ = guard.set_peer_trust(device_id, clean_trust(trust));
     }
     if let Some(peer) = peers.get_mut(device_id) {
         peer.confirmed = true;
@@ -1149,30 +1626,433 @@ fn confirm_peer(
     true
 }
 
-/// The device we dialed has accepted. Save the identity it already presented.
-fn accept_remote_pair(db: &Arc<Mutex<Db>>, live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str) -> bool {
+/// Asking side: the user typed the code shown on the other device. Sends the first SPAKE2 message,
+/// bound to this device's TLS key and the key the other device showed on this connection.
+fn start_pairing(material: &IdentityMaterial, live: &Live, peers: &HashMap<String, PeerOut>, device_id: &str, trust: &str, typed: &str) {
+    let Ok(mut guard) = live.inner.lock() else { return };
+    let inner = &mut *guard;
+    let Some(offer) = inner.offer.as_mut().filter(|offer| offer.device_id == device_id && offer.role == "outgoing") else { return };
+    if offer.finished() || inner.pairing.asking.is_some() {
+        return;
+    }
+    let Some(code) = pairing::clean_code(typed) else {
+        offer.status = "badCode".into();
+        return;
+    };
+    if !peers.contains_key(device_id) {
+        offer.status = "failed".into();
+        return;
+    }
+    let (asking, message) = pairing::Asking::start(&code, &material.public_key, &offer.public_key);
+    inner.pairing.asking = Some((device_id.to_string(), asking, Instant::now() + pairing::ANSWER_TIMEOUT * 2));
+    offer.status = "checking".into();
+    offer.trust = clean_trust(trust).into();
+    send_frame(peers, device_id, Frame::PairStart { message });
+}
+
+/// Handles one pairing frame from a device that is not paired yet. True when it is paired now.
+fn pairing_frame(db: &Arc<Mutex<Db>>, material: &IdentityMaterial, live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str, frame: Frame) -> bool {
+    match frame {
+        Frame::PairStart { message } => {
+            answer_pairing(material, live, peers, device_id, &message);
+            false
+        }
+        Frame::PairAnswer { message, tag } => {
+            let asking = live.inner.lock().ok().and_then(|mut guard| guard.pairing.asking.take_if(|(id, _, _)| id == device_id));
+            let Some((_, asking, _)) = asking else { return false };
+            match asking.finish(&message, &tag) {
+                Ok(back) => {
+                    send_frame(peers, device_id, Frame::PairConfirm { tag: back });
+                    save_paired(db, live, peers, device_id, "outgoing")
+                }
+                Err(_) => {
+                    // The asked side counts the wrong try and sends a new code or the lock.
+                    send_frame(peers, device_id, Frame::PairFail { reason: "wrong".into() });
+                    set_asking_status(live, device_id, "wrong");
+                    false
+                }
+            }
+        }
+        Frame::PairConfirm { tag } => {
+            let expecting = live.inner.lock().ok().and_then(|mut guard| guard.pairing.expecting.take_if(|(id, _, _)| id == device_id));
+            let Some((_, expected, _)) = expecting else { return false };
+            if expected.accepts(&tag) {
+                if let Ok(mut guard) = live.inner.lock() {
+                    guard.pairing.guard.succeeded();
+                }
+                save_paired(db, live, peers, device_id, "incoming")
+            } else {
+                wrong_code(live, peers, device_id);
+                false
+            }
+        }
+        Frame::PairFail { reason } => {
+            let role = live.inner.lock().ok().and_then(|guard| {
+                guard.offer.as_ref().filter(|offer| offer.device_id == device_id).map(|offer| offer.role.clone())
+            });
+            let expecting = live.inner.lock().is_ok_and(|guard| guard.pairing.expecting.as_ref().is_some_and(|(id, _, _)| id == device_id));
+            if expecting {
+                // The asking side gave up or found the code wrong: that try counts.
+                wrong_code(live, peers, device_id);
+            }
+            match role.as_deref() {
+                Some("outgoing") => {
+                    if let Ok(mut guard) = live.inner.lock() {
+                        guard.pairing.asking = None;
+                    }
+                    let status = match reason.as_str() {
+                        "wrong" | "expired" | "locked" | "busy" | "cancelled" => reason.as_str(),
+                        _ => "failed",
+                    };
+                    set_asking_status(live, device_id, status);
+                }
+                Some("incoming") if reason == "cancelled" => {
+                    if let Ok(mut guard) = live.inner.lock() {
+                        guard.pairing.reset();
+                        if let Some(offer) = guard.offer.as_mut() {
+                            offer.status = "cancelled".into();
+                            offer.code = None;
+                            offer.expires_at = None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn set_asking_status(live: &Live, device_id: &str, status: &str) {
+    if let Ok(mut guard) = live.inner.lock()
+        && let Some(offer) = guard.offer.as_mut().filter(|offer| offer.device_id == device_id && offer.role == "outgoing")
+    {
+        // A lock already reported stays on screen.
+        if offer.status == "locked" && status == "wrong" {
+            return;
+        }
+        offer.status = status.into();
+    }
+}
+
+/// Asked side: the other device sent its first SPAKE2 message. The code on screen is used up by
+/// this try, whatever the outcome.
+fn answer_pairing(material: &IdentityMaterial, live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str, message: &[u8]) {
+    let now = Instant::now();
+    let mut reply = None;
+    let mut ended = None;
+    let mut malformed = false;
+    if let Ok(mut guard) = live.inner.lock() {
+        let inner = &mut *guard;
+        if inner.pairing.guard.locked(now) {
+            reply = Some(Frame::PairFail { reason: "locked".into() });
+        } else if let Some(offer) = inner.offer.as_mut().filter(|offer| offer.device_id == device_id && offer.role == "incoming") {
+            if inner.pairing.expecting.is_some() {
+                reply = Some(Frame::PairFail { reason: "busy".into() });
+            } else {
+                match inner.pairing.code.take().map(|code| code.use_once(now)) {
+                    Some(Some(code)) => match pairing::answer(&code, &material.public_key, &offer.public_key, message) {
+                        Ok(answer) => {
+                            let (message, tag, expected) = answer.into_expected();
+                            inner.pairing.expecting = Some((device_id.to_string(), expected, now + pairing::ANSWER_TIMEOUT));
+                            offer.status = "checking".into();
+                            offer.code = None;
+                            offer.expires_at = None;
+                            reply = Some(Frame::PairAnswer { message, tag });
+                        }
+                        Err(_) => malformed = true,
+                    },
+                    Some(None) => ended = Some("expired"),
+                    None if offer.finished() => reply = Some(Frame::PairFail { reason: offer.status.clone() }),
+                    None => reply = Some(Frame::PairFail { reason: "busy".into() }),
+                }
+            }
+        } else {
+            reply = Some(Frame::PairFail { reason: "busy".into() });
+        }
+    }
+    if let Some(frame) = reply {
+        send_frame(peers, device_id, frame);
+    }
+    if let Some(status) = ended {
+        end_shown_code(live, peers, device_id, status);
+    }
+    if malformed {
+        wrong_code(live, peers, device_id);
+    }
+}
+
+/// Asked side: one try failed. Counts it, then shows a new code, or locks pairing after too many.
+fn wrong_code(live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str) {
+    let now = Instant::now();
+    let Ok(mut guard) = live.inner.lock() else { return };
+    let inner = &mut *guard;
+    inner.pairing.expecting = None;
+    inner.pairing.code = None;
+    let locked = inner.pairing.guard.wrong(now);
+    let lock_ms = i64::try_from(inner.pairing.guard.lock_left(now)).unwrap_or(0) * 1000;
+    let tries_left = inner.pairing.guard.tries_left();
+    if let Some(offer) = inner.offer.as_mut().filter(|offer| offer.device_id == device_id && offer.role == "incoming") {
+        offer.tries_left = tries_left;
+        if locked {
+            offer.status = "locked".into();
+            offer.code = None;
+            offer.expires_at = None;
+            offer.locked_until = Some(now_ms() + lock_ms);
+        } else {
+            let code = pairing::Code::new(now);
+            offer.status = "wrong".into();
+            offer.code = Some(code.value().to_string());
+            offer.expires_at = Some(code_deadline_ms(&code, now));
+            inner.pairing.code = Some(code);
+        }
+    }
+    drop(guard);
+    send_frame(peers, device_id, Frame::PairFail { reason: if locked { "locked" } else { "wrong" }.into() });
+    if locked {
+        drop_unpaired(peers, device_id);
+    }
+}
+
+/// Asked side: the shown code can no longer be used ("expired"). Tells the other device and closes.
+fn end_shown_code(live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str, status: &str) {
+    if let Ok(mut guard) = live.inner.lock() {
+        guard.pairing.code = None;
+        guard.pairing.expecting = None;
+        if let Some(offer) = guard.offer.as_mut().filter(|offer| offer.device_id == device_id) {
+            offer.status = status.into();
+            offer.code = None;
+            offer.expires_at = None;
+        }
+    }
+    send_frame(peers, device_id, Frame::PairFail { reason: status.into() });
+    drop_unpaired(peers, device_id);
+}
+
+/// Runs every second: ends codes that expired and tries whose answer never came. True when
+/// something changed.
+fn tick_pairing(live: &Live, peers: &mut HashMap<String, PeerOut>, now: Instant) -> bool {
+    let mut expired = None;
+    let mut no_tag = None;
+    let mut changed = false;
+    if let Ok(mut guard) = live.inner.lock() {
+        let inner = &mut *guard;
+        if inner.pairing.code.as_ref().is_some_and(|code| code.expired(now)) {
+            expired = inner.offer.as_ref().filter(|offer| offer.role == "incoming").map(|offer| offer.device_id.clone());
+            if expired.is_none() {
+                inner.pairing.code = None;
+            }
+        }
+        if inner.pairing.expecting.as_ref().is_some_and(|(_, _, deadline)| now >= *deadline) {
+            no_tag = inner.pairing.expecting.as_ref().map(|(id, _, _)| id.clone());
+        }
+        if let Some((device_id, _, _)) = inner.pairing.asking.take_if(|(_, _, deadline)| now >= *deadline) {
+            if let Some(offer) = inner.offer.as_mut().filter(|offer| offer.device_id == device_id) {
+                offer.status = "failed".into();
+            }
+            changed = true;
+        }
+    }
+    if let Some(device_id) = expired {
+        end_shown_code(live, peers, &device_id, "expired");
+        changed = true;
+    }
+    if let Some(device_id) = no_tag {
+        wrong_code(live, peers, &device_id);
+        changed = true;
+    }
+    changed
+}
+
+/// The connection to a device in the middle of pairing closed. A try that was waiting for its tag
+/// still counts as wrong, so hanging up does not give free guesses.
+fn pairing_closed(live: &Live, device_id: &str) {
+    let now = Instant::now();
+    let Ok(mut guard) = live.inner.lock() else { return };
+    let inner = &mut *guard;
+    let counted = inner.pairing.expecting.take_if(|(id, _, _)| id == device_id).is_some();
+    let locked = counted && inner.pairing.guard.wrong(now);
+    let lock_ms = i64::try_from(inner.pairing.guard.lock_left(now)).unwrap_or(0) * 1000;
+    if inner.pairing.asking.as_ref().is_some_and(|(id, _, _)| id == device_id) {
+        inner.pairing.asking = None;
+    }
+    let Some(offer) = inner.offer.as_mut().filter(|offer| offer.device_id == device_id) else { return };
+    if offer.role == "approve" {
+        inner.offer = None;
+        return;
+    }
+    inner.pairing.code = None;
+    if locked {
+        offer.status = "locked".into();
+        offer.locked_until = Some(now_ms() + lock_ms);
+    } else if !offer.finished() {
+        offer.status = "failed".into();
+    }
+    offer.code = None;
+    offer.expires_at = None;
+}
+
+/// Both sides proved they used the same code and saw the same two TLS keys. Saves the key this
+/// connection showed; from now on TLS only accepts this device with that key.
+fn save_paired(db: &Arc<Mutex<Db>>, live: &Live, peers: &mut HashMap<String, PeerOut>, device_id: &str, role: &str) -> bool {
     let offer = live.inner.lock().ok().and_then(|guard| guard.offer.clone());
-    let Some(offer) = offer.filter(|offer| offer.device_id == device_id && offer.role == "outgoing") else { return false };
+    let Some(offer) = offer.filter(|offer| offer.device_id == device_id && offer.role == role) else { return false };
     if let Ok(guard) = db.lock() {
         let _ = guard.upsert_peer(&crate::db::PeerRow {
             device_id: offer.device_id.clone(),
-            identity_public: offer.identity_public,
-            cert_der: offer.cert_der,
+            public_key: offer.public_key,
             cert_id: offer.cert_id,
             display_name: offer.name.clone(),
-            safety_number: offer.safety_number,
-            trust: "full".into(),
+            trust: offer.trust.clone(),
         });
-        let _ = guard.add_notice("paired", &offer.device_id, &offer.name, "full");
+        // Pairing with the code again lets a removed device back in.
+        let _ = guard.end_removal(&offer.device_id);
+        let _ = guard.add_notice("paired", &offer.device_id, &offer.name, &offer.trust);
     }
     if let Some(peer) = peers.get_mut(device_id) {
         peer.confirmed = true;
     }
     if let Ok(mut guard) = live.inner.lock() {
         guard.offer = None;
+        guard.pairing.reset();
         guard.failures.remove(device_id);
     }
     true
+}
+
+/// Unpairs a device on both sides: its key is deleted here, and the device is told with an
+/// Unpaired frame so it deletes this computer too. Other paired devices are not affected.
+/// The removal is recorded until the device answers. A connected device answers within seconds;
+/// one that is offline is told the next time either side reaches the other (see `tell_removed`).
+fn remove_here(
+    db: &Arc<Mutex<Db>>,
+    live: &Live,
+    peers: &mut HashMap<String, PeerOut>,
+    farewells: &mut HashMap<String, (PeerOut, Instant)>,
+    pending_holdings: &mut HashMap<String, HoldingsBuild>,
+    device_id: &str,
+) {
+    let name = block_name(db, live, device_id);
+    // The connection leaves the device list now but stays open for the answer.
+    let connection = peers.remove(device_id);
+    forget_connection(live, peers, pending_holdings, device_id);
+    if let Some(peer) = connection
+        && peer.tx.send(Frame::Unpaired { pair: false }).is_ok()
+    {
+        farewells.insert(device_id.to_string(), (peer, Instant::now()));
+    }
+    if let Ok(guard) = db.lock() {
+        let _ = guard.remove_peer(device_id);
+        let _ = guard.record_removal(device_id, &name, now_ms());
+        let _ = guard.add_notice("removed", device_id, &name, "");
+    }
+}
+
+/// Ends the connection to a device and everything waiting on it, without touching what is saved.
+fn forget_connection(live: &Live, peers: &mut HashMap<String, PeerOut>, pending_holdings: &mut HashMap<String, HoldingsBuild>, device_id: &str) {
+    peers.remove(device_id);
+    pending_holdings.remove(device_id);
+    drop_partial_snapshots(live, device_id);
+    if let Ok(mut guard) = live.inner.lock() {
+        if guard.offer.as_ref().is_some_and(|offer| offer.device_id == device_id) {
+            guard.offer = None;
+            guard.pairing.reset();
+        }
+        guard.paused.remove(device_id);
+        guard.held.remove(device_id);
+        guard.failures.remove(device_id);
+    }
+}
+
+/// Lets go of connections to devices that are not saved and no longer have a pairing going on,
+/// such as one whose code ran out or failed, so they do not stay in the device list as waiting.
+fn drop_stale_unpaired(db: &Arc<Mutex<Db>>, live: &Live, peers: &mut HashMap<String, PeerOut>) -> bool {
+    let saved: HashSet<String> = db
+        .lock()
+        .ok()
+        .and_then(|guard| guard.peers().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|peer| peer.device_id)
+        .collect();
+    let pairing = live.inner.lock().ok().and_then(|guard| {
+        guard.offer.as_ref().filter(|offer| !offer.finished()).map(|offer| offer.device_id.clone())
+    });
+    let stale: Vec<String> = peers
+        .values()
+        .filter(|peer| !peer.confirmed && !saved.contains(&peer.device_id) && pairing.as_deref() != Some(peer.device_id.as_str()))
+        .map(|peer| peer.device_id.clone())
+        .collect();
+    for device_id in &stale {
+        peers.remove(device_id);
+    }
+    !stale.is_empty()
+}
+
+/// The other device no longer has this one saved and said so with an Unpaired frame. TLS proved
+/// which device sent it, so a device can only make this one forget that same device.
+/// `pair: false` means it unpaired this computer: forget it, answer with an Unpaired frame so it
+/// knows it was heard, and drop the connection. Returns the sender's name when it was forgotten
+/// that way, for the notice on screen.
+fn forgotten_by(
+    db: &Arc<Mutex<Db>>,
+    live: &Live,
+    peers: &mut HashMap<String, PeerOut>,
+    pending_holdings: &mut HashMap<String, HoldingsBuild>,
+    sender: &str,
+    pair: bool,
+) -> Option<String> {
+    let saved = db.lock().ok().and_then(|guard| guard.peers().ok()).unwrap_or_default().into_iter().find(|peer| peer.device_id == sender);
+    if !pair {
+        // Answered even when it is not saved here (already forgotten), so the sender stops telling it.
+        send_frame(peers, sender, Frame::Unpaired { pair: false });
+    }
+    // Not saved here either: a normal first pairing, or nothing to forget.
+    let Some(saved) = saved else {
+        if !pair {
+            forget_connection(live, peers, pending_holdings, sender);
+        }
+        return None;
+    };
+    let name = block_name(db, live, sender);
+    if let Ok(guard) = db.lock() {
+        let _ = guard.remove_peer(sender);
+        // Anything this computer still owed it is moot now.
+        let _ = guard.end_removal(sender);
+        if !pair {
+            let _ = guard.add_notice("removedYou", sender, &name, "");
+        }
+    }
+    let cert_der = peers.get(sender).map(|peer| peer.cert_der.clone()).unwrap_or_default();
+    if !pair {
+        forget_connection(live, peers, pending_holdings, sender);
+        unpaired_lately(sender, true);
+        eprintln!("{} unpaired this computer", short_id(sender));
+        return Some(name);
+    }
+    pending_holdings.remove(sender);
+    drop_partial_snapshots(live, sender);
+    let busy = live.inner.lock().ok().is_some_and(|guard| {
+        guard.offer.as_ref().is_some_and(|offer| offer.device_id != sender && !offer.finished())
+    });
+    if busy {
+        send_frame(peers, sender, Frame::PairFail { reason: "busy".into() });
+        peers.remove(sender);
+        return None;
+    }
+    if let Some(peer) = peers.get_mut(sender) {
+        peer.confirmed = false;
+        peer.ready = false;
+    }
+    if let Ok(mut guard) = live.inner.lock()
+        && guard.offer.as_ref().is_some_and(|offer| offer.device_id == sender)
+    {
+        guard.offer = None;
+    }
+    // Shown by the publish that follows.
+    put_offer(live, &saved.public_key, &cert_der, &name, "incoming", "full");
+    None
 }
 
 fn block_name(db: &Arc<Mutex<Db>>, live: &Live, device_id: &str) -> String {
@@ -1201,7 +2081,7 @@ fn short_id(device_id: &str) -> String {
 }
 
 /// Paired devices are listed even while offline. Unconfirmed connections show as pending.
-fn enqueue_overwrite(live: &Live, device_id: &str, name: &str, feature: &str, items: Value) -> bool {
+fn enqueue_overwrite(live: &Live, device_id: &str, name: &str, feature: &str, items: Value, send_id: Option<String>) -> bool {
     let Ok(mut guard) = live.inner.lock() else { return false };
     if guard.overwrite_waiting.len() + guard.overwrite_shown.len() >= 20 {
         return false;
@@ -1215,6 +2095,7 @@ fn enqueue_overwrite(live: &Live, device_id: &str, name: &str, feature: &str, it
         feature: feature.to_string(),
         items,
         shown: None,
+        send_id,
     });
     promote_overwrites(&mut guard);
     true
@@ -1238,7 +2119,7 @@ fn emit_overwrite_asks(app: &AppHandle, live: &Live) {
     let _ = app.emit("overwrite-asks", json!(rows));
 }
 
-fn expire_overwrites(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live) {
+fn expire_overwrites(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, peers: &HashMap<String, PeerOut>) {
     let expired = {
         let Ok(mut guard) = live.inner.lock() else { return };
         if guard.overwrite_shown.is_empty() && guard.overwrite_waiting.is_empty() {
@@ -1262,7 +2143,11 @@ fn expire_overwrites(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live) {
     if let Ok(guard) = db.lock() {
         for ask in &expired {
             let _ = guard.add_notice("overwrite", &ask.device_id, &ask.name, &format!("{}:timeout", ask.feature));
+            eprintln!("sync {} from {}: no answer, not changed", ask.feature, short_id(&ask.device_id));
         }
+    }
+    for ask in &expired {
+        send_result(peers, &ask.device_id, &ask.feature, ask.send_id.as_deref(), "timeout", None);
     }
     if !expired.is_empty() {
         let _ = app.emit("network-updated", json!({}));
@@ -1270,7 +2155,7 @@ fn expire_overwrites(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live) {
     emit_overwrite_asks(app, live);
 }
 
-fn resolve_overwrite(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, id: u64, accept: bool) {
+fn resolve_overwrite(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, peers: &HashMap<String, PeerOut>, id: u64, accept: bool) {
     let ask = {
         let Ok(mut guard) = live.inner.lock() else { return };
         let Some(index) = guard.overwrite_shown.iter().position(|ask| ask.id == id) else { return };
@@ -1278,16 +2163,21 @@ fn resolve_overwrite(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, id: u64,
         promote_overwrites(&mut guard);
         ask
     };
+    let mut applied = false;
     if let Ok(guard) = db.lock() {
+        let accept = accept && !guard.is_blocked(&ask.device_id).unwrap_or(true);
         if accept {
             apply_snapshot_payload(&guard, &ask.feature, &ask.items);
             sync_appearance_window(app, &guard, &ask.feature);
-            let _ = guard.mark_dirty(&ask.feature, false);
             let _ = guard.add_notice("sync", &ask.device_id, &ask.name, &ask.feature);
+            applied = true;
         } else {
             let _ = guard.add_notice("overwrite", &ask.device_id, &ask.name, &format!("{}:cancel", ask.feature));
         }
     }
+    let status = if applied { "applied" } else { "declined" };
+    eprintln!("sync {} from {}: {status}", ask.feature, short_id(&ask.device_id));
+    send_result(peers, &ask.device_id, &ask.feature, ask.send_id.as_deref(), status, None);
     let _ = app.emit("library-updated", json!({}));
     let _ = app.emit("network-updated", json!({}));
     emit_overwrite_asks(app, live);
@@ -1342,6 +2232,19 @@ fn publish(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, peers: &HashMap<St
     let _ = app.emit("network-updated", json!({}));
 }
 
+/// Saved devices to dial again: not connected now and not held off by a manual Disconnect.
+/// A manual Disconnect holds until the user presses Connect (or the app restarts).
+fn redial_ids(saved: Vec<String>, connected: impl Fn(&str) -> bool, paused: &HashSet<String>) -> Vec<String> {
+    saved.into_iter().filter(|id| !connected(id) && !paused.contains(id)).collect()
+}
+
+impl LiveInner {
+    /// Devices automatic redial leaves alone: disconnected here, or disconnected by the other side.
+    fn on_hold(&self) -> HashSet<String> {
+        self.paused.union(&self.held).cloned().collect()
+    }
+}
+
 fn nearby_of(live: &Live, device_id: &str) -> Option<Nearby> {
     live.inner.lock().ok()?.nearby.iter().find(|item| item.device_id == device_id).cloned()
 }
@@ -1357,35 +2260,106 @@ async fn restart_discovery(
     material: &IdentityMaterial,
     port: u16,
     events: &mpsc::UnboundedSender<NetEvent>,
-    discovery: &mut Option<std::sync::mpsc::Sender<()>>,
+    discovery: &mut Option<std::sync::mpsc::Sender<DiscoveryCtl>>,
     live: &Live,
 ) {
     if let Some(stop) = discovery.take() {
-        let _ = stop.send(());
+        let _ = stop.send(DiscoveryCtl::Stop);
     }
-    let guard = db.lock().expect("db");
-    let (incognito, enabled, _, _) = switches(&guard);
+    let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+    let (incognito, enabled) = switches(&guard);
     let name = guard.setting_string("displayName").unwrap_or_else(|_| "Device".into());
     drop(guard);
     if incognito || !enabled || port == 0 {
         if let Ok(mut guard) = live.inner.lock() {
             guard.nearby.clear();
+            guard.discovery_on = false;
         }
         return;
     }
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let events = events.clone();
     let device_id = material.device_id.clone();
+    if let Ok(mut guard) = live.inner.lock() {
+        guard.discovery_on = true;
+    }
+    let thread_live = live.clone();
     let _ = std::thread::Builder::new().name("lan-discovery".into()).spawn(move || {
         if let Err(err) = run_discovery(stop_rx, events, device_id, name, port) {
             eprintln!("discovery: {err}");
+            if let Ok(mut guard) = thread_live.inner.lock() {
+                guard.discovery_on = false;
+            }
         }
     });
     *discovery = Some(stop_tx);
 }
 
-const DISCOVERY_PORT: u16 = 41220;
-const DISCOVERY_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 168);
+pub const DISCOVERY_PORT: u16 = 41220;
+const DISCOVERY_MAX_DEVICES: usize = 64;
+const DISCOVERY_NETS_REFRESH: Duration = Duration::from_secs(5);
+pub const DISCOVERY_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 168);
+/// Multicast announces go out this often.
+const MULTICAST_EVERY: Duration = Duration::from_secs(3);
+/// Subnet broadcast reaches networks whose routers drop multicast, so it is sent less often.
+const BROADCAST_EVERY: Duration = Duration::from_secs(15);
+/// Peers answer one sender at most once a second, so a device heard this recently may not answer a Refresh.
+const REFRESH_KEEP_HEARD: Duration = Duration::from_secs(1);
+/// After a Refresh the list is held back this long so answers arrive before the screen changes.
+const REFRESH_SETTLE: Duration = Duration::from_millis(700);
+
+/// Messages to the discovery thread. Dropping the sender also stops it.
+pub(crate) enum DiscoveryCtl {
+    Stop,
+    Refresh,
+}
+
+/// When announces were last sent, on each path and by a Refresh.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AnnounceTimes {
+    multicast: Option<Instant>,
+    broadcast: Option<Instant>,
+    refresh_multicast: Option<Instant>,
+    refresh_broadcast: Option<Instant>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AnnounceDue {
+    multicast: bool,
+    broadcast: bool,
+}
+
+fn passed(since: Option<Instant>, now: Instant, every: Duration) -> bool {
+    since.is_none_or(|at| now.saturating_duration_since(at) >= every)
+}
+
+/// Decides which announces go out now and records them as sent.
+/// The regular announce on each path waits its interval since the last send on that path.
+/// A Refresh sends on each path at once, unless a Refresh already sent on that path within the same interval,
+/// so pressing Refresh again and again adds at most one extra packet per interval on each path.
+fn announce_due(times: &mut AnnounceTimes, now: Instant, refresh: bool) -> AnnounceDue {
+    let multicast = passed(times.multicast, now, MULTICAST_EVERY) || (refresh && passed(times.refresh_multicast, now, MULTICAST_EVERY));
+    let broadcast = passed(times.broadcast, now, BROADCAST_EVERY) || (refresh && passed(times.refresh_broadcast, now, BROADCAST_EVERY));
+    if multicast {
+        times.multicast = Some(now);
+        if refresh {
+            times.refresh_multicast = Some(now);
+        }
+    }
+    if broadcast {
+        times.broadcast = Some(now);
+        if refresh {
+            times.refresh_broadcast = Some(now);
+        }
+    }
+    AnnounceDue { multicast, broadcast }
+}
+
+/// How long until the next regular announce is due, so the loop wakes on time instead of up to a read timeout late.
+fn announce_wait(times: &AnnounceTimes, now: Instant) -> Duration {
+    let left = |since: Option<Instant>, every: Duration| since.map_or(Duration::ZERO, |at| (at + every).saturating_duration_since(now));
+    left(times.multicast, MULTICAST_EVERY).min(left(times.broadcast, BROADCAST_EVERY))
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Announce {
@@ -1450,8 +2424,8 @@ fn heard_nearby(id: &str, item: &Heard, nets: &[(Ipv4Addr, Ipv4Addr)]) -> Nearby
 }
 
 /// Announces repeat every few seconds; only a real change reaches the app, so screens are not refreshed for nothing.
-fn send_nearby(events: &mpsc::UnboundedSender<NetEvent>, found: &HashMap<String, Heard>, last_sent: &mut String) {
-    let list = nearby_list(found);
+fn send_nearby(events: &mpsc::UnboundedSender<NetEvent>, found: &HashMap<String, Heard>, nets: &[(Ipv4Addr, Ipv4Addr)], last_sent: &mut String) {
+    let list = nearby_list(found, nets);
     let text = serde_json::to_string(&list).unwrap_or_default();
     if text != *last_sent {
         *last_sent = text;
@@ -1459,15 +2433,14 @@ fn send_nearby(events: &mpsc::UnboundedSender<NetEvent>, found: &HashMap<String,
     }
 }
 
-fn nearby_list(found: &HashMap<String, Heard>) -> Vec<Nearby> {
-    let nets = lan_nets();
-    let mut list: Vec<Nearby> = found.iter().map(|(id, item)| heard_nearby(id, item, &nets)).filter(|item| !item.hosts.is_empty()).collect();
+fn nearby_list(found: &HashMap<String, Heard>, nets: &[(Ipv4Addr, Ipv4Addr)]) -> Vec<Nearby> {
+    let mut list: Vec<Nearby> = found.iter().map(|(id, item)| heard_nearby(id, item, nets)).filter(|item| !item.hosts.is_empty()).collect();
     list.sort_by(|left, right| left.name.cmp(&right.name).then_with(|| left.device_id.cmp(&right.device_id)));
     list
 }
 
 fn run_discovery(
-    stop: std::sync::mpsc::Receiver<()>,
+    control: std::sync::mpsc::Receiver<DiscoveryCtl>,
     events: mpsc::UnboundedSender<NetEvent>,
     device_id: String,
     name: String,
@@ -1484,25 +2457,83 @@ fn run_discovery(
     let group = std::net::SocketAddrV4::new(DISCOVERY_GROUP, DISCOVERY_PORT);
     let mut found: HashMap<String, Heard> = HashMap::new();
     let mut last_sent = String::new();
-    let mut last_announce = Instant::now() - Duration::from_secs(30);
+    let mut times = AnnounceTimes::default();
+    // While set, list changes wait so the answers to a Refresh land in one update.
+    let mut settle: Option<Instant> = None;
     let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 2048];
+    // Reading the adapters is slow on Windows, so the list is refreshed every few seconds, not per packet.
+    let mut nets = lan_nets();
+    let mut nets_read = Instant::now();
+    let mut replied: HashMap<std::net::IpAddr, Instant> = HashMap::new();
     loop {
-        if stop.try_recv() != Err(std::sync::mpsc::TryRecvError::Empty) {
+        let mut refresh = false;
+        let mut stopped = false;
+        loop {
+            match control.try_recv() {
+                Ok(DiscoveryCtl::Refresh) => refresh = true,
+                Ok(DiscoveryCtl::Stop) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    stopped = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+        if stopped {
             break;
         }
-        let local = lan_ipv4();
+        if nets_read.elapsed() >= DISCOVERY_NETS_REFRESH {
+            nets = lan_nets();
+            nets_read = Instant::now();
+        }
+        let local: Vec<Ipv4Addr> = nets.iter().map(|(ip, _)| *ip).collect();
         for ip in &local {
             if joined.insert(*ip) {
                 let _ = socket.join_multicast_v4(&DISCOVERY_GROUP, ip);
             }
         }
-        socket.set_read_timeout(Some(Duration::from_millis(400)))?;
+        let now = Instant::now();
+        let due = announce_due(&mut times, now, refresh);
+        if refresh && (due.multicast || due.broadcast) {
+            // Start the list over: a device that has left is gone at once, the rest answer this announce.
+            // A device heard within the last second is kept, because it may not answer again so soon.
+            found.retain(|_, item| now.duration_since(item.seen) < REFRESH_KEEP_HEARD);
+            settle = Some(now + REFRESH_SETTLE);
+        }
+        if due.multicast || due.broadcast {
+            let packet = announce_packet(&device_id, &name, listen_port, true, &local);
+            if due.multicast {
+                let target: socket2::SockAddr = std::net::SocketAddr::from(group).into();
+                for ip in &local {
+                    if socket.set_multicast_if_v4(ip).is_ok() {
+                        let _ = socket.send_to(&packet, &target);
+                    }
+                }
+            }
+            // Some routers drop multicast; subnet broadcast reaches those networks too.
+            if due.broadcast {
+                for broadcast in lan_broadcasts() {
+                    let to: socket2::SockAddr = std::net::SocketAddr::from((broadcast, DISCOVERY_PORT)).into();
+                    let _ = socket.send_to(&packet, &to);
+                }
+            }
+        }
+        let settle_left = settle.map_or(Duration::MAX, |until| until.saturating_duration_since(now));
+        let wait = Duration::from_millis(400).min(settle_left).min(announce_wait(&times, now)).max(Duration::from_millis(20));
+        socket.set_read_timeout(Some(wait))?;
         match socket.recv_from(&mut buf) {
             Ok((size, src)) => {
                 let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, size) };
-                if let Some(peer) = src.as_socket().and_then(|addr| read_announce(bytes, addr, &device_id)) {
-                    let reply = peer.announce;
+                let parsed = src.as_socket().and_then(|addr| read_announce(bytes, addr, &device_id));
+                // Packets are unauthenticated: a flood of made-up ids must not grow the list without end.
+                let room = parsed.as_ref().is_some_and(|peer| found.contains_key(&peer.id) || found.len() < DISCOVERY_MAX_DEVICES);
+                if let Some(peer) = parsed.filter(|_| room) {
                     let now = Instant::now();
+                    // One answer per sender every second is enough; announces repeat every three seconds.
+                    let reply = peer.announce
+                        && src.as_socket().is_some_and(|addr| {
+                            replied.retain(|_, at| now.duration_since(*at) < Duration::from_secs(1));
+                            replied.len() < DISCOVERY_MAX_DEVICES && replied.insert(addr.ip(), now).is_none()
+                        });
                     let entry = found.entry(peer.id.clone()).or_insert_with(|| Heard {
                         name: String::new(),
                         port: peer.port,
@@ -1516,7 +2547,9 @@ fn run_discovery(
                     entry.sources.insert(peer.host, now);
                     entry.sources.retain(|_, at| now.duration_since(*at) < Duration::from_secs(12));
                     entry.seen = now;
-                    send_nearby(&events, &found, &mut last_sent);
+                    if settle.is_none() {
+                        send_nearby(&events, &found, &nets, &mut last_sent);
+                    }
                     if reply {
                         let packet = announce_packet(&device_id, &name, listen_port, false, &local);
                         let _ = socket.send_to(&packet, &src);
@@ -1530,23 +2563,11 @@ fn run_discovery(
         let now = Instant::now();
         let before = found.len();
         found.retain(|_, item| now.duration_since(item.seen) < Duration::from_secs(12));
-        if found.len() != before {
-            send_nearby(&events, &found, &mut last_sent);
-        }
-        if last_announce.elapsed() >= Duration::from_secs(3) {
-            let packet = announce_packet(&device_id, &name, listen_port, true, &local);
-            let target: socket2::SockAddr = std::net::SocketAddr::from(group).into();
-            for ip in &local {
-                if socket.set_multicast_if_v4(ip).is_ok() {
-                    let _ = socket.send_to(&packet, &target);
-                }
-            }
-            // Some routers drop multicast; subnet broadcast reaches those networks too.
-            for broadcast in lan_broadcasts() {
-                let to: socket2::SockAddr = std::net::SocketAddr::from((broadcast, DISCOVERY_PORT)).into();
-                let _ = socket.send_to(&packet, &to);
-            }
-            last_announce = Instant::now();
+        if settle.is_some_and(|until| now >= until) {
+            settle = None;
+            send_nearby(&events, &found, &nets, &mut last_sent);
+        } else if settle.is_none() && found.len() != before {
+            send_nearby(&events, &found, &nets, &mut last_sent);
         }
     }
     Ok(())
@@ -1583,14 +2604,28 @@ fn read_announce(bytes: &[u8], src: std::net::SocketAddr, self_id: &str) -> Opti
     if message.v != 1 || message.id.is_empty() || message.id == self_id || message.port == 0 {
         return None;
     }
+    if message.id.len() > 128 {
+        return None;
+    }
     Some(ParsedAnnounce {
         id: message.id,
-        name: message.name,
+        name: clean_name(&message.name, 64),
         host: ip.to_string(),
         port: message.port,
         announce: message.announce,
-        addrs: message.addrs,
+        addrs: message.addrs.into_iter().take(16).collect(),
     })
+}
+
+/// A device name from the network, without control or text-direction characters that could disguise it.
+pub(crate) fn clean_name(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_control() && !matches!(ch, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(max_chars)
+        .collect()
 }
 
 fn txt_value(text: &str) -> String {
@@ -1738,9 +2773,102 @@ fn lan_interface(name: &str, ip: Ipv4Addr) -> bool {
 
 #[cfg(test)]
 mod lan_tests {
-    use super::{accept_holdings_part, holdings_messages, lan_interface, HoldingsBuild, HOLDINGS_PART_BYTES};
+    use super::{
+        accept_holdings_part, accept_snapshot_part, clean_name, download_name, is_cover_image, history_part_messages, holdings_messages, lan_interface,
+        port_setting, snapshot_part_messages, HoldingsBuild, HISTORY_PARTS_KEY, HOLDINGS_PART_BYTES, SNAPSHOT_PART_BYTES,
+    };
     use crate::db::HoldingInput;
+    use serde_json::{json, Value};
     use std::collections::HashMap;
+
+    #[test]
+    fn long_copies_are_split_into_parts() {
+        let rows: Vec<Value> = (0..200).map(|index| json!({"contentId": format!("c{index}"), "name": "x".repeat(400)})).collect();
+        let parts = snapshot_part_messages("favorites", &Value::Array(rows));
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|part| part["kind"] == "snapshot" && part["parts"] == json!(parts.len())));
+        assert!(parts.iter().all(|part| serde_json::to_vec(part).unwrap().len() < SNAPSHOT_PART_BYTES + 1024));
+        let single = snapshot_part_messages("appearance", &json!({"theme": "dark"}));
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0]["parts"], json!(1));
+    }
+
+    #[test]
+    fn download_names_are_safe_windows_file_names() {
+        assert_eq!(download_name("a/b:c?", "mp3", "id"), "a_b_c_.mp3");
+        assert_eq!(download_name("CON", "flac", "id"), "_CON.flac");
+        assert_eq!(download_name("com1.live", "flac", "id"), "_com1.live.flac");
+        assert_eq!(download_name("Lpt9 ", "flac", "id"), "_Lpt9.flac");
+        assert_eq!(download_name("Console", "flac", "id"), "Console.flac");
+        assert_eq!(download_name("song. . ", "mp3", "id"), "song.mp3");
+        assert_eq!(download_name("..", "mp3", "abc"), "abc.mp3");
+        assert_eq!(download_name("  ", "mp3", "../x"), ".._x.mp3");
+        assert_eq!(download_name("", "mp3", ""), "track.mp3");
+        assert_eq!(download_name("a\tb\u{0}", "mp3", "id"), "a_b_.mp3");
+        let long = "长".repeat(300);
+        assert_eq!(download_name(&long, "mp3", "id").chars().count(), 124);
+    }
+
+    #[test]
+    fn only_picture_bytes_are_kept_as_covers() {
+        assert!(is_cover_image(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10]));
+        assert!(is_cover_image(b"\x89PNG\r\n\x1a\n\0\0"));
+        assert!(!is_cover_image(b"<html>not a picture</html>"));
+        assert!(!is_cover_image(b""));
+    }
+
+    #[test]
+    fn long_history_is_sent_in_parts_and_rebuilt_in_order() {
+        let entries: Vec<Value> = (0..3000)
+            .map(|index| json!({"contentId": format!("{index:064}"), "at": "2026-10-28T00:00:00Z"}))
+            .collect();
+        let messages = history_part_messages(&json!(entries));
+        assert!(messages.len() > 1);
+        let count = messages.len();
+        let mut pending = HashMap::new();
+        let mut rebuilt = None;
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(message["part"], json!(index));
+            assert_eq!(message["parts"], json!(count));
+            assert!(serde_json::to_vec(&message["entries"]).unwrap().len() <= SNAPSHOT_PART_BYTES);
+            let done = accept_snapshot_part(&mut pending, "dev", HISTORY_PARTS_KEY, index, count, message["entries"].clone());
+            assert_eq!(done.is_some(), index + 1 == count);
+            rebuilt = rebuilt.or(done);
+        }
+        assert_eq!(rebuilt, Some(json!(entries)));
+        assert!(pending.is_empty());
+        let empty = history_part_messages(&json!([]));
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0]["entries"], json!([]));
+    }
+
+    #[test]
+    fn history_parts_from_another_device_stay_apart() {
+        let mut pending = HashMap::new();
+        assert!(accept_snapshot_part(&mut pending, "a", HISTORY_PARTS_KEY, 0, 2, json!([1])).is_none());
+        assert!(accept_snapshot_part(&mut pending, "b", HISTORY_PARTS_KEY, 1, 2, json!([9])).is_none());
+        assert_eq!(accept_snapshot_part(&mut pending, "a", HISTORY_PARTS_KEY, 1, 2, json!([2])), Some(json!([1, 2])));
+        assert!(accept_snapshot_part(&mut pending, "a", HISTORY_PARTS_KEY, 2, 2, json!([3])).is_none());
+    }
+
+    #[test]
+    fn port_settings_outside_the_tcp_range_are_refused() {
+        assert_eq!(port_setting(Some(22067)), Some(22067));
+        assert_eq!(port_setting(Some(65535)), Some(65535));
+        assert_eq!(port_setting(Some(0)), None);
+        assert_eq!(port_setting(Some(-1)), None);
+        assert_eq!(port_setting(Some(65536 + 80)), None);
+        assert_eq!(port_setting(None), None);
+    }
+
+    #[test]
+    fn network_names_lose_control_and_direction_characters() {
+        assert_eq!(clean_name("  Living room  ", 64), "Living room");
+        assert_eq!(clean_name("Bob\u{202E}gpj.exe", 64), "Bobgpj.exe");
+        assert_eq!(clean_name("a\nb\u{0007}c\u{2066}d", 64), "abcd");
+        assert_eq!(clean_name("音乐电脑", 2), "音乐");
+        assert_eq!(clean_name("\u{200F}", 64), "");
+    }
 
     #[test]
     fn discovery_skips_virtual_and_link_local_adapters() {
@@ -1751,61 +2879,48 @@ mod lan_tests {
         assert!(!lan_interface("Ethernet", "169.254.8.1".parse().unwrap()));
     }
 
-    fn test_store(name: &str) -> (crate::identity::IdentityMaterial, crate::identity::SignalStore) {
+    fn test_identity(name: &str) -> crate::identity::IdentityMaterial {
         let dir = std::env::temp_dir().join(format!("tunepeerly-net-test-{name}-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).expect("dir");
         let db = crate::db::Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).expect("db");
-        let material = crate::identity::load_or_create(&db).expect("identity");
-        let store = crate::identity::SignalStore::open(std::sync::Arc::new(std::sync::Mutex::new(db)), material.identity, material.registration_id).expect("store");
-        (material, store)
+        crate::identity::load_or_create(&db).expect("identity")
     }
 
-    /// Both directions of the private channel and the group channel must open on the other side.
+    /// Runs one handshake over memory. The server takes any device key; the client pins `pin`.
+    async fn handshake(
+        server: &crate::identity::IdentityMaterial,
+        client: &crate::identity::IdentityMaterial,
+        pin: [u8; 32],
+    ) -> Result<(rustls::ProtocolVersion, String), std::io::Error> {
+        use std::sync::Arc;
+        let provider = crate::tls::provider();
+        let server_verifier = Arc::new(crate::tls::IdentityVerifier::peer(provider.clone(), None));
+        let server_config = crate::tls::server_config(provider.clone(), &server.cert_der, &server.cert_key_pkcs8, server_verifier).expect("server config");
+        let client_verifier = Arc::new(crate::tls::IdentityVerifier::peer(provider.clone(), Some(pin)));
+        let client_config = crate::tls::client_config(provider, &client.cert_der, &client.cert_key_pkcs8, client_verifier, None).expect("client config");
+        let (left, right) = tokio::io::duplex(64 * 1024);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let name = rustls::pki_types::ServerName::try_from(crate::identity::TLS_DNS_NAME).expect("name");
+        let (accepted, connected) = tokio::join!(acceptor.accept(left), connector.connect(name, right));
+        let (accepted, connected) = (accepted?, connected?);
+        let version = connected.get_ref().1.protocol_version().expect("version");
+        let seen = accepted.get_ref().1.peer_certificates().and_then(|certs| certs.first().cloned()).expect("client cert");
+        let seen_id = crate::ids::app_device_id(&crate::identity::public_key_of(seen.as_ref()).expect("key"));
+        Ok((version, seen_id))
+    }
+
+    /// Devices meet over TLS 1.3 with both certificates, and a dial only completes to the pinned key.
     #[tokio::test]
-    async fn signal_frames_open_in_both_directions() {
-        use crate::identity::SignalStore;
-        use super::{decode_ciphertext, tag_ciphertext, tag_group, SIGNAL_GROUP};
-        let (a_mat, mut a) = test_store("a");
-        let (b_mat, mut b) = test_store("b");
-        let a_addr = SignalStore::address_for(&a_mat.device_id);
-        let b_addr = SignalStore::address_for(&b_mat.device_id);
-        let mut rng = rand::rng();
-        let b_bundle = b.ensure_prekeys().await.expect("bundle");
-        let _ = a.ensure_prekeys().await.expect("bundle");
-        a.trust(&b_mat.device_id, &b_mat.identity.identity_key().serialize());
-        b.trust(&a_mat.device_id, &a_mat.identity.identity_key().serialize());
-        libsignal_protocol::process_prekey_bundle(&b_addr, &a_addr, &mut a.clone(), &mut a.clone(), &b_bundle, std::time::SystemTime::now(), &mut rng)
-            .await
-            .expect("session");
-
-        async fn open(store: &SignalStore, remote: &libsignal_protocol::ProtocolAddress, local: &libsignal_protocol::ProtocolAddress, frame: &[u8]) -> Vec<u8> {
-            let (&kind, body) = frame.split_first().expect("kind");
-            let message = decode_ciphertext(kind, body).expect("decodes");
-            let mut rng = rand::rng();
-            libsignal_protocol::message_decrypt(
-                &message, remote, local,
-                &mut store.clone(), &mut store.clone(), &mut store.clone(), &store.clone(), &mut store.clone(), &mut rng,
-            ).await.expect("decrypts")
-        }
-
-        // A (the first to speak) -> B: a prekey message.
-        let first = libsignal_protocol::message_encrypt(b"hello", &b_addr, &a_addr, &mut a.clone(), &mut a.clone(), std::time::SystemTime::now(), &mut rng).await.expect("encrypt");
-        let frame = tag_ciphertext(&first);
-        assert_eq!(open(&b, &a_addr, &b_addr, &frame).await, b"hello");
-
-        // B -> A: an ordinary message that has no prekey part.
-        let reply = libsignal_protocol::message_encrypt(b"reply", &a_addr, &b_addr, &mut b.clone(), &mut b.clone(), std::time::SystemTime::now(), &mut rng).await.expect("encrypt");
-        let frame = tag_ciphertext(&reply);
-        assert_eq!(open(&a, &b_addr, &a_addr, &frame).await, b"reply");
-
-        // B's group channel: A learns B's sender key privately, then opens B's group message.
-        let skdm = libsignal_protocol::create_sender_key_distribution_message(&b_addr, b_mat.distribution_id, &mut b.clone(), &mut rng).await.expect("skdm");
-        libsignal_protocol::process_sender_key_distribution_message(&b_addr, &skdm, &mut a.clone()).await.expect("process");
-        let group = libsignal_protocol::group_encrypt(&mut b.clone(), &b_addr, b_mat.distribution_id, b"holdings", &mut rng).await.expect("group");
-        let frame = tag_group(group.serialized());
-        assert_eq!(frame[0], SIGNAL_GROUP);
-        let plain = libsignal_protocol::group_decrypt(&frame[1..], &mut a.clone(), &b_addr).await.expect("group opens");
-        assert_eq!(plain, b"holdings");
+    async fn tls_pins_the_device_key_both_ways() {
+        let a = test_identity("a");
+        let b = test_identity("b");
+        let pin_a = crate::ids::key_hash_from_device_id(&a.device_id).expect("hash");
+        let (version, seen) = handshake(&a, &b, pin_a).await.expect("handshake");
+        assert_eq!(version, rustls::ProtocolVersion::TLSv1_3);
+        assert_eq!(seen, b.device_id);
+        let pin_b = crate::ids::key_hash_from_device_id(&b.device_id).expect("hash");
+        assert!(handshake(&a, &b, pin_b).await.is_err());
     }
 
     fn row(n: usize) -> HoldingInput {
@@ -1857,13 +2972,13 @@ async fn restart_relay(
     if let Some(task) = task.take() {
         task.abort();
     }
-    let guard = db.lock().expect("db");
+    let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
     if !relay_ready(&guard) {
         set_relay(live, "");
         return;
     }
     let host = guard.setting_string("relayHost").unwrap_or_default();
-    let port = guard.setting_i64("relayPort").unwrap_or(22067) as u16;
+    let port = relay_port(&guard);
     let relay_id = guard.setting_string("relayDeviceId").unwrap_or_default();
     let token = guard.setting_string("relayToken").unwrap_or_default();
     drop(guard);
@@ -1904,21 +3019,27 @@ async fn relay_session(
     provider: Arc<rustls::crypto::CryptoProvider>,
     events: mpsc::UnboundedSender<NetEvent>,
 ) -> Result<(), String> {
-    let addr = resolve_v4(&host, port).await?;
-    let stream = TcpStream::connect(addr).await.map_err(|err| err.to_string())?;
-    let verifier = Arc::new(tls::IdentityVerifier::relay(provider.clone(), expected));
-    let config = tls::client_config(provider, &parts.cert_der, &parts.cert_key, verifier, Some(b"bep-relay"))
-        .map_err(|err| err.to_string())?;
-    let connector = TlsConnector::from(Arc::new(config));
-    let name = rustls::pki_types::ServerName::try_from("relay.local").map_err(|err| err.to_string())?;
-    let mut tls = connector.connect(name, stream).await.map_err(|err| err.to_string())?;
+    let setup = async {
+        let addr = resolve_v4(&host, port).await?;
+        let stream = TcpStream::connect(addr).await.map_err(|err| err.to_string())?;
+        let verifier = Arc::new(tls::IdentityVerifier::relay(provider.clone(), expected));
+        let config = tls::client_config(provider, &parts.cert_der, &parts.cert_key, verifier, Some(b"bep-relay"))
+            .map_err(|err| err.to_string())?;
+        let connector = TlsConnector::from(Arc::new(config));
+        let name = rustls::pki_types::ServerName::try_from("relay.local").map_err(|err| err.to_string())?;
+        connector.connect(name, stream).await.map_err(|err| err.to_string())
+    };
+    let mut tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, setup).await.map_err(|_| "Connection timed out".to_string())??;
     let peer_certs = tls.get_ref().1.peer_certificates().map(|certs| certs.to_vec()).unwrap_or_default();
     let cert = peer_certs.first().ok_or("missing relay certificate")?;
     if !ids::same_cert_id(&relay_id, cert.as_ref()) || ids::cert_id_bytes(cert.as_ref()) != expected {
         return Err("relay certificate id does not match".into());
     }
     relay::write_message(&mut tls, 2, &relay::join_relay(&token)).await.map_err(|err| err.to_string())?;
-    let (kind, body) = relay::read_message(&mut tls).await.map_err(|err| err.to_string())?;
+    let (kind, body) = tokio::time::timeout(HANDSHAKE_TIMEOUT, relay::read_message(&mut tls))
+        .await
+        .map_err(|_| "Connection timed out".to_string())?
+        .map_err(|err| err.to_string())?;
     if kind != 4 {
         return Err("unexpected relay response".into());
     }
@@ -1927,25 +3048,52 @@ async fn relay_session(
         return Err(message);
     }
     let _ = events.send(NetEvent::RelayState("registered".into()));
-    let mut ping = tokio::time::interval(Duration::from_secs(30));
-    loop {
-        tokio::select! {
-            _ = ping.tick() => {
-                relay::write_message(&mut tls, 0, &[]).await.map_err(|err| err.to_string())?;
+    // Pings go out from their own task, so a half-read message is never cancelled by the timer.
+    let (mut reader, mut writer) = tokio::io::split(tls);
+    let _pinger = AbortOnDrop(tokio::task::spawn_local(async move {
+        let mut ping = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            ping.tick().await;
+            if relay::write_message(&mut writer, 0, &[]).await.is_err() {
+                break;
             }
-            incoming = relay::read_message(&mut tls) => {
-                let (kind, body) = incoming.map_err(|err| err.to_string())?;
-                if kind == 1 {
-                    continue;
-                }
-                if kind == 6 {
-                    if let Ok(invitation) = relay::parse_invitation(&body) {
-                        let _ = events.send(NetEvent::Invitation(invitation));
-                    }
-                }
+        }
+    }));
+    loop {
+        // The relay answers our pings and pings us; long silence means the connection is gone.
+        let (kind, body) = tokio::time::timeout(RELAY_IDLE_TIMEOUT, relay::read_message(&mut reader))
+            .await
+            .map_err(|_| "Connection timed out".to_string())?
+            .map_err(|err| err.to_string())?;
+        if kind == 1 {
+            continue;
+        }
+        if kind == 6 {
+            if let Ok(invitation) = relay::parse_invitation(&body) {
+                let _ = events.send(NetEvent::Invitation(invitation));
             }
         }
     }
+}
+
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(100);
+
+/// Stops a helper task when its owner returns or is aborted.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A saved port setting, or `None` when it is not a usable TCP port.
+fn port_setting(value: Option<i64>) -> Option<u16> {
+    value.and_then(|port| u16::try_from(port).ok()).filter(|port| *port != 0)
+}
+
+fn relay_port(db: &Db) -> u16 {
+    port_setting(db.setting_i64("relayPort").ok()).unwrap_or(22067)
 }
 
 async fn resolve_v4(host: &str, port: u16) -> Result<SocketAddr, String> {
@@ -1966,7 +3114,7 @@ async fn maybe_relay_fallback(
     events: &mpsc::UnboundedSender<NetEvent>,
     device_id: &str,
 ) {
-    let guard = db.lock().expect("db");
+    let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
     if !relay_ready(&guard) {
         return;
     }
@@ -1974,7 +3122,7 @@ async fn maybe_relay_fallback(
         return;
     };
     let host = guard.setting_string("relayHost").unwrap_or_default();
-    let port = guard.setting_i64("relayPort").unwrap_or(22067) as u16;
+    let port = relay_port(&guard);
     let relay_id = guard.setting_string("relayDeviceId").unwrap_or_default();
     drop(guard);
     let Some(expected) = ids::parse_cert_id(&relay_id) else { return };
@@ -1983,7 +3131,7 @@ async fn maybe_relay_fallback(
     let provider = provider.clone();
     let events = events.clone();
     tokio::task::spawn_local(async move {
-        let _ = request_relay_session(host, port, expected, target, parts, provider, events).await;
+        let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, request_relay_session(host, port, expected, target, parts, provider, events)).await;
     });
 }
 
@@ -2023,16 +3171,28 @@ async fn join_invited(
     invitation: relay::Invitation,
 ) {
     let (host, port) = {
-        let guard = db.lock().expect("db");
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
         (
             guard.setting_string("relayHost").unwrap_or_default(),
-            guard.setting_i64("relayPort").unwrap_or(22067) as u16,
+            relay_port(&guard),
         )
     };
-    let Ok(fallback) = resolve_v4(&host, port).await else { return };
-    if invitation.from.is_empty() {
+    // The relay names the inviting device by its certificate id. Only a saved device may come in this
+    // way, and its TLS handshake must then present the key that was pinned when pairing.
+    let Some(expected) = ({
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .peers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|peer| !guard.is_blocked(&peer.device_id).unwrap_or(false))
+            .find(|peer| ids::parse_cert_id(&peer.cert_id).is_some_and(|id| id.as_slice() == invitation.from.as_slice()))
+            .and_then(|peer| ids::key_hash_from_device_id(&peer.device_id))
+    }) else {
+        eprintln!("relay: refused a session from a device that is not paired");
         return;
-    }
+    };
+    let Ok(fallback) = resolve_v4(&host, port).await else { return };
     let Ok(target) = relay::invitation_target(&invitation, match fallback.ip() {
         std::net::IpAddr::V4(ip) => ip,
         _ => return,
@@ -2041,7 +3201,7 @@ async fn join_invited(
     let provider = provider.clone();
     let events = events.clone();
     let db = db.clone();
-    tokio::task::spawn_local(async move {
+    let session = async move {
         let Ok(mut stream) = TcpStream::connect(target).await else { return };
         if relay::write_message(&mut stream, 3, &relay::join_session(&invitation.key)).await.is_err() {
             return;
@@ -2054,9 +3214,9 @@ async fn join_invited(
         if code != 0 {
             return;
         }
-        let expected = None;
-        let verifier = Arc::new(tls::IdentityVerifier::peer(provider.clone(), expected));
-        let dialed_by = parts.device_id.clone();
+        let verifier = Arc::new(tls::IdentityVerifier::peer(provider.clone(), Some(expected)));
+        // The TLS client counts as the dialer on both sides; empty means "the other device".
+        let dialed_by = if invitation.server_socket { String::new() } else { parts.device_id.clone() };
         if invitation.server_socket {
             let Ok(config) = tls::server_config(provider, &parts.cert_der, &parts.cert_key, verifier) else { return };
             let Ok(tls) = tokio_rustls::TlsAcceptor::from(Arc::new(config)).accept(stream).await else { return };
@@ -2069,18 +3229,18 @@ async fn join_invited(
             let certs = tls.get_ref().1.peer_certificates().map(|certs| certs.to_vec()).unwrap_or_default();
             let _ = finish_handshake(tls, certs, db, parts, events, "relay".into(), dialed_by, false, None).await;
         }
+    };
+    tokio::task::spawn_local(async move {
+        let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, session).await;
     });
 }
 
-async fn handle_frame(
+fn handle_frame(
     app: &AppHandle,
     db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
+    peers: &mut HashMap<String, PeerOut>,
     live: &Live,
     bus: &AudioBus,
-    ready_sessions: &mut HashSet<String>,
     pending_holdings: &mut HashMap<String, HoldingsBuild>,
     published_holdings: &mut String,
     device_id: &str,
@@ -2091,77 +3251,32 @@ async fn handle_frame(
         return;
     }
     match frame {
-        Frame::Keepalive | Frame::PairAccept => {}
-        Frame::Bundle(bytes) => {
-            if smaller_device(&material.device_id, device_id).is_lt() {
-                if let Ok(bundle) = decode_bundle(&bytes) {
-                    let remote = SignalStore::address_for(device_id);
-                    let local = SignalStore::address_for(&material.device_id);
-                    let mut sessions = store.clone();
-                    let mut identities = store.clone();
-                    let mut rng = rand::rng();
-                    if libsignal_protocol::process_prekey_bundle(
-                        &remote,
-                        &local,
-                        &mut sessions,
-                        &mut identities,
-                        &bundle,
-                        std::time::SystemTime::now(),
-                        &mut rng,
-                    ).await.is_ok() {
-                        session_ready(db, material, store, peers, ready_sessions, published_holdings, device_id).await;
-                    }
-                }
-            }
-        }
-        Frame::Signal(bytes) => {
-            // The first byte says which kind of message follows; libsignal does not mark it in its own bytes.
-            let Some((&kind, body)) = bytes.split_first() else { return };
-            let bytes = body.to_vec();
-            if kind != SIGNAL_GROUP && let Some(message) = decode_ciphertext(kind, &bytes) {
-                let remote = SignalStore::address_for(device_id);
-                let local = SignalStore::address_for(&material.device_id);
-                let mut sessions = store.clone();
-                let mut identities = store.clone();
-                let mut prekeys = store.clone();
-                let signed = store.clone();
-                let mut kyber = store.clone();
-                let mut rng = rand::rng();
-                if let Ok(plain) = libsignal_protocol::message_decrypt(
-                    &message,
-                    &remote,
-                    &local,
-                    &mut sessions,
-                    &mut identities,
-                    &mut prekeys,
-                    &signed,
-                    &mut kyber,
-                    &mut rng,
-                ).await {
-                    if smaller_device(&material.device_id, device_id).is_gt() {
-                        session_ready(db, material, store, peers, ready_sessions, published_holdings, device_id).await;
-                    }
-                    if accept_private(db, store, device_id, &plain).await {
-                        publish(app, db, live, peers);
-                    } else if !reply_sync_request(app, db, material, store, peers, device_id, &plain).await
-                        && !reply_history_request(db, material, store, peers, device_id, &plain).await
-                    {
-                        note_history_reply(live, device_id, &plain);
-                        apply_plain(app, db, live, pending_holdings, device_id, &plain);
-                    }
-                }
-            } else if kind == SIGNAL_GROUP
-                && let Ok(plain) = libsignal_protocol::group_decrypt(&bytes, store, &SignalStore::address_for(device_id)).await
+        Frame::Keepalive
+        | Frame::Hold
+        | Frame::Unpaired { .. }
+        | Frame::PairStart { .. }
+        | Frame::PairAnswer { .. }
+        | Frame::PairConfirm { .. }
+        | Frame::PairFail { .. } => {}
+        Frame::Message(bytes) => {
+            // TLS already proved which paired device sent this: the one on the other end of this connection.
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { return };
+            if value.get("kind").and_then(Value::as_str) == Some("hello") {
+                accept_hello(db, peers, published_holdings, device_id, &value);
+                publish(app, db, live, peers);
+            } else if !reply_sync_request(db, peers, live, device_id, &value)
+                && !reply_history_request(db, peers, device_id, &value)
             {
-                note_history_reply(live, device_id, &plain);
-                apply_plain(app, db, live, pending_holdings, device_id, &plain);
+                apply_message(app, db, peers, live, pending_holdings, device_id, &value);
             }
         }
         Frame::AudioReq { id, content_id, start, end } => {
             serve_audio(db, peer, live, id, &content_id, start, end);
         }
         Frame::AudioChunk { id, offset, eof, data } => {
-            bus.deliver(id, AudioPiece::chunk(offset, eof, data));
+            if !bus.deliver(id, AudioPiece::chunk(offset, eof, data)) {
+                let _ = peer.tx.send(Frame::AudioCancel { id });
+            }
         }
         Frame::AudioHead { id, total } => {
             bus.deliver(id, AudioPiece::head(total));
@@ -2246,7 +3361,7 @@ fn spawn_cover_fetch(
                     bytes.truncate(at);
                     bytes.extend_from_slice(&piece.data);
                     if piece.eof {
-                        outcome = Some(!bytes.is_empty());
+                        outcome = Some(is_cover_image(&bytes));
                         break;
                     }
                 }
@@ -2285,7 +3400,7 @@ fn spawn_cover_fetch(
     });
 }
 
-/// Streams one byte range of a still-exposed local file. Exposure is re-checked per request.
+/// Streams one byte range of a readable local file to a paired, connected device.
 fn serve_audio(
     db: &Arc<Mutex<Db>>,
     peer: &PeerOut,
@@ -2295,7 +3410,7 @@ fn serve_audio(
     start: u64,
     end: Option<u64>,
 ) {
-    // "cover:<content id>" asks for the small picture of a song; it follows the same exposure rules as the audio.
+    // "cover:<content id>" asks for the small picture of a song; it is served like the audio.
     let cover_of = content_id.strip_prefix("cover:");
     let mut pending_cover = false;
     let paths = db
@@ -2321,21 +3436,26 @@ fn serve_audio(
             finish_audio_request(&live, id, false);
             return;
         }
-        let mut opened = None;
-        let mut reason = if pending_cover { "cover.pending" } else { "file.missing" };
-        for (_, path) in &paths {
-            match File::open(path).and_then(|file| file.metadata().map(|meta| (file, meta.len()))) {
-                Ok(found) => {
-                    opened = Some(found);
-                    break;
+        // File work runs on the blocking pool so a slow disk does not stall the network thread.
+        let opened = tokio::task::spawn_blocking(move || {
+            let mut reason = if pending_cover { "cover.pending" } else { "file.missing" };
+            for (_, path) in &paths {
+                match File::open(path).and_then(|file| file.metadata().map(|meta| (file, meta.len()))) {
+                    Ok(found) => return Ok(found),
+                    Err(_) => reason = "file.unreadable",
                 }
-                Err(_) => reason = "file.unreadable",
             }
-        }
-        let Some((mut file, total)) = opened else {
-            let _ = tx.send(Frame::AudioErr { id, reason: reason.into() });
-            finish_audio_request(&live, id, false);
-            return;
+            Err(reason)
+        })
+        .await
+        .unwrap_or(Err("file.unreadable"));
+        let (mut file, total) = match opened {
+            Ok(found) => found,
+            Err(reason) => {
+                let _ = tx.send(Frame::AudioErr { id, reason: reason.into() });
+                finish_audio_request(&live, id, false);
+                return;
+            }
         };
         let stop = end.unwrap_or(total).min(total);
         // `start == total` only represents a valid full-file request for an
@@ -2364,7 +3484,18 @@ fn serve_audio(
                 break;
             }
             let max = ((stop - offset) as usize).min(buf.len());
-            let n = match file.read(&mut buf[..max]) {
+            let read = tokio::task::spawn_blocking(move || {
+                let result = file.read(&mut buf[..max]);
+                (file, buf, result)
+            })
+            .await;
+            let Ok((returned_file, returned_buf, result)) = read else {
+                let _ = tx.send(Frame::AudioErr { id, reason: "file.unreadable".into() });
+                break;
+            };
+            file = returned_file;
+            buf = returned_buf;
+            let n = match result {
                 Ok(n) => n,
                 Err(_) => {
                     let _ = tx.send(Frame::AudioErr { id, reason: "file.unreadable".into() });
@@ -2392,20 +3523,15 @@ fn finish_audio_request(live: &Live, id: u64, was_serving: bool) {
     }
 }
 
-fn apply_plain(
+fn apply_message(
     app: &AppHandle,
     db: &Arc<Mutex<Db>>,
+    peers: &HashMap<String, PeerOut>,
     live: &Live,
     pending_holdings: &mut HashMap<String, HoldingsBuild>,
     device_id: &str,
-    plain: &[u8],
+    value: &Value,
 ) {
-    let Ok(value) = serde_json::from_slice::<Value>(plain) else { return };
-    let payload = value.get("payload").cloned().unwrap_or(value.clone());
-    if !verify_author(db, device_id, &value) {
-        return;
-    }
-    let value = payload;
     let Ok(guard) = db.lock() else { return };
     let kind = value.get("kind").and_then(|item| item.as_str()).unwrap_or("");
     match kind {
@@ -2424,35 +3550,74 @@ fn apply_plain(
                 }
             }
         }
-        "history" => {
-            // Apply only when this computer has recently-played sync on. Equal timestamps keep one copy.
-            if !data_sync_open(&guard) || !guard.setting_bool("historySync").unwrap_or(false) {
+        "history" | "history-denied" => {
+            // Only an answer to the Recently Played this computer is viewing counts; anything else is
+            // ignored. The list is shown, never stored here.
+            let asked = live.inner.lock().ok().is_some_and(|state| {
+                state.history_view.as_ref().is_some_and(|(id, deadline)| id == device_id && Instant::now() < *deadline)
+            });
+            drop(guard);
+            if !asked {
                 return;
             }
-            let entries = value.get("entries").and_then(|item| item.as_array()).cloned().unwrap_or_default();
-            let parsed = entries.iter().filter_map(|item| {
-                let content_id = item.get("contentId")?.as_str()?.to_string();
-                let at = chrono::DateTime::parse_from_rfc3339(item.get("at")?.as_str()?).ok()?;
-                Some(HistoryEntry { content_id, at: at.with_timezone(&chrono::Utc) })
-            }).collect::<Vec<_>>();
-            eprintln!("history from {}: {} entries", short_id(device_id), parsed.len());
-            let _ = merge_history_into_db(&guard, parsed);
-            let _ = app.emit("library-updated", json!({}));
+            if kind == "history-denied" {
+                eprintln!("history from {}: refused", short_id(device_id));
+                end_history_view(live, device_id);
+                let _ = app.emit("remote-history", json!({"deviceId": device_id, "error": "denied"}));
+                return;
+            }
+            // Long histories arrive in parts, like snapshots.
+            let part = value.get("part").and_then(|item| item.as_u64()).unwrap_or(0) as usize;
+            let part_count = value.get("parts").and_then(|item| item.as_u64()).unwrap_or(1) as usize;
+            let piece = value.get("entries").cloned().unwrap_or(json!([]));
+            let entries = if part_count <= 1 {
+                piece
+            } else {
+                let Some(done) = live.inner.lock().ok().and_then(|mut state| {
+                    accept_snapshot_part(&mut state.pending_snapshots, device_id, HISTORY_PARTS_KEY, part, part_count, piece)
+                }) else {
+                    return;
+                };
+                done
+            };
+            let parsed = parse_history(&entries);
+            eprintln!("history from {}: showing {} entries", short_id(device_id), parsed.len());
+            end_history_view(live, device_id);
+            let rows: Vec<Value> = parsed.iter().map(|entry| json!({"contentId": entry.content_id, "at": entry.at.to_rfc3339()})).collect();
+            let _ = app.emit("remote-history", json!({"deviceId": device_id, "entries": rows}));
+            return;
+        }
+        "sync-result" => {
+            drop(guard);
+            take_send_result(app, db, live, device_id, value);
+            return;
         }
         "sync-denied" => {
             let feature = value.get("feature").and_then(|item| item.as_str()).unwrap_or("");
+            if let Ok(mut state) = live.inner.lock() {
+                take_sync_request(&mut state, device_id, feature);
+            }
             let name = guard.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id).map(|peer| peer.display_name).unwrap_or_default();
             let _ = app.emit("sync-denied", json!({"feature": feature, "name": name}));
         }
         "snapshot" => {
             if !data_sync_open(&guard) {
+                // Incognito takes nothing in. A Send is told so once its last part arrives.
+                let last = value.get("part").and_then(|item| item.as_u64()).unwrap_or(0) + 1 >= value.get("parts").and_then(|item| item.as_u64()).unwrap_or(1);
+                let requested = value.get("requested").and_then(|item| item.as_bool()).unwrap_or(false);
+                if last && !requested {
+                    let feature = value.get("feature").and_then(|item| item.as_str()).unwrap_or("");
+                    let send_id = value.get("sendId").and_then(|item| item.as_str()).filter(|id| id.len() <= 64);
+                    if crate::db::FEATURES.contains(&feature) {
+                        send_result(peers, device_id, feature, send_id, "rejected", Some("incognito"));
+                    }
+                }
                 return;
             }
             let feature = value.get("feature").and_then(|item| item.as_str()).unwrap_or("").to_string();
             if !crate::db::FEATURES.contains(&feature.as_str()) {
                 return;
             }
-            let manual = value.get("manual").and_then(|item| item.as_bool()).unwrap_or(false);
             let part = value.get("part").and_then(|item| item.as_u64()).unwrap_or(0) as usize;
             let part_count = value.get("parts").and_then(|item| item.as_u64()).unwrap_or(1) as usize;
             let piece = value.get("items").cloned().unwrap_or(json!([]));
@@ -2466,101 +3631,86 @@ fn apply_plain(
                 };
                 done
             };
-            let requested = value.get("requested").and_then(|item| item.as_bool()).unwrap_or(false);
-            if manual && !requested && guard.overwrite_mode().unwrap_or_else(|_| "silent".into()) == "ask" {
-                let name = guard.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id).map(|peer| peer.display_name).unwrap_or_default();
+            // A reply counts as requested only when this computer really asked that device for this feature.
+            let requested = value.get("requested").and_then(|item| item.as_bool()).unwrap_or(false)
+                && live.inner.lock().map(|mut state| take_sync_request(&mut state, device_id, &feature)).unwrap_or(false);
+            // Override asked for here always applies. A Send from another device follows this
+            // computer's choice for the feature, and the sender is told what happened.
+            let send_id = value.get("sendId").and_then(|item| item.as_str()).filter(|id| id.len() <= 64).map(str::to_string);
+            let policy = if requested { "silent" } else { guard.overwrite_policy(&feature) };
+            let name = guard.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id).map(|peer| peer.display_name).unwrap_or_default();
+            if policy == "deny" {
                 drop(guard);
-                if enqueue_overwrite(&live, device_id, &name, &feature, items) {
-                    emit_overwrite_asks(app, &live);
-                }
+                eprintln!("sync {feature} from {}: not allowed here", short_id(device_id));
+                send_result(peers, device_id, &feature, send_id.as_deref(), "rejected", Some("disabled"));
                 return;
             }
-            if !manual {
-                let blocks = guard.block_flags(&feature).unwrap_or(crate::db::BlockFlags { manual: false, source: false, all: false });
-                let source = guard.sync_source(&feature).unwrap_or(None);
-                if blocks.source || blocks.all || source.as_deref() != Some(device_id) {
-                    return;
+            if policy == "ask" {
+                drop(guard);
+                if enqueue_overwrite(live, device_id, &name, &feature, items, send_id.clone()) {
+                    eprintln!("sync {feature} from {}: asking", short_id(device_id));
+                    send_result(peers, device_id, &feature, send_id.as_deref(), "pending", None);
+                    emit_overwrite_asks(app, live);
+                } else {
+                    eprintln!("sync {feature} from {}: too many questions waiting", short_id(device_id));
+                    send_result(peers, device_id, &feature, send_id.as_deref(), "rejected", Some("busy"));
                 }
-                if guard.is_dirty(&feature).unwrap_or(false) {
-                    let policy = guard.setting_string("conflictPolicy").unwrap_or_else(|_| "ask".into());
-                    let name = guard.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id).map(|peer| peer.display_name).unwrap_or_default();
-                    if policy == "keep" {
-                        let _ = guard.add_notice("conflict", device_id, &name, &format!("{feature}:keep"));
-                        return;
-                    }
-                    if policy == "take" {
-                        apply_snapshot_payload(&guard, &feature, &items);
-                        sync_appearance_window(app, &guard, &feature);
-                        let _ = guard.mark_dirty(&feature, false);
-                        let _ = guard.add_notice("conflict", device_id, &name, &format!("{feature}:take"));
-                        drop(guard);
-                        let _ = app.emit("library-updated", json!({}));
-                        return;
-                    }
-                    let mut waiting = guard.setting_json("pendingSnapshots").unwrap_or(json!({}));
-                    if !waiting.is_object() {
-                        waiting = json!({});
-                    }
-                    waiting[&feature] = json!({"source": device_id, "items": items});
-                    let _ = guard.set_device_setting("pendingSnapshots", waiting);
-                    let _ = guard.add_notice("conflict", device_id, &name, &format!("{feature}:ask"));
-                    drop(guard);
-                    let _ = app.emit("network-updated", json!({}));
-                    return;
-                }
+                return;
             }
             apply_snapshot_payload(&guard, &feature, &items);
             sync_appearance_window(app, &guard, &feature);
-            let _ = guard.mark_dirty(&feature, false);
-            clear_pending(&guard, &feature);
-            let name = guard.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id).map(|peer| peer.display_name).unwrap_or_default();
             let _ = guard.add_notice("sync", device_id, &name, &feature);
             eprintln!("sync {feature} from {}: applied", short_id(device_id));
-        }
-        "position" => {
-            if guard.setting_bool("incognito").unwrap_or(false) {
-                return;
+            if !requested {
+                send_result(peers, device_id, &feature, send_id.as_deref(), "applied", None);
             }
-            let selected = guard.setting_string("positionSyncDevice").unwrap_or_default();
-            if selected.is_empty() || selected != device_id {
-                return;
-            }
-            let content_id = value.get("contentId").and_then(|item| item.as_str()).unwrap_or("");
-            let seconds = value.get("seconds").and_then(|item| item.as_f64()).unwrap_or(0.0);
-            let playing = value.get("playing").and_then(|item| item.as_bool()).unwrap_or(false);
-            let duration = value.get("duration").and_then(|item| item.as_f64()).unwrap_or(0.0);
-            let title = value.get("title").and_then(|item| item.as_str()).unwrap_or("");
-            let artist = value.get("artist").and_then(|item| item.as_str()).unwrap_or("");
-            let album = value.get("album").and_then(|item| item.as_str()).unwrap_or("");
-            drop(guard);
-            let _ = app.emit("playback-mirror", json!({
-                "deviceId": device_id,
-                "contentId": content_id,
-                "seconds": seconds,
-                "playing": playing,
-                "duration": duration,
-                "title": title,
-                "artist": artist,
-                "album": album,
-            }));
-            return;
         }
-        _ => {}
+        // Unknown messages change nothing, so the library is not reloaded.
+        _ => return,
     }
     drop(guard);
     let _ = app.emit("library-updated", json!({}));
 }
 
 const SNAPSHOT_PART_BYTES: usize = 16 * 1024;
+/// Most parts one snapshot or history may arrive in (about 4 MiB of rows).
+const SNAPSHOT_MAX_PARTS: usize = 256;
+/// Pending-part key for history messages. It is not a feature name, so it never mixes with a snapshot.
+const HISTORY_PARTS_KEY: &str = "\0history-entries";
 
 pub(crate) struct SnapshotBuild {
     slots: Vec<Option<Value>>,
 }
 
-fn snapshot_part_messages(feature: &str, manual: bool, items: &Value) -> Vec<Value> {
+/// One copy sent with Send, or as the reply to an Override, in parts small enough for one frame each.
+fn snapshot_part_messages(feature: &str, items: &Value) -> Vec<Value> {
     let Some(rows) = items.as_array() else {
-        return vec![json!({"kind": "snapshot", "feature": feature, "manual": manual, "part": 0, "parts": 1, "items": items})];
+        return vec![json!({"kind": "snapshot", "feature": feature, "part": 0, "parts": 1, "items": items})];
     };
+    let groups = part_groups(rows);
+    let count = groups.len();
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, rows)| json!({"kind": "snapshot", "feature": feature, "part": index, "parts": count, "items": rows}))
+        .collect()
+}
+
+fn history_part_messages(entries: &Value) -> Vec<Value> {
+    let Some(rows) = entries.as_array() else {
+        return vec![json!({"kind": "history", "part": 0, "parts": 1, "entries": entries})];
+    };
+    let groups = part_groups(rows);
+    let count = groups.len();
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, rows)| json!({"kind": "history", "part": index, "parts": count, "entries": rows}))
+        .collect()
+}
+
+/// Splits rows so each part stays near SNAPSHOT_PART_BYTES, well under one frame.
+fn part_groups(rows: &[Value]) -> Vec<Vec<Value>> {
     let mut groups: Vec<Vec<Value>> = Vec::new();
     let mut current = Vec::new();
     let mut size = 2usize;
@@ -2576,36 +3726,7 @@ fn snapshot_part_messages(feature: &str, manual: bool, items: &Value) -> Vec<Val
     if groups.is_empty() || !current.is_empty() {
         groups.push(current);
     }
-    let count = groups.len();
     groups
-        .into_iter()
-        .enumerate()
-        .map(|(index, rows)| json!({"kind": "snapshot", "feature": feature, "manual": manual, "part": index, "parts": count, "items": rows}))
-        .collect()
-}
-
-fn expand_sync_body(body: Value) -> Vec<Value> {
-    if body.get("kind").and_then(|item| item.as_str()) != Some("snapshot") {
-        return vec![body];
-    }
-    let feature = body.get("feature").and_then(|item| item.as_str()).unwrap_or("");
-    let manual = body.get("manual").and_then(|item| item.as_bool()).unwrap_or(false);
-    let items = body.get("items").cloned().unwrap_or(json!([]));
-    snapshot_part_messages(feature, manual, &items)
-}
-
-async fn deliver_sync(
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    bodies: Vec<Value>,
-) {
-    let targets: Vec<String> = peers.iter().filter(|(_, peer)| peer.confirmed).map(|(id, _)| id.clone()).collect();
-    for body in &bodies {
-        for id in &targets {
-            send_private_signed(material, store, peers, id, body).await;
-        }
-    }
 }
 
 fn accept_snapshot_part(
@@ -2616,7 +3737,7 @@ fn accept_snapshot_part(
     part_count: usize,
     items: Value,
 ) -> Option<Value> {
-    if part_count == 0 || part >= part_count || part_count > 64 {
+    if part_count == 0 || part >= part_count || part_count > SNAPSHOT_MAX_PARTS {
         return None;
     }
     let key = format!("{device_id}\0{feature}");
@@ -2642,11 +3763,32 @@ fn accept_snapshot_part(
     Some(json!(merged))
 }
 
-async fn request_sync(
+/// Parts of a copy that a device was still sending when it went away are not kept.
+fn drop_partial_snapshots(live: &Live, device_id: &str) {
+    let prefix = format!("{device_id}\0");
+    if let Ok(mut guard) = live.inner.lock() {
+        guard.pending_snapshots.retain(|key, _| !key.starts_with(&prefix));
+    }
+}
+
+const SYNC_REQUEST_WINDOW: Duration = Duration::from_secs(120);
+const SYNC_REPLY_INTERVAL: Duration = Duration::from_secs(10);
+
+fn sync_request_key(device_id: &str, feature: &str) -> String {
+    format!("{device_id}\0{feature}")
+}
+
+/// Uses up the matching request. An expired or unknown request does not count.
+fn take_sync_request(state: &mut LiveInner, device_id: &str, feature: &str) -> bool {
+    let now = Instant::now();
+    state.sync_requests.retain(|_, deadline| *deadline > now);
+    state.sync_requests.remove(&sync_request_key(device_id, feature)).is_some()
+}
+
+fn request_sync(
     db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
     peers: &HashMap<String, PeerOut>,
+    live: &Live,
     feature: &str,
     device_id: &str,
 ) {
@@ -2658,47 +3800,52 @@ async fn request_sync(
         eprintln!("sync {feature}: request not sent, sync is off");
         return;
     }
-    if !peers.get(device_id).is_some_and(|peer| peer.confirmed) {
+    if !peers.get(device_id).is_some_and(|peer| peer.ready) {
         eprintln!("sync {feature}: {} is not connected", short_id(device_id));
         return;
     }
     eprintln!("sync {feature}: requesting a copy from {}", short_id(device_id));
-    send_private_signed(material, store, peers, device_id, &json!({"kind": "sync-request", "feature": feature})).await;
+    if let Ok(mut state) = live.inner.lock() {
+        let now = Instant::now();
+        state.sync_requests.retain(|_, deadline| *deadline > now);
+        state.sync_requests.insert(sync_request_key(device_id, feature), now + SYNC_REQUEST_WINDOW);
+    }
+    send_message(peers, device_id, &json!({"kind": "sync-request", "feature": feature}));
 }
 
 /// The other computer asked for our copy. Send it back only to them, so it replaces their copy.
-async fn reply_sync_request(
-    app: &AppHandle,
+fn reply_sync_request(
     db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
     peers: &HashMap<String, PeerOut>,
+    live: &Live,
     device_id: &str,
-    plain: &[u8],
+    value: &Value,
 ) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(plain) else { return false };
-    let payload = value.get("payload").cloned().unwrap_or(value.clone());
-    if payload.get("kind").and_then(|item| item.as_str()) != Some("sync-request") {
+    if value.get("kind").and_then(|item| item.as_str()) != Some("sync-request") {
         return false;
     }
-    if !verify_author(db, device_id, &value) {
-        return true;
-    }
-    let feature = payload.get("feature").and_then(|item| item.as_str()).unwrap_or("").to_string();
+    let feature = value.get("feature").and_then(|item| item.as_str()).unwrap_or("").to_string();
     if !crate::db::FEATURES.contains(&feature.as_str()) {
         return true;
     }
+    // Building a full copy is expensive; repeated requests for the same copy are answered once per window.
+    let fresh = live.inner.lock().map(|mut state| {
+        let now = Instant::now();
+        state.sync_replies.retain(|_, at| now.duration_since(*at) < SYNC_REPLY_INTERVAL);
+        state.sync_replies.insert(sync_request_key(device_id, &feature), now).is_none()
+    }).unwrap_or(true);
+    if !fresh {
+        return true;
+    }
     let answer = {
-        let guard = db.lock().expect("db");
-        // No manual and Stop all only stop this computer from pushing or following.
-        // A device that asked for this copy still receives it.
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
         if !data_sync_open(&guard) {
             eprintln!("sync {feature}: refused a request from {}", short_id(device_id));
             vec![json!({"kind": "sync-denied", "feature": feature})]
         } else {
             let items = snapshot_items(&guard, &feature);
             let count = items.as_array().map(|rows| rows.len()).unwrap_or(1);
-            let mut parts = snapshot_part_messages(&feature, true, &items);
+            let mut parts = snapshot_part_messages(&feature, &items);
             for part in &mut parts {
                 if let Some(object) = part.as_object_mut() {
                     object.insert("requested".into(), json!(true));
@@ -2709,274 +3856,318 @@ async fn reply_sync_request(
         }
     };
     for body in &answer {
-        send_private_signed(material, store, peers, device_id, body).await;
+        send_message(peers, device_id, body);
     }
-    let _ = app;
     true
 }
 
-fn note_history_reply(live: &Live, device_id: &str, plain: &[u8]) {
-    let Ok(value) = serde_json::from_slice::<Value>(plain) else { return };
-    let payload = value.get("payload").cloned().unwrap_or(value);
-    if payload.get("kind").and_then(|item| item.as_str()) != Some("history") {
-        return;
-    }
-    if let Ok(mut guard) = live.inner.lock() {
-        guard.history_waiting.remove(device_id);
-    }
-}
-
-/// A startup request for this computer's play history. Sync off means no reply and no notice.
-async fn reply_history_request(
+/// Another device opened this computer's Recently Played: send the list back to it only.
+/// Incognito answers with a refusal so it does not wait.
+fn reply_history_request(
     db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
     peers: &HashMap<String, PeerOut>,
     device_id: &str,
-    plain: &[u8],
+    value: &Value,
 ) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(plain) else { return false };
-    let payload = value.get("payload").cloned().unwrap_or(value.clone());
-    if payload.get("kind").and_then(|item| item.as_str()) != Some("history-request") {
+    if value.get("kind").and_then(|item| item.as_str()) != Some("history-request") {
         return false;
     }
-    if !verify_author(db, device_id, &value) {
-        return true;
+    let parts = {
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+        if !data_sync_open(&guard) {
+            eprintln!("history: refused a request from {}", short_id(device_id));
+            vec![json!({"kind": "history-denied"})]
+        } else {
+            let entries = history_entries(&guard);
+            eprintln!("history: sending {} entries to {}", entries.as_array().map(Vec::len).unwrap_or(0), short_id(device_id));
+            history_part_messages(&entries)
+        }
+    };
+    for part in &parts {
+        send_message(peers, device_id, part);
     }
-    let Some(body) = db.lock().ok().and_then(|guard| history_message(&guard)) else { return true };
-    send_private_signed(material, store, peers, device_id, &body).await;
     true
 }
 
-/// Once, after this computer comes online: merge every synced device's history, then send the result.
-async fn tick_history_startup(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    live: &Live,
-) {
-    let enabled = db.lock().map(|guard| {
-        data_sync_open(&guard) && guard.setting_bool("historySync").unwrap_or(false) && guard.setting_bool("historyStartup").unwrap_or(false)
-    }).unwrap_or(false);
-    let online: Vec<String> = peers.iter().filter(|(_, peer)| peer.confirmed).map(|(id, _)| id.clone()).collect();
-    let (ask, send) = {
-        let Ok(mut guard) = live.inner.lock() else { return };
-        if guard.history_done || !enabled || online.is_empty() {
-            return;
-        }
-        if guard.history_deadline.is_none() {
-            guard.history_deadline = Some(Instant::now() + Duration::from_secs(8));
-        }
-        let ask: Vec<String> = online.iter().filter(|id| guard.history_asked.insert((*id).clone())).cloned().collect();
-        for id in &ask {
-            guard.history_waiting.insert(id.clone());
-        }
-        let due = guard.history_deadline.is_some_and(|deadline| Instant::now() >= deadline)
-            || (!guard.history_asked.is_empty() && guard.history_waiting.is_empty());
-        let send = due && ask.is_empty();
-        if send {
-            guard.history_done = true;
-            guard.history_waiting.clear();
-        }
-        (ask, send)
-    };
-    for id in &ask {
-        send_private_signed(material, store, peers, id, &json!({"kind": "history-request"})).await;
-    }
-    if send {
-        if let Some(body) = db.lock().ok().and_then(|guard| history_message(&guard)) {
-            deliver_sync(material, store, peers, vec![body]).await;
-        }
-    }
-}
-
-fn history_message(db: &Db) -> Option<Value> {
-    if !data_sync_open(db) || !db.setting_bool("historySync").unwrap_or(false) {
-        return None;
-    }
-    let entries = db
-        .history_for_sync()
-        .ok()?
-        .into_iter()
-        .map(|entry| json!({"contentId": entry.content_id, "at": entry.at.to_rfc3339()}))
-        .collect::<Vec<_>>();
-    Some(json!({"kind": "history", "entries": entries}))
-}
-
-async fn send_sync(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    feature: &str,
-    refresh: bool,
-) {
-    if feature == "history" {
-        let Some(body) = db.lock().ok().and_then(|guard| history_message(&guard)) else { return };
-        deliver_sync(material, store, peers, vec![body]).await;
+/// Opens a connected device's Recently Played here: ask it once and show the answer as it is.
+fn view_history(app: &AppHandle, db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, live: &Live, device_id: &str) {
+    let open = db.lock().map(|guard| data_sync_open(&guard)).unwrap_or(false);
+    if !open || !peers.get(device_id).is_some_and(|peer| peer.ready) {
+        eprintln!("history: {} is not connected", short_id(device_id));
+        let _ = app.emit("remote-history", json!({"deviceId": device_id, "error": "offline"}));
         return;
     }
+    if let Ok(mut state) = live.inner.lock() {
+        state.history_view = Some((device_id.to_string(), Instant::now() + HISTORY_REPLY_WINDOW));
+        state.pending_snapshots.retain(|key, _| !key.ends_with(HISTORY_PARTS_KEY));
+    }
+    eprintln!("history: asking {} for its list", short_id(device_id));
+    send_message(peers, device_id, &json!({"kind": "history-request"}));
+}
+
+fn end_history_view(live: &Live, device_id: &str) {
+    if let Ok(mut state) = live.inner.lock() {
+        if state.history_view.as_ref().is_some_and(|(id, _)| id == device_id) {
+            state.history_view = None;
+        }
+    }
+}
+
+/// A device that does not answer in time, or disconnects first, ends the request.
+fn tick_history_view(app: &AppHandle, peers: &HashMap<String, PeerOut>, live: &Live) {
+    let late = live.inner.lock().ok().and_then(|mut state| {
+        let (id, deadline) = state.history_view.as_ref()?;
+        let offline = !peers.get(id).is_some_and(|peer| peer.ready);
+        if !offline && Instant::now() < *deadline {
+            return None;
+        }
+        let id = id.clone();
+        state.history_view = None;
+        Some((id, if offline { "offline" } else { "timeout" }))
+    });
+    if let Some((id, error)) = late {
+        eprintln!("history: no answer from {} ({error})", short_id(&id));
+        let _ = app.emit("remote-history", json!({"deviceId": id, "error": error}));
+    }
+}
+
+fn history_entries(db: &Db) -> Value {
+    json!(db
+        .history_for_sync()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| json!({"contentId": entry.content_id, "at": entry.at.to_rfc3339()}))
+        .collect::<Vec<_>>())
+}
+
+fn parse_history(entries: &Value) -> Vec<HistoryEntry> {
+    entries
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|item| {
+                    let content_id = item.get("contentId")?.as_str()?.to_string();
+                    let at = chrono::DateTime::parse_from_rfc3339(item.get("at")?.as_str()?).ok()?;
+                    Some(HistoryEntry { content_id, at: at.with_timezone(&chrono::Utc) })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Send: this computer's copy goes to one connected device, or to every connected device when
+/// `target` is None. The receiver applies it at once or asks first, as its overwrite setting says.
+fn send_sync(app: &AppHandle, db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, live: &Live, feature: &str, target: Option<&str>) {
+    if !crate::db::FEATURES.contains(&feature) {
+        return;
+    }
+    let mut to: Vec<(&String, &PeerOut)> = match target {
+        Some(device_id) => peers.get_key_value(device_id).filter(|(_, peer)| peer.ready).into_iter().collect(),
+        None => peers.iter().filter(|(_, peer)| peer.ready).collect(),
+    };
+    to.sort_by(|left, right| left.0.cmp(right.0));
+    if to.is_empty() {
+        match target {
+            Some(device_id) => eprintln!("sync {feature}: not sent, {} is not connected", short_id(device_id)),
+            None => eprintln!("sync {feature}: not sent, no device is connected"),
+        }
+        return;
+    }
+    let send_id = uuid::Uuid::new_v4().simple().to_string();
     let bodies = {
-        let guard = db.lock().expect("db");
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
         if !data_sync_open(&guard) {
             eprintln!("sync {feature}: not sent, sync is off");
             return;
         }
-        let blocks = guard.block_flags(feature).unwrap_or(crate::db::BlockFlags { manual: false, source: false, all: false });
-        if blocks.manual || blocks.all {
-            eprintln!("sync {feature}: not sent, manual sync is blocked");
-            return;
-        }
-        if let Some(source) = guard.sync_source(feature).unwrap_or(None)
-            && source != material.device_id && !refresh
-        {
-            return;
-        }
         let items = snapshot_items(&guard, feature);
         let count = items.as_array().map(|rows| rows.len()).unwrap_or(1);
-        let _ = guard.mark_dirty(feature, false);
-        eprintln!("sync {feature}: sending {count} item(s)");
-        snapshot_part_messages(feature, true, &items)
+        match target {
+            Some(device_id) => eprintln!("sync {feature}: sending {count} item(s) to {}", short_id(device_id)),
+            None => eprintln!("sync {feature}: sending {count} item(s) to {} device(s)", to.len()),
+        }
+        let mut parts = snapshot_part_messages(feature, &items);
+        for part in &mut parts {
+            if let Some(object) = part.as_object_mut() {
+                object.insert("sendId".into(), json!(send_id));
+            }
+        }
+        parts
     };
-    deliver_sync(material, store, peers, bodies).await;
-}
-
-/// A device that is its own sync source sends each local change. History in time-merge mode sends the trimmed list.
-async fn auto_sync(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    feature: &str,
-) {
-    if peers.values().all(|peer| !peer.confirmed) {
-        return;
-    }
-    let Some(body) = db.lock().ok().and_then(|guard| auto_body(&guard, &material.device_id, feature)) else { return };
-    deliver_sync(material, store, peers, expand_sync_body(body)).await;
-}
-
-fn auto_body(db: &Db, self_id: &str, feature: &str) -> Option<Value> {
-    if !data_sync_open(db) {
-        return None;
-    }
-    if feature == "history" {
-        return history_message(db);
-    }
-    // Auto send pushes this computer's edit out. It does not pull anyone else's copy.
-    let auto = db.setting_json("autoSend").unwrap_or(json!({}));
-    if auto.get(feature).and_then(|value| value.as_bool()) != Some(true) {
-        return None;
-    }
-    let blocks = db.block_flags(feature).ok()?;
-    if blocks.all {
-        return None;
-    }
-    // An empty source is the "This computer" row: this device publishes.
-    // A different device id means this computer is following that device.
-    match db.sync_source(feature) {
-        Ok(Some(id)) if id != self_id => return None,
-        Ok(_) => {}
-        Err(_) => return None,
-    }
-    let items = snapshot_items(db, feature);
-    let _ = db.mark_dirty(feature, false);
-    Some(json!({"kind": "snapshot", "feature": feature, "manual": false, "items": items}))
-}
-
-fn clear_pending(db: &Db, feature: &str) {
-    let mut waiting = db.setting_json("pendingSnapshots").unwrap_or(json!({}));
-    if let Some(map) = waiting.as_object_mut() {
-        if map.remove(feature).is_some() {
-            let _ = db.set_device_setting("pendingSnapshots", waiting);
+    if let Ok(mut state) = live.inner.lock() {
+        let deadline = Instant::now() + SEND_RESULT_WINDOW;
+        for (device_id, _) in &to {
+            state.send_waits.insert(
+                send_wait_key(device_id, &send_id),
+                SendWait { device_id: (*device_id).clone(), feature: feature.to_string(), deadline },
+            );
         }
     }
-}
-
-/// The follower chose between its unsynced local copy and the source's snapshot.
-fn resolve_pending(app: &AppHandle, db: &Arc<Mutex<Db>>, feature: &str, take: bool) {
-    let Ok(guard) = db.lock() else { return };
-    let waiting = guard.setting_json("pendingSnapshots").unwrap_or(json!({}));
-    let Some(item) = waiting.get(feature).cloned() else { return };
-    if take {
-        let items = item.get("items").cloned().unwrap_or(json!([]));
-        apply_snapshot_payload(&guard, feature, &items);
-        sync_appearance_window(app, &guard, feature);
-        let _ = guard.mark_dirty(feature, false);
+    for (_, peer) in &to {
+        for body in &bodies {
+            send_json(peer, body);
+        }
     }
-    clear_pending(&guard, feature);
-    drop(guard);
-    let _ = app.emit("library-updated", json!({}));
+    let _ = app.emit("sync-sent", json!({"feature": feature, "count": to.len()}));
 }
 
-async fn send_sender_key(
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
+fn send_wait_key(device_id: &str, send_id: &str) -> String {
+    format!("{device_id}\0{send_id}")
+}
+
+/// Tells the device that pressed Send what happened to its copy here. A reply to Override has no
+/// send id and gets no answer.
+fn send_result(peers: &HashMap<String, PeerOut>, device_id: &str, feature: &str, send_id: Option<&str>, status: &str, reason: Option<&str>) {
+    let Some(send_id) = send_id else { return };
+    send_message(peers, device_id, &json!({"kind": "sync-result", "feature": feature, "sendId": send_id, "status": status, "reason": reason}));
+}
+
+fn peer_name(db: &Db, device_id: &str) -> String {
+    db.peers().ok().into_iter().flatten().find(|peer| peer.device_id == device_id).map(|peer| peer.display_name).unwrap_or_default()
+}
+
+/// A device answered one of our Sends. Only a Send this computer made to that device counts.
+fn take_send_result(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, device_id: &str, value: &Value) {
+    let send_id = value.get("sendId").and_then(|item| item.as_str()).unwrap_or("");
+    let status = value.get("status").and_then(|item| item.as_str()).unwrap_or("");
+    if !matches!(status, "applied" | "pending" | "rejected" | "declined" | "timeout") {
+        return;
+    }
+    let key = send_wait_key(device_id, send_id);
+    let feature = {
+        let Ok(mut state) = live.inner.lock() else { return };
+        if status == "pending" {
+            let Some(wait) = state.send_waits.get_mut(&key) else { return };
+            wait.deadline = Instant::now() + SEND_ASK_WINDOW;
+            wait.feature.clone()
+        } else {
+            let Some(wait) = state.send_waits.remove(&key) else { return };
+            wait.feature
+        }
+    };
+    let reason = value.get("reason").and_then(|item| item.as_str()).filter(|text| matches!(*text, "disabled" | "busy" | "incognito"));
+    let name = db.lock().map(|guard| {
+        if status != "pending" {
+            let outcome = match (status, reason) {
+                ("rejected", Some("incognito")) => "inIncognito",
+                ("rejected", Some(reason)) => reason,
+                ("rejected", None) => "disabled",
+                _ => status,
+            };
+            let _ = guard.add_notice("sendResult", device_id, &peer_name(&guard, device_id), &format!("{feature}:{outcome}"));
+        }
+        peer_name(&guard, device_id)
+    }).unwrap_or_default();
+    eprintln!("sync {feature} to {}: {status}{}", short_id(device_id), reason.map(|text| format!(" ({text})")).unwrap_or_default());
+    let _ = app.emit("sync-result", json!({"deviceId": device_id, "name": name, "feature": feature, "status": status, "reason": reason}));
+    let _ = app.emit("network-updated", json!({}));
+}
+
+/// A device that never reports back (it disconnected, or the answer was lost) is shown as no response.
+fn expire_send_waits(app: &AppHandle, db: &Arc<Mutex<Db>>, live: &Live, peers: &HashMap<String, PeerOut>) {
+    let now = Instant::now();
+    let late: Vec<(String, String, &'static str)> = {
+        let Ok(mut state) = live.inner.lock() else { return };
+        if state.send_waits.is_empty() {
+            return;
+        }
+        let mut late = Vec::new();
+        state.send_waits.retain(|_, wait| {
+            let offline = !peers.get(&wait.device_id).is_some_and(|peer| peer.ready);
+            if offline || now >= wait.deadline {
+                late.push((wait.device_id.clone(), wait.feature.clone(), if offline { "offline" } else { "noResponse" }));
+                return false;
+            }
+            true
+        });
+        late
+    };
+    let names: Vec<String> = db.lock().map(|guard| {
+        late.iter().map(|(id, feature, status)| {
+            let name = peer_name(&guard, id);
+            let _ = guard.add_notice("sendResult", id, &name, &format!("{feature}:{status}"));
+            name
+        }).collect()
+    }).unwrap_or_default();
+    for (index, (device_id, feature, status)) in late.iter().enumerate() {
+        eprintln!("sync {feature} to {}: {status}", short_id(device_id));
+        let name = names.get(index).cloned().unwrap_or_default();
+        let _ = app.emit("sync-result", json!({"deviceId": device_id, "name": name, "feature": feature, "status": status}));
+    }
+    if !late.is_empty() {
+        let _ = app.emit("network-updated", json!({}));
+    }
+}
+
+/// Sends one message to a paired device that has said hello on its current connection.
+fn send_message(peers: &HashMap<String, PeerOut>, device_id: &str, body: &Value) {
+    if let Some(peer) = peers.get(device_id).filter(|peer| peer.ready) {
+        send_json(peer, body);
+    }
+}
+
+/// Sends one message to every paired device that has said hello.
+fn broadcast(peers: &HashMap<String, PeerOut>, body: &Value) {
+    for peer in peers.values().filter(|peer| peer.ready) {
+        send_json(peer, body);
+    }
+}
+
+fn send_json(peer: &PeerOut, body: &Value) {
+    match serde_json::to_vec(body) {
+        Ok(bytes) => {
+            let _ = peer.tx.send(Frame::Message(bytes));
+        }
+        Err(err) => eprintln!("message not sent: {err}"),
+    }
+}
+
+/// Opens messaging on a connection this device has confirmed. The other side answers with its own
+/// hello once it has confirmed this device too, and only then do messages flow.
+fn say_hello(db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, device_id: &str) {
+    let Some(peer) = peers.get(device_id).filter(|peer| peer.confirmed) else { return };
+    let name = db.lock().ok().and_then(|guard| guard.setting_string("displayName").ok()).unwrap_or_default();
+    // Where this device can be called back, so the other side redials it without discovery.
+    let port = LISTEN_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    let addrs: Vec<String> = lan_ipv4().into_iter().map(|ip| ip.to_string()).collect();
+    send_json(peer, &json!({"kind": "hello", "name": name, "port": port, "addrs": addrs}));
+}
+
+/// The paired device said hello, so it has confirmed this one. The first hello on a connection is
+/// answered with ours and the full current state, since the reconnecting device needs it even when
+/// nothing changed here.
+fn accept_hello(
+    db: &Arc<Mutex<Db>>,
+    peers: &mut HashMap<String, PeerOut>,
+    published_holdings: &mut String,
     device_id: &str,
+    value: &Value,
 ) {
-    let sender = SignalStore::address_for(&material.device_id);
-    let mut rng = rand::rng();
-    if let Ok(message) = libsignal_protocol::create_sender_key_distribution_message(&sender, material.distribution_id, store, &mut rng).await {
-        send_private(material, store, peers, device_id, &json!({
-            "kind": "skdm",
-            "bytes": b64_bytes(message.serialized()),
-        })).await;
+    let name = clean_name(value.get("name").and_then(|item| item.as_str()).unwrap_or(""), 64);
+    if !name.is_empty() {
+        let _ = db.lock().map(|guard| guard.rename_peer(device_id, &name));
     }
-}
-
-async fn send_position(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    content_id: &str,
-    seconds: f64,
-    playing: bool,
-    duration: f64,
-    title: &str,
-    artist: &str,
-    album: &str,
-) {
-    let open = db.lock().ok().is_some_and(|guard| data_sync_open(&guard));
-    if !open || content_id.is_empty() {
+    let Some(peer) = peers.get_mut(device_id) else { return };
+    if std::mem::replace(&mut peer.ready, true) {
         return;
     }
-    let body = json!({
-        "kind": "position",
-        "contentId": content_id,
-        "seconds": seconds,
-        "playing": playing,
-        "duration": duration,
-        "title": title,
-        "artist": artist,
-        "album": album,
-    });
-    seal_and_send(material, store, peers, &body).await;
-}
-
-async fn seal_and_send(
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    body: &Value,
-) {
-    let payload = serde_json::to_vec(body).unwrap_or_default();
-    let mut rng = rand::rng();
-    let Ok(signature) = material.identity.private_key().calculate_signature(&payload, &mut rng) else { return };
-    let envelope = json!({
-        "author": material.device_id,
-        "signature": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.as_ref()),
-        "payload": body,
-    });
-    let plain = serde_json::to_vec(&envelope).unwrap_or_default();
-    let sender = SignalStore::address_for(&material.device_id);
-    if let Ok(message) = libsignal_protocol::group_encrypt(store, &sender, material.distribution_id, &plain, &mut rng).await {
-        let frame = Frame::Signal(tag_group(message.serialized()));
-        for peer in peers.values().filter(|peer| peer.confirmed) {
-            let _ = peer.tx.send(frame.clone());
+    eprintln!("{} is ready", short_id(device_id));
+    say_hello(db, peers, device_id);
+    // A changed list goes to every device below; then this device already has it.
+    let published = publish_holdings(db, peers, published_holdings);
+    let catch_up = db.lock().ok().map(|guard| {
+        let mut bodies = Vec::new();
+        if !published {
+            let rows = local_publishable(&guard).unwrap_or_default();
+            let revision = guard.our_holdings_revision().unwrap_or(0).max(1);
+            bodies.extend(holdings_messages(revision, &rows));
         }
+        // Favorites and appearance only move when someone presses Send or Override, and Recently
+        // Played only when another device opens it, so nothing else goes out on connect.
+        bodies
+    }).unwrap_or_default();
+    for body in catch_up {
+        send_message(peers, device_id, &body);
     }
 }
 
@@ -2994,12 +4185,6 @@ fn snapshot_items(db: &Db, feature: &str) -> Value {
             "miniTray": db.mini_flags().1,
             "closeAction": db.setting_string("closeAction").unwrap_or_default(),
         }),
-        "history" => json!(db
-            .history_for_sync()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|entry| json!({"contentId": entry.content_id, "at": entry.at.to_rfc3339()}))
-            .collect::<Vec<_>>()),
         _ => json!([]),
     }
 }
@@ -3014,21 +4199,6 @@ fn sync_appearance_window(app: &AppHandle, db: &Db, feature: &str) {
 
 fn apply_snapshot_payload(db: &Db, feature: &str, items: &Value) {
     match feature {
-        "history" => {
-            let entries = items
-                .as_array()
-                .map(|rows| {
-                    rows.iter()
-                        .filter_map(|item| {
-                            let content_id = item.get("contentId")?.as_str()?.to_string();
-                            let at = chrono::DateTime::parse_from_rfc3339(item.get("at")?.as_str()?).ok()?;
-                            Some(HistoryEntry { content_id, at: at.with_timezone(&chrono::Utc) })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let _ = merge_history_into_db(db, entries);
-        }
         "favorites" => {
             let ids = items.as_array().map(|rows| rows.iter().filter_map(|item| item.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
             let existing = db.content_member_refs("favorites", None).unwrap_or_default();
@@ -3056,167 +4226,12 @@ fn apply_snapshot_payload(db: &Db, feature: &str, items: &Value) {
     }
 }
 
-fn verify_author(db: &Arc<Mutex<Db>>, device_id: &str, envelope: &Value) -> bool {
-    let Some(payload) = envelope.get("payload") else { return false };
-    let Some(signature) = envelope.get("signature").and_then(|item| item.as_str()) else { return false };
-    if envelope.get("author").and_then(|item| item.as_str()) != Some(device_id) {
+fn publish_holdings(db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, published_holdings: &mut String) -> bool {
+    if peers.values().all(|peer| !peer.ready) {
         return false;
     }
-    let Ok(signature) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature) else { return false };
-    let Ok(bytes) = serde_json::to_vec(payload) else { return false };
-    let Ok(guard) = db.lock() else { return false };
-    let Ok(peers) = guard.peers() else { return false };
-    let Some(peer) = peers.into_iter().find(|peer| peer.device_id == device_id) else { return false };
-    let Ok(identity) = libsignal_protocol::IdentityKey::decode(&peer.identity_public) else { return false };
-    identity.public_key().verify_signature(&bytes, &signature)
-}
-
-fn trust_saved_peers(db: &Arc<Mutex<Db>>, store: &mut SignalStore) {
-    let Ok(guard) = db.lock() else { return };
-    let Ok(peers) = guard.peers() else { return };
-    for peer in peers {
-        store.trust(&peer.device_id, &peer.identity_public);
-    }
-}
-
-async fn send_bundle(db: &Arc<Mutex<Db>>, store: &mut SignalStore, peers: &HashMap<String, PeerOut>, device_id: &str) {
-    let _ = db;
-    let Ok(bundle) = store.ensure_prekeys().await else { return };
-    let Ok(identity) = bundle.identity_key() else { return };
-    let Ok(signed_public) = bundle.signed_pre_key_public() else { return };
-    let Ok(signed_signature) = bundle.signed_pre_key_signature() else { return };
-    let Ok(kyber_public) = bundle.kyber_pre_key_public() else { return };
-    let Ok(kyber_signature) = bundle.kyber_pre_key_signature() else { return };
-    let body = json!({
-        "identity": b64_bytes(&identity.serialize()),
-        "signedPublic": b64_bytes(&signed_public.serialize()),
-        "signedSignature": b64_bytes(signed_signature),
-        "kyberPublic": b64_bytes(&kyber_public.serialize()),
-        "kyberSignature": b64_bytes(kyber_signature),
-        "registrationId": bundle.registration_id().unwrap_or(1),
-    });
-    if let Some(peer) = peers.get(device_id) {
-        let _ = peer.tx.send(Frame::Bundle(serde_json::to_vec(&body).unwrap_or_default()));
-    }
-}
-
-async fn session_ready(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    ready_sessions: &mut HashSet<String>,
-    published_holdings: &mut String,
-    device_id: &str,
-) {
-    if !ready_sessions.insert(device_id.to_string()) {
-        return;
-    }
-    let name = db.lock().ok().and_then(|guard| guard.setting_string("displayName").ok()).unwrap_or_default();
-    eprintln!("secure session with {} is ready", short_id(device_id));
-    send_private(material, store, peers, device_id, &json!({"kind": "hello", "name": name})).await;
-    send_sender_key(material, store, peers, device_id).await;
-    // The reconnecting peer needs the full current state even when nothing changed here.
-    let catch_up = db.lock().ok().map(|guard| {
-        let mut bodies = Vec::new();
-        let rows = local_publishable(&guard).unwrap_or_default();
-        let revision = guard.our_holdings_revision().unwrap_or(0).max(1);
-        bodies.extend(holdings_messages(revision, &rows));
-        for feature in crate::db::FEATURES {
-            if let Some(body) = auto_body(&guard, &material.device_id, feature) {
-                bodies.extend(expand_sync_body(body));
-            }
-        }
-        bodies
-    }).unwrap_or_default();
-    for body in catch_up {
-        send_private_signed(material, store, peers, device_id, &body).await;
-    }
-    publish_holdings(db, material, store, peers, published_holdings).await;
-}
-
-async fn send_private_signed(
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    device_id: &str,
-    body: &Value,
-) {
-    let payload = serde_json::to_vec(body).unwrap_or_default();
-    let mut rng = rand::rng();
-    let Ok(signature) = material.identity.private_key().calculate_signature(&payload, &mut rng) else { return };
-    let envelope = json!({
-        "author": material.device_id,
-        "signature": b64_bytes(signature.as_ref()),
-        "payload": body,
-    });
-    send_private(material, store, peers, device_id, &envelope).await;
-}
-
-async fn send_private(
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    device_id: &str,
-    body: &Value,
-) {
-    let Some(peer) = peers.get(device_id) else { return };
-    let plain = serde_json::to_vec(body).unwrap_or_default();
-    let remote = SignalStore::address_for(device_id);
-    let local = SignalStore::address_for(&material.device_id);
-    let mut sessions = store.clone();
-    let mut identities = store.clone();
-    let mut rng = rand::rng();
-    if let Ok(message) = libsignal_protocol::message_encrypt(
-        &plain,
-        &remote,
-        &local,
-        &mut sessions,
-        &mut identities,
-        std::time::SystemTime::now(),
-        &mut rng,
-    ).await {
-        let _ = peer.tx.send(Frame::Signal(tag_ciphertext(&message)));
-    }
-}
-
-async fn accept_private(db: &Arc<Mutex<Db>>, store: &mut SignalStore, device_id: &str, plain: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(plain) else { return false };
-    match value.get("kind").and_then(|item| item.as_str()) {
-        Some("hello") => {
-            let name = value.get("name").and_then(|item| item.as_str()).unwrap_or("").trim().chars().take(64).collect::<String>();
-            if !name.is_empty() {
-                let _ = db.lock().map(|guard| guard.rename_peer(device_id, &name));
-            }
-            return true;
-        }
-        Some("skdm") => {}
-        _ => return false,
-    }
-    let Some(text) = value.get("bytes").and_then(|item| item.as_str()) else { return true };
-    let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text) else { return true };
-    if let Ok(message) = libsignal_protocol::SenderKeyDistributionMessage::try_from(bytes.as_slice()) {
-        let _ = libsignal_protocol::process_sender_key_distribution_message(
-            &SignalStore::address_for(device_id),
-            &message,
-            store,
-        ).await;
-    }
-    true
-}
-
-async fn publish_holdings(
-    db: &Arc<Mutex<Db>>,
-    material: &IdentityMaterial,
-    store: &mut SignalStore,
-    peers: &HashMap<String, PeerOut>,
-    published_holdings: &mut String,
-) {
-    if peers.values().all(|peer| !peer.confirmed) {
-        return;
-    }
     let Some((fingerprint, revision, rows)) = ({
-        let guard = db.lock().expect("db");
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
         let rows = local_publishable(&guard).unwrap_or_default();
         let fingerprint = serde_json::to_string(&rows).unwrap_or_default();
         if fingerprint == *published_holdings {
@@ -3227,15 +4242,16 @@ async fn publish_holdings(
             Some((fingerprint, revision, rows))
         }
     }) else {
-        return;
+        return false;
     };
     *published_holdings = fingerprint;
     for body in holdings_messages(revision, &rows) {
-        seal_and_send(material, store, peers, &body).await;
+        broadcast(peers, &body);
     }
+    true
 }
 
-/// One signal frame cannot carry a whole library, so the list is split.
+/// One message frame cannot carry a whole library, so the list is split.
 /// The receiver replaces its copy only after every part of this revision has arrived.
 const HOLDINGS_PART_BYTES: usize = 20 * 1024;
 
@@ -3297,17 +4313,16 @@ fn accept_holdings_part(
     Some(done)
 }
 
-/// An oversized frame is skipped. A real write error ends the connection.
+/// An oversized frame is skipped and logged. A real write error ends the connection.
 async fn write_or_stop(writer: &mut (impl tokio::io::AsyncWriteExt + Unpin), frame: &Frame) -> bool {
     match frames::write_frame(writer, frame).await {
         Ok(()) => false,
-        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => false,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+            eprintln!("frame not sent: {err}");
+            false
+        }
         Err(_) => true,
     }
-}
-
-fn b64_bytes(bytes: &[u8]) -> String {
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
 }
 
 fn dequeue_download(live: &Live, tx: &mpsc::UnboundedSender<Cmd>) {
@@ -3339,7 +4354,9 @@ fn song_title(db: &Db, content_id: &str) -> String {
         .unwrap_or_default()
 }
 
-fn store_download(live: &Live, status: DownloadStatus) {
+fn store_download(live: &Live, mut status: DownloadStatus) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    status.seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut guard) = live.inner.lock() {
         guard.download = Some(status);
     }
@@ -3372,6 +4389,7 @@ async fn start_download(
 ) {
     let set_status = |content_id: &str, state: &str, detail: &str, title: &str| {
         store_download(live, DownloadStatus {
+            seq: 0,
             content_id: content_id.to_string(),
             state: state.into(),
             detail: detail.into(),
@@ -3392,7 +4410,7 @@ async fn start_download(
         publish_download(app, live, None, false);
         return;
     }
-    let guard = db.lock().expect("db");
+    let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
     if guard.setting_bool("incognito").unwrap_or(false) {
         drop(guard);
         if let Ok(mut queued) = live.inner.lock() {
@@ -3452,14 +4470,25 @@ async fn start_download(
     let bus = bus.clone();
     let cmd_tx = tx.clone();
     tokio::task::spawn_local(async move {
+        let directory = PathBuf::from(&folder);
+        // The song goes straight to disk; only a small part of it is in memory at any time.
+        let temp = directory.join(format!(".tunepeerly-download-{content_id}.part"));
         let mut attempt = Some(first);
-        let mut bytes = Vec::new();
+        let mut size = 0u64;
         let mut ok = false;
         while let Some(source) = attempt.take() {
             let Some((_, sender)) = senders.iter().find(|(item, _)| item == &source) else { break };
+            let created = {
+                let directory = directory.clone();
+                let temp = temp.clone();
+                tokio::task::spawn_blocking(move || std::fs::create_dir_all(&directory).and_then(|_| File::create(&temp))).await
+            };
+            let Ok(Ok(file)) = created else { break };
+            let mut part = Some(file);
             let id = rand::random::<u64>();
             let (tx, mut rx) = mpsc::unbounded_channel();
-            bus.register(id, tx);
+            let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            bus.register_limited(id, tx, queued.clone());
             if sender
                 .send(Frame::AudioReq {
                     id,
@@ -3476,30 +4505,55 @@ async fn start_download(
                 }
                 continue;
             }
-            bytes.clear();
+            let mut hasher = blake3::Hasher::new();
+            let mut written = 0u64;
             let mut failed = false;
             let mut total_bytes = 0u64;
             let mut last_progress = Instant::now() - Duration::from_secs(1);
             loop {
                 let piece = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
                 let Ok(Some(piece)) = piece else { failed = true; break };
+                media::taken(&queued, &piece);
                 if piece.error.is_some() {
                     failed = true;
                     break;
                 }
                 if let Some(total) = piece.total {
-                    total_bytes = total_bytes.max(total);
-                }
-                if !piece.data.is_empty() {
-                    let at = piece.offset as usize;
-                    // The sender streams from the start. A gap, or more bytes than the announced size, is a bad peer.
-                    let over = total_bytes > 0 && (at as u64).saturating_add(piece.data.len() as u64) > total_bytes;
-                    if at > bytes.len() || over {
+                    if total > MAX_DOWNLOAD_BYTES {
                         failed = true;
                         break;
                     }
-                    bytes.truncate(at);
-                    bytes.extend_from_slice(&piece.data);
+                    total_bytes = total_bytes.max(total);
+                }
+                if !piece.data.is_empty() {
+                    let at = piece.offset;
+                    let end = at.saturating_add(piece.data.len() as u64);
+                    // The sender streams from the start. A gap, or more bytes than the announced size, is a bad peer.
+                    let over = (total_bytes > 0 && end > total_bytes) || end > MAX_DOWNLOAD_BYTES;
+                    if at > written || over {
+                        failed = true;
+                        break;
+                    }
+                    // Bytes sent again are already on disk; only the new part is written.
+                    let fresh = &piece.data[(written - at).min(piece.data.len() as u64) as usize..];
+                    if !fresh.is_empty() {
+                        hasher.update(fresh);
+                        let chunk = fresh.to_vec();
+                        let Some(mut file) = part.take() else { failed = true; break };
+                        let wrote = tokio::task::spawn_blocking(move || {
+                            use std::io::Write;
+                            let result = file.write_all(&chunk);
+                            (file, result)
+                        })
+                        .await;
+                        let Ok((returned, result)) = wrote else { failed = true; break };
+                        part = Some(returned);
+                        if result.is_err() {
+                            failed = true;
+                            break;
+                        }
+                        written += fresh.len() as u64;
+                    }
                 }
                 let due = last_progress.elapsed() >= Duration::from_millis(200) || piece.eof;
                 if due {
@@ -3507,7 +4561,7 @@ async fn start_download(
                     if let Ok(mut guard) = live.inner.lock() {
                         if let Some(status) = guard.download.as_mut() {
                             if status.content_id == content_id && status.state == "started" {
-                                status.received = bytes.len() as u64;
+                                status.received = written;
                                 status.total = total_bytes;
                             }
                         }
@@ -3522,7 +4576,12 @@ async fn start_download(
             if failed {
                 let _ = sender.send(Frame::AudioCancel { id });
             }
-            if !failed && blake3::hash(&bytes).to_hex().as_str() == content_id {
+            let flushed = match part.take() {
+                Some(file) => tokio::task::spawn_blocking(move || file.sync_all()).await.is_ok_and(|result| result.is_ok()),
+                None => false,
+            };
+            if !failed && flushed && hasher.finalize().to_hex().as_str() == content_id {
+                size = written;
                 ok = true;
                 break;
             }
@@ -3533,42 +4592,57 @@ async fn start_download(
         }
         let finish = |state: &str, detail: &str| {
             store_download(&live, DownloadStatus {
+                seq: 0,
                 content_id: content_id.clone(),
                 state: state.into(),
                 detail: detail.into(),
                 title: title.clone(),
-                received: bytes.len() as u64,
-                total: bytes.len() as u64,
+                received: size,
+                total: size,
             });
         };
         let remember = |path: &str, saved_ok: bool| -> Option<Value> {
             db.lock().ok().and_then(|guard| guard.push_download_history(&content_id, &title, path, saved_ok).ok())
         };
         if !ok {
+            let temp = temp.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(&temp)).await;
             finish("failed", "");
             let history = remember("", false);
             publish_download(&app, &live, history, true);
             dequeue_download(&live, &cmd_tx);
             return;
         }
-        let directory = PathBuf::from(&folder);
-        let _ = std::fs::create_dir_all(&directory);
         let name = download_name(&title, &codec, &content_id);
-        let temp = directory.join(format!(".tunepeerly-download-{content_id}.part"));
-        let final_path = unique_path(&directory, &name);
-        let saved = std::fs::write(&temp, &bytes).and_then(|_| std::fs::rename(&temp, &final_path));
-        let (history, saved_ok) = if saved.is_err() {
-            let _ = std::fs::remove_file(&temp);
-            finish("failed", &folder);
-            (remember(&folder, false), false)
-        } else {
-            if crate::scan::import_path(&db, &directory, "directory").is_ok() {
+        // Moving the file and reading its tags run on the blocking pool, not the network thread.
+        // Only the new file is imported; the rest of the folder is not rescanned.
+        let saved = {
+            let directory = directory.clone();
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || {
+                let final_path = unique_path(&directory, &name);
+                if std::fs::rename(&temp, &final_path).is_err() {
+                    let _ = std::fs::remove_file(&temp);
+                    return None;
+                }
+                let imported = crate::scan::import_downloaded_file(&db, &directory, &final_path).is_ok();
+                Some((final_path, imported))
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        let (history, saved_ok) = if let Some((final_path, imported)) = saved {
+            if imported {
                 use tauri::Manager;
                 let _ = app.asset_protocol_scope().allow_directory(&directory, true);
             }
             let path = final_path.to_string_lossy().to_string();
             finish("saved", &path);
             (remember(&path, true), true)
+        } else {
+            finish("failed", &folder);
+            (remember(&folder, false), false)
         };
         publish_download(&app, &live, history, true);
         if saved_ok {
@@ -3578,11 +4652,44 @@ async fn start_download(
     });
 }
 
+/// A peer's cover is shown by the WebView, so keep only bytes that are a picture it can draw.
+fn is_cover_image(bytes: &[u8]) -> bool {
+    matches!(
+        image::guess_format(bytes),
+        Ok(image::ImageFormat::Jpeg | image::ImageFormat::Png | image::ImageFormat::Gif | image::ImageFormat::WebP | image::ImageFormat::Bmp)
+    )
+}
+
+/// Largest file a download accepts.
+const MAX_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 fn download_name(title: &str, codec: &str, content_id: &str) -> String {
-    let clean = title.chars().map(|ch| if "\\/:*?\"<>|".contains(ch) { '_' } else { ch }).collect::<String>();
-    let stem = if clean.trim().is_empty() { content_id } else { clean.trim() };
+    let stem = match safe_file_stem(title) {
+        Some(stem) => stem,
+        None => safe_file_stem(content_id).unwrap_or_else(|| "track".into()),
+    };
     let ext = crate::scan::file_extension_for_codec(codec);
     format!("{stem}.{ext}")
+}
+
+/// A peer's title as a Windows file name: no path characters, no trailing dots or spaces
+/// (Windows drops them), no device names such as `CON` or `COM1`, and not overly long.
+fn safe_file_stem(text: &str) -> Option<String> {
+    let clean = text
+        .chars()
+        .map(|ch| if ch.is_control() || "\\/:*?\"<>|".contains(ch) { '_' } else { ch })
+        .take(120)
+        .collect::<String>();
+    let clean = clean.trim().trim_end_matches(['.', ' ']);
+    if clean.is_empty() || clean.chars().all(|ch| ch == '.') {
+        return None;
+    }
+    let device = clean.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let reserved = matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || (device.len() == 4
+            && (device.starts_with("COM") || device.starts_with("LPT"))
+            && device.as_bytes()[3].is_ascii_digit());
+    Some(if reserved { format!("_{clean}") } else { clean.to_string() })
 }
 
 fn unique_path(directory: &PathBuf, name: &str) -> PathBuf {
@@ -3601,60 +4708,6 @@ fn unique_path(directory: &PathBuf, name: &str) -> PathBuf {
     }
     let tick = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_millis()).unwrap_or(0);
     directory.join(format!("{stem}-{tick}.{ext}"))
-}
-
-fn decode_bundle(bytes: &[u8]) -> AppResult<libsignal_protocol::PreKeyBundle> {
-    let value: Value = serde_json::from_slice(bytes)?;
-    let b64 = |key: &str| {
-        base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            value.get(key).and_then(|item| item.as_str()).unwrap_or(""),
-        ).map_err(|err| crate::error::AppError::Message(err.to_string()))
-    };
-    let identity = libsignal_protocol::IdentityKey::decode(&b64("identity")?).map_err(|err| crate::error::AppError::Message(err.to_string()))?;
-    let signed_public = libsignal_protocol::PublicKey::deserialize(&b64("signedPublic")?).map_err(|err| crate::error::AppError::Message(err.to_string()))?;
-    let kyber_public = libsignal_protocol::kem::PublicKey::deserialize(&b64("kyberPublic")?).map_err(|err| crate::error::AppError::Message(err.to_string()))?;
-    libsignal_protocol::PreKeyBundle::new(
-        value.get("registrationId").and_then(|item| item.as_u64()).unwrap_or(1) as u32,
-        libsignal_protocol::DeviceId::new(1).expect("id"),
-        None,
-        libsignal_protocol::SignedPreKeyId::from(1u32),
-        signed_public,
-        b64("signedSignature")?,
-        libsignal_protocol::KyberPreKeyId::from(1u32),
-        kyber_public,
-        b64("kyberSignature")?,
-        identity,
-    ).map_err(|err| crate::error::AppError::Message(err.to_string()))
-}
-
-/// Kind byte placed in front of every Signal frame.
-const SIGNAL_WHISPER: u8 = 2;
-const SIGNAL_PREKEY: u8 = 3;
-const SIGNAL_GROUP: u8 = 4;
-
-fn tag_ciphertext(message: &libsignal_protocol::CiphertextMessage) -> Vec<u8> {
-    let kind = match message {
-        libsignal_protocol::CiphertextMessage::PreKeySignalMessage(_) => SIGNAL_PREKEY,
-        _ => SIGNAL_WHISPER,
-    };
-    let mut out = vec![kind];
-    out.extend_from_slice(message.serialize());
-    out
-}
-
-fn tag_group(serialized: &[u8]) -> Vec<u8> {
-    let mut out = vec![SIGNAL_GROUP];
-    out.extend_from_slice(serialized);
-    out
-}
-
-fn decode_ciphertext(kind: u8, bytes: &[u8]) -> Option<libsignal_protocol::CiphertextMessage> {
-    match kind {
-        SIGNAL_WHISPER => libsignal_protocol::SignalMessage::try_from(bytes).ok().map(libsignal_protocol::CiphertextMessage::SignalMessage),
-        SIGNAL_PREKEY => libsignal_protocol::PreKeySignalMessage::try_from(bytes).ok().map(libsignal_protocol::CiphertextMessage::PreKeySignalMessage),
-        _ => None,
-    }
 }
 
 #[derive(Clone)]
@@ -3676,4 +4729,935 @@ impl IdentityMaterial {
 
 pub fn choose_download_source(sources: &[PlaySource], failed: Option<&PlaySource>) -> SourceChoice {
     sync_logic::select_source(sources, sync_logic::FailureClass::Transport, failed, false)
+}
+
+#[cfg(test)]
+mod disconnect_tests {
+    use super::{redial_ids, LiveInner};
+    use std::collections::HashSet;
+
+    #[test]
+    fn a_hold_from_either_side_stops_automatic_redial() {
+        let mut live = LiveInner::default();
+        live.paused.insert("we-disconnected".into());
+        live.held.insert("they-disconnected".into());
+        let saved = vec!["we-disconnected".to_string(), "they-disconnected".to_string(), "offline".to_string()];
+        assert_eq!(redial_ids(saved, |_| false, &live.on_hold()), vec!["offline".to_string()]);
+    }
+
+    #[test]
+    fn a_manually_disconnected_device_is_not_dialed_again() {
+        let saved = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let paused: HashSet<String> = ["b".to_string()].into_iter().collect();
+        assert_eq!(redial_ids(saved.clone(), |id| id == "a", &paused), vec!["c".to_string()]);
+        // After Connect the hold is lifted and the device is dialed again.
+        assert_eq!(redial_ids(saved, |id| id == "a", &HashSet::new()), vec!["b".to_string(), "c".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod redial_tests {
+    use super::{hello_address, redial_targets, redial_wait, Nearby, Redial, REDIAL_MAX_WAIT};
+    use crate::frames::Frame;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn waits_grow_from_one_second_to_a_minute_with_at_most_a_quarter_more() {
+        let waits: Vec<u64> = (1..=9).map(|tries| redial_wait(tries, 0.0).as_secs()).collect();
+        assert_eq!(waits, vec![1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(redial_wait(1, 1.0), Duration::from_millis(1250));
+        assert_eq!(redial_wait(40, 1.0), REDIAL_MAX_WAIT + REDIAL_MAX_WAIT / 4);
+        assert_eq!(redial_wait(3, 7.0), redial_wait(3, 1.0));
+    }
+
+    #[test]
+    fn a_missing_device_is_called_at_once_then_after_its_wait() {
+        let mut redial = Redial::default();
+        let missing = vec!["phone".to_string()];
+        let start = Instant::now();
+        assert_eq!(redial.take_due(&missing, start, || 0.0), vec![("phone".to_string(), 0)]);
+        assert!(redial.take_due(&missing, start + Duration::from_millis(500), || 0.0).is_empty());
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(1), || 0.0), vec![("phone".to_string(), 1)]);
+        // Waits 2 seconds now.
+        assert!(redial.take_due(&missing, start + Duration::from_millis(2500), || 0.0).is_empty());
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(3), || 0.0).len(), 1);
+    }
+
+    #[test]
+    fn a_call_under_way_is_not_repeated_until_it_fails() {
+        let mut redial = Redial::default();
+        let missing = vec!["phone".to_string()];
+        let start = Instant::now();
+        assert_eq!(redial.take_due(&missing, start, || 0.0).len(), 1);
+        redial.calling("phone", start, 2, false);
+        assert!(redial.take_due(&missing, start + Duration::from_secs(2), || 0.0).is_empty());
+        redial.dial_failed("phone");
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(2), || 0.0).len(), 1);
+        // A relay request is waited out even when the LAN part fails.
+        redial.calling("phone", start + Duration::from_secs(2), 1, true);
+        redial.dial_failed("phone");
+        assert!(redial.take_due(&missing, start + Duration::from_secs(10), || 0.0).is_empty());
+    }
+
+    #[test]
+    fn a_connection_that_closes_before_it_is_ready_is_not_called_again_at_once() {
+        let mut redial = Redial::default();
+        let missing = vec!["phone".to_string()];
+        let start = Instant::now();
+        redial.connected("phone");
+        redial.closed_early("phone", start, 0.0);
+        assert!(redial.take_due(&missing, start, || 0.0).is_empty());
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(1), || 0.0), vec![("phone".to_string(), 1)]);
+        // Each early close in a row waits longer.
+        redial.connected("phone");
+        redial.closed_early("phone", start, 0.0);
+        assert!(redial.take_due(&missing, start + Duration::from_secs(1), || 0.0).is_empty());
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(2), || 0.0).len(), 1);
+        // Once a link worked, losing it calls again at once and starts the waits over.
+        redial.connected("phone");
+        redial.link_lost("phone");
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(2), || 0.0), vec![("phone".to_string(), 0)]);
+        assert!(!redial.early_closes.contains_key("phone"));
+    }
+
+    #[test]
+    fn a_kick_calls_again_at_once_and_starts_the_waits_over() {
+        let mut redial = Redial::default();
+        let missing = vec!["phone".to_string(), "laptop".to_string()];
+        let start = Instant::now();
+        for _ in 0..5 {
+            redial.take_due(&missing, Instant::now(), || 0.0);
+        }
+        let _ = start;
+        redial.kick("phone");
+        let due = redial.take_due(&missing, Instant::now(), || 0.0);
+        assert_eq!(due, vec![("phone".to_string(), 0)]);
+        redial.kick_all();
+        let due = redial.take_due(&missing, Instant::now(), || 0.0);
+        assert_eq!(due.len(), 2);
+        // A connected device leaves the schedule; one that is no longer missing is dropped too.
+        redial.connected("phone");
+        redial.take_due(&["laptop".to_string()], Instant::now(), || 0.0);
+        assert!(!redial.due.contains_key("phone"));
+    }
+
+    #[test]
+    fn saved_addresses_come_before_nearby_ones_each_once() {
+        let nearby = Nearby {
+            device_id: "phone".into(),
+            name: "Phone".into(),
+            host: "192.168.1.20".into(),
+            hosts: vec!["192.168.1.20".into(), "10.0.0.5".into()],
+            port: 5000,
+        };
+        let saved = Some((vec!["192.168.1.30".to_string(), "192.168.1.20".to_string()], 5000));
+        assert_eq!(
+            redial_targets(saved, Some(&nearby)),
+            vec![("192.168.1.30".to_string(), 5000), ("192.168.1.20".to_string(), 5000), ("10.0.0.5".to_string(), 5000)]
+        );
+        // The device moved to another port: the old port is still tried first, then the new one.
+        let old = Some((vec!["192.168.1.20".to_string()], 4000));
+        assert_eq!(redial_targets(old, Some(&nearby)).len(), 3);
+        assert!(redial_targets(None, None).is_empty());
+    }
+
+    #[test]
+    fn a_hello_carries_the_port_and_usable_addresses() {
+        let frame = Frame::Message(serde_json::to_vec(&json!({"kind": "hello", "name": "PC", "port": 51000, "addrs": ["192.168.1.5", "127.0.0.1", "nonsense", "224.0.0.1"]})).unwrap());
+        assert_eq!(hello_address(&frame), Some((51000, vec!["192.168.1.5".to_string()])));
+        // Older versions send no port: nothing to remember.
+        let old = Frame::Message(serde_json::to_vec(&json!({"kind": "hello", "name": "PC"})).unwrap());
+        assert_eq!(hello_address(&old), None);
+        let other = Frame::Message(serde_json::to_vec(&json!({"kind": "holdings", "port": 1})).unwrap());
+        assert_eq!(hello_address(&other), None);
+        assert_eq!(hello_address(&Frame::Keepalive), None);
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::{answer_pairing, pairing_closed, pairing_frame, put_offer, start_pairing, tick_pairing, Live, LiveInner, PeerOut};
+    use crate::db::Db;
+    use crate::frames::Frame;
+    use crate::identity::{self, IdentityMaterial};
+    use crate::pairing;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+
+    /// One app: its database, key, pairing state, and the frames it sent to the other side.
+    struct Side {
+        db: Arc<Mutex<Db>>,
+        material: IdentityMaterial,
+        live: Live,
+        peers: HashMap<String, PeerOut>,
+        sent: Option<mpsc::UnboundedReceiver<Frame>>,
+    }
+
+    fn side(name: &str) -> Side {
+        let dir = std::env::temp_dir().join(format!("tunepeerly-pairing-{name}-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).expect("db");
+        let material = identity::load_or_create(&db).expect("identity");
+        Side { db: Arc::new(Mutex::new(db)), material, live: Live { inner: Arc::new(Mutex::new(LiveInner::default())) }, peers: HashMap::new(), sent: None }
+    }
+
+    /// Opens an unpaired connection from `me` to a device whose TLS key `me` sees as `seen_key`.
+    fn connect(me: &mut Side, device_id: &str, seen_key: &[u8], cert_der: &[u8], role: &str) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (audio, _) = mpsc::channel(1);
+        me.peers.insert(device_id.to_string(), PeerOut {
+            device_id: device_id.to_string(),
+            conn: 1,
+            dialed_by: String::new(),
+            confirmed: false,
+            ready: false,
+            incoming: role == "incoming",
+            path: "lan".into(),
+            tx,
+            audio,
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            cert_der: Vec::new(),
+        });
+        me.sent = Some(rx);
+        put_offer(&me.live, seen_key, cert_der, "Other", role, "full");
+        // put_offer names the device by the key it was given; tests use the real id throughout.
+        if let Ok(mut guard) = me.live.inner.lock()
+            && let Some(offer) = guard.offer.as_mut()
+        {
+            offer.device_id = device_id.to_string();
+        }
+    }
+
+    /// The asked app (shows the code) and the asking app (types it), connected to each other.
+    fn pair_of() -> (Side, Side) {
+        let mut asked = side("asked");
+        let mut asking = side("asking");
+        let (asking_id, asking_key, asking_cert) = (asking.material.device_id.clone(), asking.material.public_key.clone(), asking.material.cert_der.clone());
+        let (asked_id, asked_key, asked_cert) = (asked.material.device_id.clone(), asked.material.public_key.clone(), asked.material.cert_der.clone());
+        connect(&mut asked, &asking_id, &asking_key, &asking_cert, "incoming");
+        connect(&mut asking, &asked_id, &asked_key, &asked_cert, "outgoing");
+        (asked, asking)
+    }
+
+    /// Delivers every frame `from` sent to `to`. Returns true if `to` became paired.
+    fn deliver(from: &mut Side, to: &mut Side) -> bool {
+        let mut frames = Vec::new();
+        if let Some(rx) = from.sent.as_mut() {
+            while let Ok(frame) = rx.try_recv() {
+                frames.push(frame);
+            }
+        }
+        let mut paired = false;
+        for frame in frames {
+            paired |= pairing_frame(&to.db, &to.material, &to.live, &mut to.peers, &from.material.device_id, frame);
+        }
+        paired
+    }
+
+    fn sent_frames(side: &mut Side) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        if let Some(rx) = side.sent.as_mut() {
+            while let Ok(frame) = rx.try_recv() {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
+    fn shown_code(side: &Side) -> Option<String> {
+        side.live.inner.lock().unwrap().offer.as_ref().and_then(|offer| offer.code.clone())
+    }
+
+    fn status(side: &Side) -> Option<String> {
+        side.live.inner.lock().unwrap().offer.as_ref().map(|offer| offer.status.clone())
+    }
+
+    fn saved_key(side: &Side, device_id: &str) -> Option<Vec<u8>> {
+        side.db.lock().unwrap().peers().unwrap().into_iter().find(|peer| peer.device_id == device_id).map(|peer| peer.public_key)
+    }
+
+    /// The asking app types `code` and the frames go back and forth until the exchange settles.
+    fn try_code(asked: &mut Side, asking: &mut Side, code: &str) -> (bool, bool) {
+        let asked_id = asked.material.device_id.clone();
+        start_pairing(&asking.material, &asking.live, &asking.peers, &asked_id, "full", code);
+        let mut asked_paired = deliver(asking, asked);
+        let asking_paired = deliver(asked, asking);
+        asked_paired |= deliver(asking, asked);
+        deliver(asked, asking);
+        (asked_paired, asking_paired)
+    }
+
+    fn other_code(code: &str) -> String {
+        let value: u32 = code.parse().unwrap();
+        format!("{:06}", (value + 1) % 1_000_000)
+    }
+
+    #[test]
+    fn the_right_code_pairs_both_apps_and_pins_both_keys() {
+        let (mut asked, mut asking) = pair_of();
+        let code = shown_code(&asked).expect("code on screen");
+        assert_eq!(code.len(), 6);
+        assert!(shown_code(&asking).is_none(), "the asking side never sees the code");
+        assert_eq!(try_code(&mut asked, &mut asking, &code), (true, true));
+        assert_eq!(saved_key(&asked, &asking.material.device_id), Some(asking.material.public_key.clone()));
+        assert_eq!(saved_key(&asking, &asked.material.device_id), Some(asked.material.public_key.clone()));
+        assert!(asked.peers.values().all(|peer| peer.confirmed));
+        assert!(asking.peers.values().all(|peer| peer.confirmed));
+        assert!(asked.live.inner.lock().unwrap().offer.is_none());
+        assert!(asking.live.inner.lock().unwrap().offer.is_none());
+    }
+
+    #[test]
+    fn nothing_is_saved_before_the_code_is_checked() {
+        let (asked, asking) = pair_of();
+        assert!(saved_key(&asked, &asking.material.device_id).is_none());
+        assert!(saved_key(&asking, &asked.material.device_id).is_none());
+        assert!(asking.peers.values().all(|peer| !peer.confirmed));
+    }
+
+    #[test]
+    fn a_wrong_code_fails_and_a_new_code_replaces_the_used_one() {
+        let (mut asked, mut asking) = pair_of();
+        let first = shown_code(&asked).unwrap();
+        assert_eq!(try_code(&mut asked, &mut asking, &other_code(&first)), (false, false));
+        assert_eq!(status(&asking).as_deref(), Some("wrong"));
+        assert_eq!(status(&asked).as_deref(), Some("wrong"));
+        assert_eq!(asked.live.inner.lock().unwrap().offer.as_ref().unwrap().tries_left, 2);
+        let second = shown_code(&asked).expect("a new code");
+        assert!(saved_key(&asked, &asking.material.device_id).is_none());
+        assert!(saved_key(&asking, &asked.material.device_id).is_none());
+        // The first code worked once and is gone, even though it was the right one.
+        if first != second {
+            assert_eq!(try_code(&mut asked, &mut asking, &first), (false, false));
+        }
+        let third = shown_code(&asked).unwrap();
+        assert_eq!(try_code(&mut asked, &mut asking, &third), (true, true));
+    }
+
+    #[test]
+    fn three_wrong_codes_lock_pairing() {
+        let (mut asked, mut asking) = pair_of();
+        for _ in 0..pairing::MAX_WRONG {
+            let code = shown_code(&asked).expect("code");
+            assert_eq!(try_code(&mut asked, &mut asking, &other_code(&code)), (false, false));
+        }
+        assert_eq!(status(&asked).as_deref(), Some("locked"));
+        assert_eq!(status(&asking).as_deref(), Some("locked"));
+        assert!(shown_code(&asked).is_none());
+        let offer = asked.live.inner.lock().unwrap().offer.clone().unwrap();
+        let left = offer.locked_until.unwrap() - super::now_ms();
+        assert!((55_000..=60_000).contains(&left), "{left}");
+        // The connection was closed, and any new try is refused while locked.
+        assert!(asked.peers.is_empty());
+        let mut other = side("other");
+        let (asked_id, asked_key, asked_cert) = (asked.material.device_id.clone(), asked.material.public_key.clone(), asked.material.cert_der.clone());
+        connect(&mut other, &asked_id, &asked_key, &asked_cert, "outgoing");
+        let other_id = other.material.device_id.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (audio, _) = mpsc::channel(1);
+        asked.peers.insert(other_id.clone(), PeerOut {
+            device_id: other_id.clone(), conn: 2, dialed_by: String::new(), confirmed: false, ready: false, incoming: true,
+            path: "lan".into(), tx, audio, alive: Arc::new(std::sync::atomic::AtomicBool::new(true)), cert_der: Vec::new(),
+        });
+        let (_, message) = pairing::Asking::start("000000", &other.material.public_key, &asked.material.public_key);
+        answer_pairing(&asked.material, &asked.live, &mut asked.peers, &other_id, &message);
+        assert!(matches!(rx.try_recv(), Ok(Frame::PairFail { reason }) if reason == "locked"));
+    }
+
+    #[test]
+    fn a_code_expires() {
+        let (mut asked, mut asking) = pair_of();
+        let code = shown_code(&asked).unwrap();
+        assert!(!tick_pairing(&asked.live, &mut asked.peers, Instant::now() + Duration::from_secs(30)));
+        assert!(tick_pairing(&asked.live, &mut asked.peers, Instant::now() + pairing::CODE_LIFETIME));
+        assert_eq!(status(&asked).as_deref(), Some("expired"));
+        assert!(shown_code(&asked).is_none());
+        assert!(asked.peers.is_empty(), "the unpaired connection is closed");
+        deliver(&mut asked, &mut asking);
+        assert_eq!(status(&asking).as_deref(), Some("expired"));
+        // The right code typed now gets nowhere.
+        start_pairing(&asking.material, &asking.live, &asking.peers, &asked.material.device_id, "full", &code);
+        assert!(sent_frames(&mut asking).is_empty());
+    }
+
+    #[test]
+    fn a_late_try_with_an_expired_code_is_refused() {
+        let (mut asked, mut asking) = pair_of();
+        let Some(past) = Instant::now().checked_sub(pairing::CODE_LIFETIME + Duration::from_secs(1)) else { return };
+        let old = pairing::Code::new(past);
+        let value = old.value().to_string();
+        asked.live.inner.lock().unwrap().pairing.code = Some(old);
+        assert_eq!(try_code(&mut asked, &mut asking, &value), (false, false));
+        assert_eq!(status(&asked).as_deref(), Some("expired"));
+        assert_eq!(status(&asking).as_deref(), Some("expired"));
+    }
+
+    #[test]
+    fn someone_in_the_middle_fails_even_with_the_right_code() {
+        let (mut asked, mut asking) = pair_of();
+        let code = shown_code(&asked).unwrap();
+        // Each end only sees the key the middle used for its TLS session; the middle passes frames on.
+        let middle_one = side("middle-one").material.public_key;
+        let middle_two = side("middle-two").material.public_key;
+        asking.live.inner.lock().unwrap().offer.as_mut().unwrap().public_key = middle_one;
+        asked.live.inner.lock().unwrap().offer.as_mut().unwrap().public_key = middle_two;
+        assert_eq!(try_code(&mut asked, &mut asking, &code), (false, false));
+        assert_eq!(status(&asking).as_deref(), Some("wrong"));
+        assert_eq!(asked.live.inner.lock().unwrap().pairing.guard.tries_left(), 2);
+        assert!(saved_key(&asked, &asking.material.device_id).is_none());
+        assert!(saved_key(&asking, &asked.material.device_id).is_none());
+    }
+
+    #[test]
+    fn hanging_up_or_never_answering_counts_as_a_wrong_try() {
+        let (mut asked, mut asking) = pair_of();
+        let code = shown_code(&asked).unwrap();
+        let asked_id = asked.material.device_id.clone();
+        start_pairing(&asking.material, &asking.live, &asking.peers, &asked_id, "full", &code);
+        deliver(&mut asking, &mut asked);
+        assert_eq!(status(&asked).as_deref(), Some("checking"));
+        // The tag never comes back.
+        assert!(tick_pairing(&asked.live, &mut asked.peers, Instant::now() + pairing::ANSWER_TIMEOUT));
+        assert_eq!(asked.live.inner.lock().unwrap().pairing.guard.tries_left(), 2);
+        assert_eq!(status(&asked).as_deref(), Some("wrong"));
+        // Next try: the asking side hangs up after the answer.
+        let (mut asked2, mut asking2) = pair_of();
+        let code = shown_code(&asked2).unwrap();
+        let asked2_id = asked2.material.device_id.clone();
+        start_pairing(&asking2.material, &asking2.live, &asking2.peers, &asked2_id, "full", &code);
+        deliver(&mut asking2, &mut asked2);
+        pairing_closed(&asked2.live, &asking2.material.device_id);
+        assert_eq!(asked2.live.inner.lock().unwrap().pairing.guard.tries_left(), 2);
+        assert_eq!(status(&asked2).as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn only_the_device_on_screen_can_use_the_code() {
+        let (mut asked, _asking) = pair_of();
+        let code = shown_code(&asked).unwrap();
+        let stranger = side("stranger");
+        let stranger_id = stranger.material.device_id.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (audio, _) = mpsc::channel(1);
+        asked.peers.insert(stranger_id.clone(), PeerOut {
+            device_id: stranger_id.clone(), conn: 3, dialed_by: String::new(), confirmed: false, ready: false, incoming: true,
+            path: "lan".into(), tx, audio, alive: Arc::new(std::sync::atomic::AtomicBool::new(true)), cert_der: Vec::new(),
+        });
+        let (_, message) = pairing::Asking::start(&code, &stranger.material.public_key, &asked.material.public_key);
+        answer_pairing(&asked.material, &asked.live, &mut asked.peers, &stranger_id, &message);
+        assert!(matches!(rx.try_recv(), Ok(Frame::PairFail { reason }) if reason == "busy"));
+        // The code is still there for the device it was shown for, and nothing was counted.
+        assert_eq!(shown_code(&asked), Some(code));
+        assert_eq!(asked.live.inner.lock().unwrap().pairing.guard.tries_left(), pairing::MAX_WRONG);
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::{drop_stale_unpaired, forgotten_by, put_offer, remove_here, tell_removed, Live, LiveInner, PeerOut};
+    use crate::db::{Db, PeerRow};
+    use crate::frames::Frame;
+    use crate::identity::{self, IdentityMaterial};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    fn open(name: &str) -> (Db, IdentityMaterial) {
+        let dir = std::env::temp_dir().join(format!("tunepeerly-removal-{name}-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).expect("db");
+        let material = identity::load_or_create(&db).expect("identity");
+        (db, material)
+    }
+
+    fn id(n: u8) -> String {
+        format!("{n:02x}").repeat(32)
+    }
+
+    fn save(db: &Db, device_id: &str, key: Vec<u8>, name: &str, trust: &str) {
+        db.upsert_peer(&PeerRow {
+            device_id: device_id.into(),
+            public_key: key,
+            cert_id: String::new(),
+            display_name: name.into(),
+            trust: trust.into(),
+        })
+        .expect("save");
+    }
+
+    fn saved(db: &Db, device_id: &str) -> bool {
+        db.peers().unwrap().iter().any(|peer| peer.device_id == device_id)
+    }
+
+    fn connection(device_id: &str, confirmed: bool, ready: bool) -> (PeerOut, mpsc::UnboundedReceiver<Frame>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (audio, _) = mpsc::channel(1);
+        let peer = PeerOut {
+            device_id: device_id.into(),
+            conn: 1,
+            dialed_by: String::new(),
+            confirmed,
+            ready,
+            incoming: true,
+            path: "lan".into(),
+            tx,
+            audio,
+            alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            cert_der: Vec::new(),
+        };
+        (peer, rx)
+    }
+
+    fn live() -> Live {
+        Live { inner: Arc::new(Mutex::new(LiveInner::default())) }
+    }
+
+    fn sent(rx: &mut mpsc::UnboundedReceiver<Frame>) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    /// Removing C: C is told, leaves the device list, and its key goes. The connection waits for C's
+    /// answer, and the removal stays recorded until then. B hears nothing and stays paired.
+    #[test]
+    fn removing_a_device_tells_it_and_waits_for_its_answer() {
+        let (db, _) = open("local");
+        let (b, c) = (id(0xbb), id(0xcc));
+        save(&db, &b, vec![1], "Tower", "full");
+        save(&db, &c, vec![2], "Laptop", "full");
+        let db = Arc::new(Mutex::new(db));
+        let live = live();
+        let mut peers = HashMap::new();
+        let mut inboxes = HashMap::new();
+        for device in [&b, &c] {
+            let (peer, rx) = connection(device, true, true);
+            peers.insert(device.clone(), peer);
+            inboxes.insert(device.clone(), rx);
+        }
+        let mut farewells = HashMap::new();
+        remove_here(&db, &live, &mut peers, &mut farewells, &mut HashMap::new(), &c);
+        assert!(!peers.contains_key(&c));
+        assert!(peers.contains_key(&b));
+        assert!(farewells.contains_key(&c));
+        assert!(matches!(sent(inboxes.get_mut(&c).unwrap()).as_slice(), [Frame::Unpaired { pair: false }]));
+        assert!(sent(inboxes.get_mut(&b).unwrap()).is_empty());
+        let guard = db.lock().unwrap();
+        assert!(!saved(&guard, &c));
+        assert!(saved(&guard, &b));
+        assert!(guard.is_removed(&c));
+        assert!(!guard.is_removed(&b));
+        assert_eq!(guard.removals().unwrap().iter().map(|row| row.name.as_str()).collect::<Vec<_>>(), vec!["Laptop"]);
+        assert!(guard.notices().unwrap().iter().any(|notice| notice.kind == "removed" && notice.name == "Laptop"));
+        // C's answer, or pairing again, ends the removal.
+        guard.end_removal(&c).unwrap();
+        assert!(!guard.is_removed(&c));
+    }
+
+    #[test]
+    fn an_unpaired_frame_makes_this_device_forget_the_sender_quietly() {
+        let (db, _) = open("forget");
+        let a = id(0xaa);
+        save(&db, &a, vec![1], "Desk", "full");
+        let db = Arc::new(Mutex::new(db));
+        let live = live();
+        let mut peers = HashMap::new();
+        let (peer, mut rx) = connection(&a, true, true);
+        peers.insert(a.clone(), peer);
+        assert_eq!(forgotten_by(&db, &live, &mut peers, &mut HashMap::new(), &a, false).as_deref(), Some("Desk"));
+        assert!(peers.is_empty());
+        assert!(live.inner.lock().unwrap().offer.is_none());
+        // The answer that tells the sender it was heard.
+        assert!(matches!(sent(&mut rx).as_slice(), [Frame::Unpaired { pair: false }]));
+        let guard = db.lock().unwrap();
+        assert!(!saved(&guard, &a));
+        // Forgetting does not keep the sender out: either side can pair again.
+        assert!(!guard.is_removed(&a));
+        assert!(guard.notices().unwrap().iter().any(|notice| notice.kind == "removedYou" && notice.name == "Desk"));
+    }
+
+    #[test]
+    fn pairing_again_from_the_remover_shows_a_code_here() {
+        let (db, _) = open("again");
+        let (_, remover) = open("remover");
+        save(&db, &remover.device_id, remover.public_key.clone(), "Desk", "full");
+        let db = Arc::new(Mutex::new(db));
+        let live = live();
+        let mut peers = HashMap::new();
+        let (mut peer, _rx) = connection(&remover.device_id, true, true);
+        peer.cert_der = remover.cert_der.clone();
+        peers.insert(remover.device_id.clone(), peer);
+        forgotten_by(&db, &live, &mut peers, &mut HashMap::new(), &remover.device_id, true);
+        let connection = peers.get(&remover.device_id).expect("kept");
+        assert!(!connection.confirmed && !connection.ready);
+        let offer = live.inner.lock().unwrap().offer.clone().expect("offer");
+        assert_eq!((offer.device_id.as_str(), offer.role.as_str()), (remover.device_id.as_str(), "incoming"));
+        assert!(offer.code.is_some());
+        assert!(!saved(&db.lock().unwrap(), &remover.device_id));
+    }
+
+    #[test]
+    fn an_unpaired_frame_from_an_unsaved_device_is_answered_and_changes_nothing_else() {
+        let (db, _) = open("unsaved");
+        let (a, b) = (id(0xaa), id(0xbb));
+        save(&db, &b, vec![2], "Tower", "full");
+        let db = Arc::new(Mutex::new(db));
+        let live = live();
+        let mut peers = HashMap::new();
+        let (peer, mut rx) = connection(&a, false, false);
+        peers.insert(a.clone(), peer);
+        assert!(forgotten_by(&db, &live, &mut peers, &mut HashMap::new(), &a, false).is_none());
+        assert!(matches!(sent(&mut rx).as_slice(), [Frame::Unpaired { pair: false }]));
+        assert!(!peers.contains_key(&a));
+        let guard = db.lock().unwrap();
+        assert!(guard.notices().unwrap().is_empty());
+        assert!(saved(&guard, &b));
+    }
+
+    /// A device removed while it was away is told on its next connection. Only its answer ends the
+    /// removal; a device that does not answer is told again next time.
+    #[tokio::test]
+    async fn a_removed_device_is_told_when_it_comes_back() {
+        let (db, _) = open("told");
+        let c = id(0xcc);
+        db.record_removal(&c, "Laptop", 1).unwrap();
+        let db = Arc::new(Mutex::new(db));
+        for answer in [true, false] {
+            let (here, mut there) = tokio::io::duplex(4096);
+            let told = tokio::spawn({
+                let db = db.clone();
+                let c = c.clone();
+                async move { tell_removed(here, &db, &c).await }
+            });
+            // The other device says hello first, then reads the notice.
+            crate::frames::write_frame(&mut there, &Frame::Keepalive).await.unwrap();
+            assert!(matches!(crate::frames::read_frame(&mut there).await.unwrap(), Frame::Unpaired { pair: false }));
+            if answer {
+                crate::frames::write_frame(&mut there, &Frame::Unpaired { pair: false }).await.unwrap();
+            } else {
+                drop(there);
+            }
+            told.await.unwrap();
+            assert_eq!(db.lock().unwrap().is_removed(&c), !answer);
+            db.lock().unwrap().record_removal(&c, "Laptop", 2).unwrap();
+        }
+    }
+
+    #[test]
+    fn unpaired_connections_without_a_pairing_are_let_go() {
+        let (db, _) = open("stale");
+        let (_, other) = open("other");
+        let (pairing, done, saved_verify) = (other.device_id.clone(), id(0xdd), id(0xee));
+        save(&db, &saved_verify, vec![5], "Ask", "verify");
+        let db = Arc::new(Mutex::new(db));
+        let live = live();
+        let mut peers = HashMap::new();
+        for device in [&pairing, &done, &saved_verify] {
+            peers.insert(device.clone(), connection(device, false, false).0);
+        }
+        put_offer(&live, &other.public_key, &other.cert_der, "Other", "incoming", "full");
+        assert!(drop_stale_unpaired(&db, &live, &mut peers));
+        let mut left: Vec<&String> = peers.keys().collect();
+        left.sort();
+        let mut want = vec![&pairing, &saved_verify];
+        want.sort();
+        assert_eq!(left, want);
+        // Once that try has ended, its connection goes too, though the dialog stays until closed.
+        live.inner.lock().unwrap().offer.as_mut().unwrap().status = "expired".into();
+        assert!(drop_stale_unpaired(&db, &live, &mut peers));
+        assert_eq!(peers.keys().collect::<Vec<_>>(), vec![&saved_verify]);
+        assert!(live.inner.lock().unwrap().offer.is_some());
+        assert!(!drop_stale_unpaired(&db, &live, &mut peers));
+    }
+}
+
+#[cfg(test)]
+mod announce_timing_tests {
+    use super::*;
+
+    fn at(start: Instant, millis: u64) -> Instant {
+        start + Duration::from_millis(millis)
+    }
+
+    /// Runs the clock in 100 ms steps, pressing Refresh at the given times, and returns when each path sent.
+    fn run(until_ms: u64, presses: &[u64]) -> (Vec<u64>, Vec<u64>) {
+        let start = Instant::now();
+        let mut times = AnnounceTimes::default();
+        let (mut multicast, mut broadcast) = (Vec::new(), Vec::new());
+        let mut step = 0;
+        while step <= until_ms {
+            let due = announce_due(&mut times, at(start, step), presses.contains(&step));
+            if due.multicast {
+                multicast.push(step);
+            }
+            if due.broadcast {
+                broadcast.push(step);
+            }
+            step += 100;
+        }
+        (multicast, broadcast)
+    }
+
+    fn most_in_window(sent: &[u64], window: u64) -> usize {
+        sent.iter().map(|first| sent.iter().filter(|other| **other >= *first && **other < first + window).count()).max().unwrap_or(0)
+    }
+
+    #[test]
+    fn both_paths_announce_at_start() {
+        let mut times = AnnounceTimes::default();
+        assert_eq!(announce_due(&mut times, Instant::now(), false), AnnounceDue { multicast: true, broadcast: true });
+    }
+
+    #[test]
+    fn multicast_every_three_seconds_and_broadcast_every_fifteen() {
+        let (multicast, broadcast) = run(30_000, &[]);
+        assert_eq!(multicast, (0..=10).map(|n| n * 3_000).collect::<Vec<_>>());
+        assert_eq!(broadcast, vec![0, 15_000, 30_000]);
+    }
+
+    #[test]
+    fn refresh_sends_both_paths_at_once() {
+        let start = Instant::now();
+        let mut times = AnnounceTimes::default();
+        announce_due(&mut times, start, false);
+        // One second after the regular announce, neither path is due on its own.
+        assert_eq!(announce_due(&mut times, at(start, 1_000), false), AnnounceDue::default());
+        assert_eq!(announce_due(&mut times, at(start, 1_000), true), AnnounceDue { multicast: true, broadcast: true });
+        // The regular multicast now counts from the Refresh.
+        assert!(!announce_due(&mut times, at(start, 3_900), false).multicast);
+        assert!(announce_due(&mut times, at(start, 4_000), false).multicast);
+    }
+
+    #[test]
+    fn repeated_refresh_is_limited_on_each_path() {
+        let start = Instant::now();
+        let mut times = AnnounceTimes::default();
+        announce_due(&mut times, start, false);
+        assert_eq!(announce_due(&mut times, at(start, 1_000), true), AnnounceDue { multicast: true, broadcast: true });
+        // Pressed again within 3 s: nothing extra.
+        assert_eq!(announce_due(&mut times, at(start, 1_500), true), AnnounceDue::default());
+        assert_eq!(announce_due(&mut times, at(start, 3_900), true), AnnounceDue::default());
+        // 3 s after the last Refresh multicast may go again; broadcast waits for 15 s.
+        assert_eq!(announce_due(&mut times, at(start, 4_000), true), AnnounceDue { multicast: true, broadcast: false });
+        assert!(!announce_due(&mut times, at(start, 15_900), true).broadcast);
+        assert!(announce_due(&mut times, at(start, 16_000), true).broadcast);
+    }
+
+    #[test]
+    fn pressing_nonstop_never_floods() {
+        // Refresh pressed every 100 ms for a minute.
+        let presses: Vec<u64> = (0..=600).map(|n| n * 100).collect();
+        let (multicast, broadcast) = run(60_000, &presses);
+        // At most one regular and one Refresh send per interval on each path.
+        assert!(most_in_window(&multicast, 3_000) <= 2, "{multicast:?}");
+        assert!(most_in_window(&broadcast, 15_000) <= 2, "{broadcast:?}");
+        // In practice a held-down Refresh simply takes the place of the regular announce.
+        assert_eq!(multicast.len(), 21);
+        assert_eq!(broadcast.len(), 5);
+    }
+
+    #[test]
+    fn loop_wakes_when_the_next_announce_is_due() {
+        let start = Instant::now();
+        let mut times = AnnounceTimes::default();
+        assert_eq!(announce_wait(&times, start), Duration::ZERO);
+        announce_due(&mut times, start, false);
+        assert_eq!(announce_wait(&times, at(start, 1_000)), Duration::from_millis(2_000));
+        assert_eq!(announce_wait(&times, at(start, 3_500)), Duration::ZERO);
+    }
+
+    #[test]
+    fn worst_case_is_two_sends_per_interval() {
+        // A Refresh just after the regular announce sends again at once; a second press does not.
+        let (multicast, broadcast) = run(15_000, &[100, 200, 2_900]);
+        assert_eq!(&multicast[..3], &[0, 100, 3_100]);
+        assert_eq!(&broadcast[..2], &[0, 100]);
+        assert!(most_in_window(&multicast, 3_000) <= 2);
+        assert!(most_in_window(&broadcast, 15_000) <= 2);
+    }
+}
+
+#[cfg(test)]
+mod relay_rule_tests {
+    use super::{finish_handshake, relay_admits, relay_forbids, NetEvent, RELAY_PATH};
+    use crate::db::{Db, PeerRow};
+    use crate::frames::{self, Frame};
+    use crate::identity::{self, IdentityMaterial};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn open(name: &str) -> (Db, IdentityMaterial) {
+        let dir = std::env::temp_dir().join(format!("tunepeerly-relay-{name}-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).expect("db");
+        let material = identity::load_or_create(&db).expect("identity");
+        (db, material)
+    }
+
+    fn row(device: &IdentityMaterial, public_key: Vec<u8>, trust: &str) -> PeerRow {
+        PeerRow {
+            device_id: device.device_id.clone(),
+            public_key,
+            cert_id: device.cert_id.clone(),
+            display_name: "Other".into(),
+            trust: trust.into(),
+        }
+    }
+
+    /// Runs this computer's side of a connection from `other` on `path`. Returns whether it was kept,
+    /// the events it produced and the other device's end of the stream.
+    async fn connect(
+        db: Db,
+        here: &IdentityMaterial,
+        other: &IdentityMaterial,
+        path: &str,
+    ) -> (bool, mpsc::UnboundedReceiver<NetEvent>, tokio::io::DuplexStream) {
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let (events, rx) = mpsc::unbounded_channel();
+        let certs = vec![rustls::pki_types::CertificateDer::from(other.cert_der.clone())];
+        let db = Arc::new(Mutex::new(db));
+        let kept = finish_handshake(near, certs, db, here.clone_parts(), events, path.into(), String::new(), true, None)
+            .await
+            .is_ok();
+        (kept, rx, far)
+    }
+
+    fn connected(rx: &mut mpsc::UnboundedReceiver<NetEvent>) -> Option<String> {
+        while let Ok(event) = rx.try_recv() {
+            if let NetEvent::Connected { path, .. } = event {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn only_a_saved_device_with_its_pinned_key_passes_the_relay() {
+        let (_, other) = open("admit");
+        assert!(!relay_admits(None, &other.public_key));
+        assert!(relay_admits(Some(&row(&other, other.public_key.clone(), "full")), &other.public_key));
+        // A saved device set to Ask each time may still come in: it gets the usual Allow prompt, not a code.
+        assert!(relay_admits(Some(&row(&other, other.public_key.clone(), "verify")), &other.public_key));
+        assert!(!relay_admits(Some(&row(&other, vec![7; 32], "full")), &other.public_key));
+    }
+
+    #[test]
+    fn pairing_frames_never_cross_the_relay() {
+        for frame in [
+            Frame::PairStart { message: vec![1] },
+            Frame::PairAnswer { message: vec![1], tag: [0; 32] },
+            Frame::PairConfirm { tag: [0; 32] },
+            Frame::PairFail { reason: "cancelled".into() },
+            Frame::Unpaired { pair: true },
+        ] {
+            assert!(relay_forbids(&frame), "{frame:?}");
+        }
+        for frame in [
+            Frame::Keepalive,
+            Frame::Message(b"{}".to_vec()),
+            Frame::Hold,
+            Frame::Unpaired { pair: false },
+            Frame::AudioReq { id: 1, content_id: "c".into(), start: 0, end: None },
+            Frame::AudioChunk { id: 1, offset: 0, eof: true, data: vec![1] },
+        ] {
+            assert!(!relay_forbids(&frame), "{frame:?}");
+        }
+    }
+
+    /// A device that is not saved here is dropped on the relay before anything reaches the app, so no
+    /// pairing dialog can open. On the local network the same device still gets through to pair.
+    #[tokio::test]
+    async fn an_unpaired_device_is_dropped_on_the_relay_but_not_on_the_lan() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (here_db, here) = open("stranger");
+                let (_, other) = open("stranger-other");
+                let (kept, mut events, mut far) = connect(here_db, &here, &other, RELAY_PATH).await;
+                assert!(!kept);
+                assert_eq!(connected(&mut events), None);
+                // The connection is closed without a word.
+                let mut byte = [0u8; 1];
+                assert_eq!(tokio::io::AsyncReadExt::read(&mut far, &mut byte).await.unwrap(), 0);
+
+                let (here_db, here) = open("stranger-lan");
+                let (kept, mut events, _far) = connect(here_db, &here, &other, "lan").await;
+                assert!(kept);
+                assert_eq!(connected(&mut events).as_deref(), Some("lan"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_saved_device_with_another_key_is_dropped_on_the_relay() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (here_db, here) = open("wrong-key");
+                let (_, other) = open("wrong-key-other");
+                here_db.upsert_peer(&row(&other, vec![7; 32], "full")).unwrap();
+                let (kept, mut events, _far) = connect(here_db, &here, &other, RELAY_PATH).await;
+                assert!(!kept);
+                assert_eq!(connected(&mut events), None);
+            })
+            .await;
+    }
+
+    /// A paired device, also one set to Ask each time, connects over the relay. Pairing frames it
+    /// sends are dropped, pairing frames this side queues are not sent, everything else passes.
+    #[tokio::test]
+    async fn a_paired_device_connects_over_the_relay_without_pairing_frames() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for trust in ["full", "verify"] {
+                    let (here_db, here) = open("paired");
+                    let (_, other) = open("paired-other");
+                    here_db.upsert_peer(&row(&other, other.public_key.clone(), trust)).unwrap();
+                    let (kept, mut events, mut far) = connect(here_db, &here, &other, RELAY_PATH).await;
+                    assert!(kept);
+                    let writer = loop {
+                        match events.recv().await.expect("connected") {
+                            NetEvent::Connected { path, writer, .. } => {
+                                assert_eq!(path, RELAY_PATH);
+                                break writer;
+                            }
+                            _ => continue,
+                        }
+                    };
+
+                    for frame in [
+                        Frame::PairStart { message: vec![1] },
+                        Frame::PairConfirm { tag: [0; 32] },
+                        Frame::Unpaired { pair: true },
+                        Frame::PairFail { reason: "wrong".into() },
+                        Frame::Unpaired { pair: false },
+                    ] {
+                        frames::write_frame(&mut far, &frame).await.unwrap();
+                    }
+                    let mut arrived = Vec::new();
+                    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(300), events.recv()).await {
+                        if let NetEvent::Frame { frame, .. } = event {
+                            arrived.push(frame);
+                        }
+                    }
+                    assert!(matches!(arrived.as_slice(), [Frame::Unpaired { pair: false }]), "{arrived:?}");
+
+                    for frame in [Frame::PairFail { reason: "cancelled".into() }, Frame::Unpaired { pair: true }, Frame::Hold] {
+                        writer.send(frame).unwrap();
+                    }
+                    let mut sent = Vec::new();
+                    while let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_millis(300), frames::read_frame(&mut far)).await {
+                        if !matches!(frame, Frame::Keepalive) {
+                            sent.push(frame);
+                        }
+                    }
+                    assert!(matches!(sent.as_slice(), [Frame::Hold]), "{sent:?}");
+                }
+            })
+            .await;
+    }
 }

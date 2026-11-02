@@ -3,13 +3,9 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, type Link } from "../api";
 import { useApp } from "../app/model";
-import { CommitInput, Revise, Row, Select } from "../components/controls";
+import { CommitInput, Row, Select, Switch } from "../components/controls";
+import { unpairedNearby } from "../lib/devices";
 import { Icons } from "../ui/icons";
-
-function ipv4(text: string): boolean {
-  const parts = text.trim().split(".");
-  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
-}
 
 export function relayLabel(relay: string, t: (key: string, options?: Record<string, unknown>) => string): { text: string; tone: string } {
   if (!relay) return { text: t("relay.off"), tone: "offline" };
@@ -23,26 +19,17 @@ export function DevicesPage() {
   const { t } = useTranslation();
   const app = useApp();
   const boot = app.boot;
-  const [host, setHost] = useState("");
-  const [port, setPort] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
   if (!boot) return null;
 
   const settings = app.settings;
-  const networkOff = Boolean(settings.incognito);
-  const pairedIds = new Set(boot.links.map((link) => link.deviceId));
-  const nearby = boot.nearby.filter((item) => !pairedIds.has(item.deviceId) || boot.links.find((link) => link.deviceId === item.deviceId)?.state !== "online");
+  const set = (key: string, value: unknown) => void app.setSetting(key, value);
   const relay = relayLabel(boot.relay, t);
-  const validHost = ipv4(host);
-  const portNumber = Number(port);
-  const validPort = Number.isInteger(portNumber) && portNumber > 0 && portNumber < 65536;
+  const networkOff = Boolean(settings.incognito);
+  // Nearby is only for devices that are not paired yet; a paired device stays under Paired even when it is offline.
+  const nearby = unpairedNearby(boot.nearby, boot.links);
 
   const run = (action: string, payload: unknown = null) => void api.network(action, payload).catch(app.say);
-  const connect = (target: string) => {
-    const [address, rawPort] = target.split(":");
-    setHost(address);
-    setPort(rawPort ?? "");
-    run("manual", { host: address, port: Number(rawPort) });
-  };
   const remove = (link: Link) =>
     app.setDialog({
       kind: "confirm",
@@ -52,6 +39,21 @@ export function DevicesPage() {
       danger: true,
       run: () => run("remove", link.deviceId),
     });
+  const block = (link: Link) =>
+    app.setDialog({
+      kind: "confirm",
+      title: t("devices.blockTitle", { name: link.name }),
+      body: t("devices.blockBody"),
+      action: t("devices.block"),
+      danger: true,
+      run: () => run("block", link.deviceId),
+    });
+  // The backend limits how often announces go out, so pressing again only resets the short spinner.
+  const refreshNearby = () => {
+    setRefreshing(true);
+    run("refresh-nearby");
+    window.setTimeout(() => setRefreshing(false), 1000);
+  };
 
   return (
     <div className="page settings-page devices-page">
@@ -68,39 +70,7 @@ export function DevicesPage() {
       )}
 
       <section className="panel">
-        <h2>{t("devices.thisDevice")}</h2>
-        <Row title={t("devices.name")} help={t("devices.nameHelp")}>
-          <CommitInput label={t("devices.name")} value={boot.deviceName} width={260} onCommit={(value) => void app.setSetting("displayName", value.trim().slice(0, 64)).then(app.scheduleRefresh)} />
-        </Row>
-        <Row title={t("devices.status")}>
-          <div className="pill-row">
-            <span className="state-pill online">{t("devices.port", { port: boot.listenPort || "—" })}</span>
-            <span className={`state-pill ${relay.tone}`} title={boot.relay}>
-              {relay.text}
-            </span>
-          </div>
-        </Row>
-        <Row title={t("devices.addresses")} help={t("devices.addressesHelp")}>
-          <div className="address-list">
-            {(boot.localAddresses ?? []).length === 0 ? (
-              <span className="muted small">{t("devices.noAddresses")}</span>
-            ) : (
-              (boot.localAddresses ?? []).map((address) => (
-                <span key={address} className="chip mono static">
-                  {address}
-                </span>
-              ))
-            )}
-          </div>
-        </Row>
-        <div className="setting-text">
-          <div className="setting-title">{t("devices.pairLan")}</div>
-          <div className="setting-help">{t("devices.pairLanHelp")}</div>
-        </div>
-      </section>
-
-      <section className="panel">
-        <h2>{t("devices.paired")}<Revise /></h2>
+        <h2>{t("devices.paired")}</h2>
         {boot.links.length === 0 ? (
           <p className="muted">{t("devices.noPaired")}</p>
         ) : (
@@ -142,7 +112,7 @@ export function DevicesPage() {
                 <button type="button" className="icon-btn" aria-label={t("devices.remove")} title={t("devices.remove")} onClick={() => remove(link)}>
                   <Icons.trash />
                 </button>
-                <button type="button" className="btn ghost small danger-text" onClick={() => run("block", link.deviceId)}>
+                <button type="button" className="btn ghost small danger-text" onClick={() => block(link)}>
                   {t("devices.block")}
                 </button>
               </li>
@@ -154,8 +124,22 @@ export function DevicesPage() {
       <section className="panel">
         <h2>
           {t("devices.nearby")}
-          <Revise />
           {settings.discovery && !networkOff && <span className="scanning" aria-hidden="true" />}
+          <span className="panel-switch" title={t("devices.discoveryHelp")}>
+            {settings.discovery && !networkOff && (
+              <button
+                type="button"
+                className={`btn ghost small${refreshing ? " spinning" : ""}`}
+                title={t("devices.refreshNearbyHelp")}
+                disabled={refreshing}
+                onClick={refreshNearby}
+              >
+                <Icons.sync /> {t("devices.refreshNearby")}
+              </button>
+            )}
+            <span className="device-switch-label">{t("devices.discovery")}</span>
+            <Switch label={t("devices.discovery")} checked={Boolean(settings.discovery)} onChange={(value) => void app.setSetting("discovery", value)} />
+          </span>
         </h2>
         {!settings.discovery ? (
           <p className="muted">{t("devices.discoveryOff")}</p>
@@ -199,32 +183,37 @@ export function DevicesPage() {
       </section>
 
       <section className="panel">
-        <h2>{t("devices.manual")}<Revise /></h2>
-        <p className="setting-help">{t("devices.manualHelp")}</p>
-        <form
-          className="manual-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (validHost && validPort) run("manual", { host: host.trim(), port: portNumber });
-          }}
-        >
-          <input className={`input${host && !validHost ? " invalid" : ""}`} value={host} placeholder="192.168.1.20" aria-label={t("devices.address")} onChange={(event) => setHost(event.target.value)} />
-          <input className={`input port${port && !validPort ? " invalid" : ""}`} value={port} placeholder="22000" inputMode="numeric" aria-label={t("devices.portLabel")} onChange={(event) => setPort(event.target.value.replace(/\D/g, ""))} />
-          <button type="submit" className="btn primary" disabled={!validHost || !validPort || boot.manual === "dialing"}>
-            {boot.manual === "dialing" ? t("devices.connecting") : t("devices.connect")}
-          </button>
-          {boot.manual && boot.manual !== "badText" && <span className={`state-text ${boot.manual}`}>{t(`manual.${boot.manual}`)}</span>}
-        </form>
-        {(settings.manualAddresses ?? []).length > 0 && (
-          <div className="chip-row">
-            <span className="muted small">{t("devices.recent")}</span>
-            {(settings.manualAddresses ?? []).map((item) => (
-              <button type="button" key={item} className="chip mono" onClick={() => connect(item)}>
-                {item}
-              </button>
-            ))}
+        <h2>{t("relay.server")}</h2>
+        {settings.incognito && (
+          <div className="banner warn">
+            <Icons.incognito /> <span>{t("settings.networkIncognito")}</span>
           </div>
         )}
+        <p className="setting-help">
+          {t("relay.help")} <span className={`state-pill ${relay.tone}`}>{relay.text}</span>
+        </p>
+        <Row title={t("relay.host")}>
+          <CommitInput label={t("relay.host")} width={240} value={String(settings.relayHost ?? "")} placeholder="relay.example.com" onCommit={(value) => set("relayHost", value.trim())} />
+        </Row>
+        <Row title={t("relay.port")}>
+          <CommitInput
+            label={t("relay.port")}
+            type="number"
+            width={110}
+            value={String(settings.relayPort ?? 22067)}
+            onCommit={(value) => {
+              const port = Number(value);
+              if (Number.isInteger(port) && port > 0 && port < 65536) set("relayPort", port);
+              else app.setNotice(t("relay.portInvalid"));
+            }}
+          />
+        </Row>
+        <Row title={t("relay.id")} help={t("relay.idHelp")}>
+          <CommitInput label={t("relay.id")} width={320} value={String(settings.relayDeviceId ?? "")} placeholder="XXXXXXX-XXXXXXX-…" onCommit={(value) => set("relayDeviceId", value.trim())} />
+        </Row>
+        <Row title={t("relay.token")}>
+          <CommitInput label={t("relay.token")} width={240} secret value={String(settings.relayToken ?? "")} onCommit={(value) => set("relayToken", value.trim())} />
+        </Row>
       </section>
 
       <section className="panel">

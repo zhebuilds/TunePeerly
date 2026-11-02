@@ -2,9 +2,12 @@
 import { listen } from "@tauri-apps/api/event";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type MemberRef, type OverwriteAsk, type Settings, type Track } from "../api";
+import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type ImportSummary, type MemberRef, type OverwriteAsk, type Settings, type SyncResult, type Track } from "../api";
 import i18n from "../i18n";
-import { albumParts, filterText, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
+import { isAndroid } from "../lib/platform";
+import { nativeAudio, type CatalogSong, type QueueEvent } from "../player/native";
+import { followedFuture, nativeQueueable } from "../player/nativePlan";
+import { albumParts, displayTitle, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
 import {
   addToQueue,
   continueLibrary,
@@ -25,18 +28,6 @@ import {
   type TrackRef,
 } from "../player/advance";
 import { PlaybackEngine, type EngineEvents } from "../player/engine";
-
-export type PlaybackMirror = {
-  deviceId: string;
-  contentId: string;
-  seconds: number;
-  playing: boolean;
-  duration: number;
-  title: string;
-  artist: string;
-  album: string;
-  at: number;
-};
 
 export type RouteName =
   | "home"
@@ -69,42 +60,6 @@ export type Toast = { id: number; text: string };
 
 const emptyQueue: QueueState = { order: "manual", repeat: "off", contextId: "library", past: [], current: null, future: [], positionSec: 0 };
 
-/** Playback position of a followed device, advanced from the last report. */
-export function mirrorPosition(mirror: PlaybackMirror, now = performance.now()): number {
-  const elapsed = mirror.playing ? Math.max(0, (now - mirror.at) / 1000) : 0;
-  const raw = Math.max(0, mirror.seconds + elapsed);
-  return mirror.duration > 0 ? Math.min(raw, mirror.duration) : raw;
-}
-
-function followedTrack(mirror: PlaybackMirror, tracks: Track[], favoriteIds: ReadonlySet<string>): Track {
-  const found = tracks.find((track) => track.contentId && track.contentId === mirror.contentId);
-  if (found) return found;
-  return {
-    contentId: mirror.contentId,
-    localFileId: null,
-    title: mirror.title,
-    artist: mirror.artist,
-    album: mirror.album,
-    trackNumber: null,
-    durationMs: mirror.duration > 0 ? Math.round(mirror.duration * 1000) : null,
-    folder: "",
-    fileName: "",
-    addedAt: "",
-    favorite: favoriteIds.has(mirror.contentId),
-    exposed: false,
-    badge: "remote",
-    accessStatus: "",
-    metadataStatus: "",
-    playbackStatus: "",
-    reasonKey: null,
-    video: false,
-    coverUrl: null,
-    absolutePath: null,
-    holderIds: [mirror.deviceId],
-    playable: false,
-    dimmed: false,
-  };
-}
 const PAST_LIMIT = 200;
 
 function asRef(value: unknown): TrackRef | null {
@@ -135,6 +90,12 @@ function normalizeQueue(raw: Record<string, unknown> | undefined): QueueState {
   };
 }
 
+/** Lists that cannot be rebuilt from their id, so their track keys are saved for the next launch:
+ * a search, the problem list, or another device's Recently Played. */
+function keptList(contextId: string): boolean {
+  return contextId === "search" || contextId === "problems" || contextId.startsWith("recent-device:");
+}
+
 function sameRoute(left: Route, right: Route): boolean {
   return left.name === right.name && (left.id ?? "") === (right.id ?? "");
 }
@@ -155,7 +116,7 @@ function useModel() {
     } catch {
       /* storage unavailable: use the default */
     }
-    return window.innerWidth > 1040;
+    return !isAndroid && window.innerWidth > 1040;
   });
   const [noticesOpen, setNoticesOpenState] = useState(false);
   const setQueueOpen = useCallback((open: boolean) => {
@@ -188,11 +149,12 @@ function useModel() {
   const [muted, setMuted] = useState(false);
   const [lyrics, setLyrics] = useState<{ key: string; text: string } | null>(null);
   const [failure, setFailure] = useState<{ key: string; reason: string } | null>(null);
-  const [mirror, setMirror] = useState<PlaybackMirror | null>(null);
   const [downloadFeed, setDownloadFeed] = useState<DownloadFeed | null>(null);
   const [search, setSearch] = useState("");
 
   const queueRef = useRef(queue);
+  const volumeRef = useRef(1);
+  const mutedRef = useRef(false);
   const bootRef = useRef(boot);
   bootRef.current = boot;
   const membersRef = useRef(members);
@@ -250,7 +212,7 @@ function useModel() {
       progress: (position) => handlers.current?.progress(position),
       activity: (playing, track, enough) => handlers.current?.activity(playing, track, enough),
       playable: (track) => handlers.current?.playable(track),
-    });
+    }, isAndroid && "__TAURI_INTERNALS__" in window ? nativeAudio() : null);
   }
   const engine = engineRef.current;
 
@@ -266,7 +228,8 @@ function useModel() {
       return;
     }
     const id = ++alertId.current;
-    setAlerts((items) => [...items, { id, text }]);
+    // The same notice again moves to the end instead of stacking up; only the latest few stay.
+    setAlerts((items) => [...items.filter((item) => item.text !== text), { id, text }].slice(-5));
   }, []);
   const dismissAlert = useCallback((id: number) => {
     setAlerts((items) => items.filter((item) => item.id !== id));
@@ -283,6 +246,11 @@ function useModel() {
     document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
     document.title = lang === "zh" ? "声渡" : "TunePeerly";
     if (i18n.language !== lang) void i18n.changeLanguage(lang);
+    try {
+      window.localStorage.setItem("language", lang);
+    } catch {
+      // Only used to pick the first language on the next start.
+    }
     if ("__TAURI_INTERNALS__" in window) {
       const title = document.title;
       void import("@tauri-apps/api/window")
@@ -317,9 +285,10 @@ function useModel() {
         const saved = Number(next.settings.volume);
         const level = Number.isFinite(saved) ? Math.min(1, Math.max(0, saved)) : 1;
         setVolumeState(level);
+        volumeRef.current = level;
         engine.setVolume(level, false);
         const index = new TrackIndex(next.tracks);
-        const keys = (state.contextId === "search" || state.contextId === "problems") && Array.isArray(next.player.contextKeys) ? next.player.contextKeys : null;
+        const keys = keptList(state.contextId) && Array.isArray(next.player.contextKeys) ? next.player.contextKeys : null;
         const rebuilt = keys ? keys.map((key) => index.get({ key: String(key) })).filter((track): track is Track => !!track) : null;
         context.current = { id: state.contextId, tracks: rebuilt && rebuilt.length > 0 ? rebuilt : null };
         engine.cue(index.get(state.current) ?? null, state.positionSec);
@@ -350,10 +319,20 @@ function useModel() {
       listen<OverwriteAsk[]>("overwrite-asks", (event) => {
         if (!disposed) setOverwriteAsks(Array.isArray(event.payload) ? event.payload.slice(0, 3) : []);
       }),
+      listen<SyncResult>("sync-result", (event) => {
+        if (disposed) return;
+        const row = event.payload;
+        const key = row.status === "rejected" ? (row.reason === "busy" || row.reason === "incognito" ? row.reason : "disabled") : row.status;
+        toast(t(`syncResult.${key}`, { name: row.name || row.deviceId.slice(0, 7), feature: t(`feature.${row.feature}`, { defaultValue: row.feature }) }));
+      }),
       listen<{ feature?: string; name?: string }>("sync-denied", (event) => {
         if (disposed) return;
         const feature = event.payload.feature ? t(`feature.${event.payload.feature}`, { defaultValue: event.payload.feature }) : "";
         toast(t("toast.syncDenied", { name: event.payload.name || t("sync.thatDevice"), feature }));
+      }),
+      listen<{ deviceId: string; name?: string }>("unpaired", (event) => {
+        if (disposed) return;
+        toast(t("toast.unpairedYou", { name: event.payload.name || event.payload.deviceId.slice(0, 7) }));
       }),
       listen<{ current: DownloadFeed["current"]; queue: DownloadFeed["queue"]; history: DownloadFeed["history"] | null }>("download-updated", (event) => {
         if (disposed) return;
@@ -363,14 +342,6 @@ function useModel() {
           queue: row.queue ?? [],
           history: row.history ?? prev?.history ?? [],
         }));
-      }),
-      listen<Omit<PlaybackMirror, "at">>("playback-mirror", (event) => {
-        if (disposed) return;
-        const selected = String(bootRef.current?.settings.positionSyncDevice ?? "");
-        const row = event.payload;
-        if (!selected || row.deviceId !== selected || bootRef.current?.settings.incognito) return;
-        setMirror({ ...row, at: performance.now() });
-        if (engine.playing) engine.pause();
       }),
     ]).catch(() => [] as (() => void)[]);
     return () => {
@@ -383,22 +354,12 @@ function useModel() {
     };
   }, [refresh, scheduleRefresh, t, toast, engine]);
 
-  useEffect(() => {
-    const selected = String(settings.positionSyncDevice ?? "");
-    if (!selected || settings.incognito) {
-      setMirror(null);
-      return;
-    }
-    if (engine.playing) engine.pause();
-  }, [settings.positionSyncDevice, settings.incognito, engine]);
-
   const commit = useCallback((state: QueueState, position: number = engine.position) => {
     const trimmed = state.past.length > PAST_LIMIT ? { ...state, past: state.past.slice(-PAST_LIMIT) } : state;
     queueRef.current = trimmed;
     setQueueState(trimmed);
-    // A search or problem list cannot be rebuilt from its id, so keep its track keys for the next launch.
     const saved: Record<string, unknown> = { ...trimmed, positionSec: position };
-    if ((trimmed.contextId === "search" || trimmed.contextId === "problems") && context.current.id === trimmed.contextId && context.current.tracks) {
+    if (keptList(trimmed.contextId) && context.current.id === trimmed.contextId && context.current.tracks) {
       saved.contextKeys = context.current.tracks.slice(0, 2000).map(trackKey);
     }
     void api.savePlayer(saved as unknown as QueueState).catch(() => {});
@@ -443,16 +404,20 @@ function useModel() {
         return visible.slice().sort((a, b) => b.addedAt.localeCompare(a.addedAt) || a.title.localeCompare(b.title));
       case "search":
       case "problems":
+      case "recent-device":
         return [];
       default:
         return visible;
     }
   }, []);
 
-  const rebuildPool = useCallback((state: QueueState): Track[] => {
-    if (state.order === "libraryRandom") return (bootRef.current?.tracks ?? []).filter(shufflable);
+  /** The list the queue starts over from. `forNative`: what the phone's player may hold (`nativeQueueable`). */
+  const rebuildPool = useCallback((state: QueueState, forNative = false): Track[] => {
+    if (state.order === "libraryRandom") {
+      return (bootRef.current?.tracks ?? []).filter((track) => shufflable(track) || (forNative && nativeQueueable(track) && track.playbackStatus !== "failed"));
+    }
     const list = context.current.id === state.contextId && context.current.tracks ? context.current.tracks : contextTracks(state.contextId);
-    return list.filter((track) => track.playable);
+    return list.filter(forNative ? nativeQueueable : (track) => track.playable);
   }, [contextTracks]);
 
   const loadLyrics = useCallback((track: Track | undefined) => {
@@ -476,37 +441,12 @@ function useModel() {
     );
   }, []);
 
-  const publishPlayback = useCallback((playing?: boolean, track = engine.current, seconds = engine.position) => {
-    if (!track?.contentId || bootRef.current?.settings.incognito) return;
-    // While this computer is following someone, its own queue must not be published as what it is playing.
-    if (String(bootRef.current?.settings.positionSyncDevice ?? "")) return;
-    void api.network("position", {
-      contentId: track.contentId,
-      seconds,
-      playing: playing ?? engine.playing,
-      duration: (track.durationMs ?? 0) / 1000,
-      title: track.title,
-      artist: track.artist,
-      album: track.album,
-    }).catch(() => {});
-  }, [engine]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => publishPlayback(), 1000);
-    return () => window.clearInterval(timer);
-  }, [publishPlayback]);
-
   const startCurrent = useCallback((state: QueueState) => {
     const track = indexRef.current.get(state.current);
     setFailure(null);
     if (!track) {
       engine.cue(null, 0);
       setLyrics(null);
-      return;
-    }
-    if (String(bootRef.current?.settings.positionSyncDevice ?? "") && !bootRef.current?.settings.incognito) {
-      engine.cue(track, state.positionSec);
-      loadLyrics(track);
       return;
     }
     void engine.start(track, state.positionSec, true);
@@ -583,7 +523,6 @@ function useModel() {
   }, [commit, engine, rebuildPool, startCurrent]);
 
   const toggle = useCallback(() => {
-    if (String(bootRef.current?.settings.positionSyncDevice ?? "") && !bootRef.current?.settings.incognito) return;
     const state = queueRef.current;
     if (!state.current) {
       if (state.future.length > 0) next();
@@ -606,28 +545,7 @@ function useModel() {
     startCurrent(target);
   }, [commit, startCurrent]);
 
-  const queueActions = useMemo(() => ({
-    playNext: (items: Track[]) => {
-      commit(playNext(queueRef.current, items.map(refOf)));
-      toast(items.length === 1 ? t("toast.playNext") : t("toast.playNextMany", { count: items.length }));
-    },
-    add: (items: Track[]) => {
-      commit(addToQueue(queueRef.current, items.map(refOf)));
-      toast(items.length === 1 ? t("toast.queued") : t("toast.queuedMany", { count: items.length }));
-    },
-    insert: (at: number, items: Track[]) => {
-      const state = queueRef.current;
-      const position = Math.max(0, Math.min(at, state.future.length));
-      commit({ ...state, future: [...state.future.slice(0, position), ...items.map(refOf), ...state.future.slice(position)] });
-      toast(items.length === 1 ? t("toast.queued") : t("toast.queuedMany", { count: items.length }));
-    },
-    remove: (at: number) => commit(removeAt(queueRef.current, at)),
-    move: (from: number, to: number) => commit(moveInQueue(queueRef.current, from, to)),
-    clear: () => commit({ ...queueRef.current, future: [] }),
-    jump,
-  }), [commit, jump, t, toast]);
-
-  const toggleShuffleMode = useCallback(() => {
+  const shuffle = useCallback(() => {
     const state = queueRef.current;
     const pool = context.current.id === state.contextId && context.current.tracks ? context.current.tracks : contextTracks(state.contextId);
     const next = toggleShuffle(state, pool.filter((track) => track.playable).map(refOf), Math.random);
@@ -637,25 +555,22 @@ function useModel() {
     }
   }, [commit, contextTracks, engine, startCurrent]);
 
-  const cycleRepeatMode = useCallback(() => {
-    commit({ ...queueRef.current, repeat: cycleRepeat(queueRef.current.repeat) });
-  }, [commit]);
-
   const setVolume = useCallback((value: number) => {
     const level = Math.min(1, Math.max(0, value));
     setVolumeState(level);
     setMuted(false);
+    volumeRef.current = level;
+    mutedRef.current = false;
     engine.setVolume(level, false);
     window.clearTimeout(volumeTimer.current);
     volumeTimer.current = window.setTimeout(() => void api.updateSetting("volume", level).catch(() => {}), 400);
   }, [engine]);
 
-  const toggleMute = useCallback(() => {
-    setMuted((value) => {
-      engine.setVolume(volume, !value);
-      return !value;
-    });
-  }, [engine, volume]);
+  const mute = useCallback((value: boolean) => {
+    setMuted(value);
+    mutedRef.current = value;
+    engine.setVolume(volumeRef.current, value);
+  }, [engine]);
 
   const patchBoot = useCallback((patch: (value: Bootstrap) => Bootstrap) => {
     setBoot((value) => (value ? patch(value) : value));
@@ -670,25 +585,33 @@ function useModel() {
     } else {
       patchBoot((item) => ({ ...item, settings: { ...item.settings, [key]: value } }));
     }
-    if (key === "incognito" && value === true && engine.remoteDevice) {
-      engine.halt();
-      setNotice(t("notice.incognitoStopped"));
+    if (key === "incognito" && value === true) {
+      if (engine.remoteDevice) {
+        engine.halt();
+        setNotice(t("notice.incognitoStopped"));
+      }
     }
     try {
       await api.updateSetting(key, value);
       if (key === "incognito") void api.network("close-route").catch(() => {});
       if (key === "showUnavailable" || key === "historyCap" || key === "incognito") scheduleRefresh();
     } catch (error) {
-      setBoot(before);
-      applyLook(before.theme, before.language);
+      // Undo only this setting, so a refresh that landed in the meantime is kept.
+      if (key === "theme" || key === "language") {
+        patchBoot((item) => ({ ...item, [key]: before[key] }));
+        const now = bootRef.current ?? before;
+        applyLook(key === "theme" ? before.theme : now.theme, key === "language" ? before.language : now.language);
+      } else {
+        patchBoot((item) => ({ ...item, settings: { ...item.settings, [key]: before.settings[key as keyof typeof before.settings] } }));
+      }
       say(error);
     }
   }, [applyLook, engine, patchBoot, say, scheduleRefresh, setNotice, t]);
 
-  const importPaths = useCallback(async (paths: string[], kind: "directory" | "file" | "auto") => {
-    if (paths.length === 0) return;
+  const imported = useCallback(async (run: () => Promise<ImportSummary[]>, quietWhenNone = false) => {
     try {
-      const summaries = await api.importPaths(paths, kind);
+      const summaries = await run();
+      if (quietWhenNone && summaries.length === 0) return;
       const added = summaries.reduce((sum, item) => sum + item.added, 0);
       toast(added > 0 ? t("toast.imported", { count: added }) : t("toast.importedNone"));
       reloadLyrics();
@@ -697,6 +620,11 @@ function useModel() {
       say(error);
     }
   }, [refresh, reloadLyrics, say, t, toast]);
+
+  const importPaths = useCallback(async (paths: string[], kind: "directory" | "file" | "auto") => {
+    if (paths.length === 0) return;
+    await imported(() => api.importPaths(paths, kind));
+  }, [imported]);
 
   /** Scans every added folder and file again. Tags and lyrics files that changed are read again. */
   const rescan = useCallback(async () => {
@@ -716,13 +644,18 @@ function useModel() {
   }, [refresh, reloadLyrics, say, t, toast]);
 
   const addMusic = useCallback(async (kind: "directory" | "file") => {
+    if (isAndroid) {
+      // Cancelling the picker copies nothing and says nothing.
+      await imported(() => api.androidImport(kind === "directory"), true);
+      return;
+    }
     try {
       const paths = kind === "directory" ? [await pickFolder()].filter((item): item is string => Boolean(item)) : await pickFiles();
       await importPaths(paths, kind);
     } catch (error) {
       say(error);
     }
-  }, [importPaths, say]);
+  }, [imported, importPaths, say]);
 
   const like = useCallback(async (track: Track) => {
     const key = trackKey(track);
@@ -904,20 +837,65 @@ function useModel() {
 
   const movePlaylistMember = useCallback(async (playlistId: string, from: number, to: number) => {
     const list = (membersRef.current[playlistId] ?? []).slice();
-    const [item] = list.splice(from, 1);
+    // The page lists only members whose song is known, so `from` and `to` count those rows.
+    // Map them onto the full member list, which is what the database numbers.
+    const shown: number[] = [];
+    list.forEach((ref, at) => {
+      if (indexRef.current.get(ref)) shown.push(at);
+    });
+    const fromMember = shown[from];
+    const toMember = shown[to];
+    if (fromMember === undefined || toMember === undefined || fromMember === toMember) return;
+    const [item] = list.splice(fromMember, 1);
     if (!item) return;
-    list.splice(to, 0, item);
+    list.splice(toMember, 0, item);
     const nextMembers = { ...membersRef.current, [playlistId]: list };
     membersRef.current = nextMembers;
     setMembers(nextMembers);
     try {
-      await api.movePlaylistMember(playlistId, from, to);
+      await api.movePlaylistMember(playlistId, fromMember, toMember);
       applyPlayingOrder(`playlist:${playlistId}`, indexRef.current.members(list));
     } catch (error) {
       say(error);
     }
     scheduleRefresh();
   }, [applyPlayingOrder, say, scheduleRefresh]);
+
+
+  const toggleMute = useCallback(() => mute(!mutedRef.current), [mute]);
+  const play = useCallback(() => {
+    if (!engine.playing) toggle();
+  }, [engine, toggle]);
+  const pause = useCallback(() => engine.pause(), [engine]);
+  const seek = useCallback((sec: number) => engine.seek(sec), [engine]);
+  const skip = useCallback((delta: number) => engine.skip(delta), [engine]);
+  const cycleRepeatMode = useCallback(() => {
+    commit({ ...queueRef.current, repeat: cycleRepeat(queueRef.current.repeat) });
+  }, [commit]);
+
+  const queueActions = useMemo(() => {
+    const queuedToast = (items: Track[]) => toast(items.length === 1 ? t("toast.queued") : t("toast.queuedMany", { count: items.length }));
+    return {
+      playNext: (items: Track[]) => {
+        commit(playNext(queueRef.current, items.map(refOf)));
+        toast(items.length === 1 ? t("toast.playNext") : t("toast.playNextMany", { count: items.length }));
+      },
+      add: (items: Track[]) => {
+        commit(addToQueue(queueRef.current, items.map(refOf)));
+        queuedToast(items);
+      },
+      insert: (at: number, items: Track[]) => {
+        const state = queueRef.current;
+        const position = Math.max(0, Math.min(at, state.future.length));
+        commit({ ...state, future: [...state.future.slice(0, position), ...items.map(refOf), ...state.future.slice(position)] });
+        queuedToast(items);
+      },
+      remove: (at: number) => commit(removeAt(queueRef.current, at)),
+      move: (from: number, to: number) => commit(moveInQueue(queueRef.current, from, to)),
+      clear: () => commit({ ...queueRef.current, future: [] }),
+      jump,
+    };
+  }, [commit, jump, t, toast]);
 
   handlers.current = {
     ended: () => {
@@ -963,22 +941,11 @@ function useModel() {
       patchBoot((item) => ({ ...item, history: [key, ...item.history.filter((value) => value !== key)] }));
       void api.recordHistory(track.contentId, track.localFileId).catch(() => {});
     },
-    paused: (track, position) => {
-      void api.saveProgress(position).catch(() => {});
-      publishPlayback(false, track, position);
-    },
-    seeked: (track, position, paused) => {
-      void api.saveProgress(position).catch(() => {});
-      publishPlayback(!paused, track, position);
-    },
+    paused: (_track, position) => void api.saveProgress(position).catch(() => {}),
+    seeked: (_track, position) => void api.saveProgress(position).catch(() => {}),
     progress: (position) => void api.saveProgress(position).catch(() => {}),
     activity: (playing, track, bufferEnough) => {
-      if (playing && String(bootRef.current?.settings.positionSyncDevice ?? "") && !bootRef.current?.settings.incognito) {
-        engine.pause();
-        return;
-      }
       void api.network("activity", { playing, localFileId: track?.localFileId ?? null, bufferEnough }).catch(() => {});
-      if (track?.contentId) publishPlayback(playing, track, engine.position);
     },
     playable: (track) => {
       if (track.playbackStatus !== "playable") void api.playbackResult(track.localFileId, track.contentId, "playable", null).catch(() => {});
@@ -986,34 +953,138 @@ function useModel() {
   };
 
   useEffect(() => {
-    const flush = () => {
-      void api.saveProgress(engine.position).catch(() => {});
-      publishPlayback(false);
-    };
+    const flush = () => void api.saveProgress(engine.position).catch(() => {});
     window.addEventListener("beforeunload", flush);
     return () => window.removeEventListener("beforeunload", flush);
-  }, [engine, publishPlayback]);
+  }, [engine]);
 
-  const followId = String(settings.positionSyncDevice ?? "");
-  const following = Boolean(followId && mirror?.deviceId === followId && !settings.incognito);
-  const favoriteIds = useMemo(() => new Set(boot?.favoriteIds ?? []), [boot?.favoriteIds]);
-  const shown = useMemo(
-    () => (following && mirror ? followedTrack(mirror, tracks, favoriteIds) : current ?? null),
-    [following, mirror, tracks, current, favoriteIds],
-  );
+  // Android: the phone's player holds every playable song and the whole queue with its rules, so it
+  // goes on by itself with the screen off (NativeAudio.kt). The page follows what it did when it runs.
+  const native = engine.nativePlayer;
+  const [streamBase, setStreamBase] = useState("");
+  useEffect(() => {
+    if (!native || !boot) return;
+    const timer = window.setTimeout(() => {
+      const songs: CatalogSong[] = [];
+      for (const track of boot.tracks) {
+        // A linked device's songs stay in even while it is offline, so the phone's player keeps them
+        // queued and waits for the link instead of dropping them.
+        if (!nativeQueueable(track)) continue;
+        const local = track.absolutePath && track.accessStatus === "available" && track.badge !== "remote";
+        const cover = track.coverUrl && !/^(data:|blob:|https?:)/.test(track.coverUrl) ? track.coverUrl : null;
+        songs.push({
+          k: trackKey(track),
+          u: local && track.absolutePath ? api.fileUrl(track.absolutePath) : null,
+          c: track.contentId,
+          t: displayTitle(track, t("library.untitled")),
+          a: track.artist ?? "",
+          l: track.album ?? "",
+          p: cover,
+          f: Boolean(track.favorite),
+          d: (track.durationMs ?? 0) / 1000,
+        });
+      }
+      native.setCatalog(streamBase, songs);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [native, boot, streamBase, t]);
 
+  useEffect(() => {
+    // Not before the saved queue is back, so an empty queue never replaces the one still playing.
+    if (!native || !boot) return;
+    const timer = window.setTimeout(() => {
+      const state = queueRef.current;
+      const key = (ref: TrackRef) => {
+        const track = indexRef.current.get(ref);
+        return track ? trackKey(track) : ref.key;
+      };
+      native.setPlan({
+        past: state.past.slice(-50).map(key),
+        current: state.current ? key(state.current) : null,
+        future: state.future.map(key),
+        repeat: state.repeat,
+        order: state.order,
+        contextId: state.contextId,
+        pool: rebuildPool(state, true).map(trackKey),
+        library: contextTracks("library").filter(nativeQueueable).map(trackKey),
+      });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [native, queue, boot, members, rebuildPool, contextTracks]);
+
+  const followNative = useRef<(event: QueueEvent) => void>(() => {});
+  followNative.current = (event: QueueEvent) => {
+    // Nothing loaded in the phone's player (the app just started): the page's own saved queue stays,
+    // and goes to the player again with the change count it reported.
+    if (event.id === 0 || !event.current) {
+      native?.resend();
+      return;
+    }
+    const ref = (key: string): TrackRef => {
+      const track = indexRef.current.get({ key });
+      return track ? refOf(track) : { key, contentId: null, localFileId: null };
+    };
+    const prior = queueRef.current;
+    const state: QueueState = {
+      ...prior,
+      order: event.order as QueueState["order"],
+      repeat: event.repeat as QueueState["repeat"],
+      contextId: event.contextId,
+      past: event.past.map(ref),
+      current: ref(event.current),
+      future: followedFuture(prior.future, event.future.map(ref), event.ended),
+      positionSec: 0,
+    };
+    if (state.contextId !== prior.contextId) {
+      context.current = state.contextId === "library"
+        ? { id: "library", tracks: contextTracks("library").filter((track) => track.playable) }
+        : { id: state.contextId, tracks: null };
+    }
+    const track = indexRef.current.get(state.current);
+    if (track && native && native.currentId !== event.id) {
+      setFailure(null);
+      engine.follow(track, event.id, event.playing);
+    }
+    commit(state, event.pos);
+  };
+
+  useEffect(() => {
+    if (!native) return;
+    native.onQueue = (event) => followNative.current(event);
+    native.onHeard = (key) => {
+      const track = indexRef.current.get({ key });
+      if (track) handlers.current?.heard(track);
+    };
+    let live = true;
+    void api.streamBase().then(
+      (base) => {
+        if (!live) return;
+        native.streamBase = base;
+        setStreamBase(base);
+      },
+      () => {},
+    );
+    return () => {
+      live = false;
+      native.onQueue = null;
+      native.onHeard = null;
+    };
+  }, [native]);
+
+  // Once the saved queue is back: the phone's player may have played on while the page was away
+  // (the window was closed by the system); show what it plays now.
+  const synced = useRef(false);
+  useEffect(() => {
+    if (!native || !boot || synced.current) return;
+    synced.current = true;
+    native.sync();
+  }, [native, boot]);
+
+  const shown = current ?? null;
+  const lookup = useCallback((ref: TrackRef | null | undefined): Track | undefined => (ref ? index.get(ref) : undefined), [index]);
   useEffect(() => {
     loadLyrics(shown ?? undefined);
   }, [shown, loadLyrics, lyricsEpoch]);
-
-  const findTracks = useCallback((text: string, scope: "all" | "queue" | string) => {
-    if (scope === "queue") {
-      const state = queueRef.current;
-      return filterText([state.current, ...state.future].map((item) => indexRef.current.get(item)).filter((item): item is Track => Boolean(item)), text);
-    }
-    if (scope.startsWith("playlist:")) return filterText(indexRef.current.members(membersRef.current[scope.slice(9)] ?? []), text);
-    return null;
-  }, []);
 
   return {
     boot,
@@ -1026,15 +1097,14 @@ function useModel() {
     index,
     members,
     queue,
-    current,
+    current: shown,
     shown,
-    following,
+    lookup,
     engine,
     volume,
     muted,
     lyrics,
     failure,
-    mirror,
     downloadFeed,
     route,
     navigation,
@@ -1067,10 +1137,14 @@ function useModel() {
     playAll,
     shuffleLibrary,
     toggle,
+    play,
+    pause,
+    seek,
+    skip,
     next,
     previous,
     queueActions,
-    toggleShuffle: toggleShuffleMode,
+    toggleShuffle: shuffle,
     cycleRepeat: cycleRepeatMode,
     setVolume,
     toggleMute,
@@ -1087,7 +1161,6 @@ function useModel() {
     movePlaylistMember,
     moveLibrary,
     contextTracks,
-    findTracks,
   };
 }
 

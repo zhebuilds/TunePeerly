@@ -13,7 +13,12 @@ if ($signature.Status -ne 'Valid') {
 }
 
 $subject = $signature.SignerCertificate.Subject
-if ($subject -notmatch 'O=Microsoft Corporation') {
+# Compare the whole O= field, so a name that only contains "Microsoft Corporation" does not pass.
+$organization = $null
+if ($subject -match '(?:^|,\s*)O=(?:"(?<quoted>[^"]*)"|(?<plain>[^,]*))') {
+    $organization = if ($null -ne $Matches['quoted']) { $Matches['quoted'] } else { "$($Matches['plain'])".Trim() }
+}
+if ($organization -cne 'Microsoft Corporation') {
     Write-Error $subject
     exit 3
 }

@@ -5,6 +5,7 @@ import { api } from "../api";
 import { useApp } from "../app/model";
 import { albumId } from "../lib/library";
 import { Icons } from "../ui/icons";
+import { isAndroid } from "../lib/platform";
 
 export function ContextMenu() {
   const { t } = useTranslation();
@@ -48,7 +49,6 @@ export function ContextMenu() {
     );
   }
 
-  const allLocal = tracks.every((track) => track.localFileId && track.accessStatus === "available");
   const allRemote = tracks.every((track) => !(track.localFileId && track.accessStatus === "available") && track.contentId);
   const playlists = app.boot?.playlists ?? [];
   const allLiked = tracks.every((track) => track.favorite);
@@ -103,7 +103,7 @@ export function ContextMenu() {
             <hr />
             {one.artist && <Item icon={<Icons.artist />} label={t("menu.goArtist")} onClick={run(() => app.navigate({ name: "artist", id: one.artist }))} />}
             {one.album && <Item icon={<Icons.album />} label={t("menu.goAlbum")} onClick={run(() => app.navigate({ name: "album", id: albumId(one.artist, one.album) }))} />}
-            {one.localFileId && one.accessStatus === "available" && (
+            {one.localFileId && one.accessStatus === "available" && !isAndroid && (
               <Item icon={<Icons.folder />} label={t("menu.showInFolder")} onClick={run(() => void api.showInFolder(one.localFileId!).catch(app.say))} />
             )}
           </>
@@ -118,23 +118,9 @@ export function ContextMenu() {
             })}
           />
         )}
-        {allLocal && (
-          <>
-            <hr />
-            {tracks.every((track) => track.exposed) ? (
-              <Item icon={<Icons.eyeOff />} label={t("menu.stopExposing")} onClick={run(() => void exposeTracks(tracks.map((track) => track.localFileId!), false).then(() => { app.toast(t("toast.hidden")); app.scheduleRefresh(); }).catch(app.say))} />
-            ) : (
-              <Item icon={<Icons.eye />} label={t("menu.expose")} onClick={run(() => void exposeTracks(tracks.map((track) => track.localFileId!), true).then(() => { app.toast(t("toast.exposed")); app.scheduleRefresh(); }).catch(app.say))} />
-            )}
-          </>
-        )}
       </div>
     </Layer>
   );
-}
-
-async function exposeTracks(ids: string[], expose: boolean) {
-  for (const id of ids) await api.setTrackExposure(id, expose);
 }
 
 function Layer({ children, onClose }: { children: ReactNode; onClose: () => void }) {

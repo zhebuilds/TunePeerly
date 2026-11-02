@@ -8,7 +8,7 @@ Wait until the discussion reaches a conclusion and the issue is confirmed. Start
 
 Report a security problem in private, as described in [SECURITY.md](SECURITY.md). Do not open a public issue for it.
 
-## Fork, and keep main the same as this project
+## Fork, and keep dev the same as this project
 
 Fork [zhebuilds/TunePeerly](https://github.com/zhebuilds/TunePeerly), then clone your fork and point `upstream` at this project:
 
@@ -17,25 +17,25 @@ git clone https://github.com/<your-account>/TunePeerly.git
 cd TunePeerly
 git remote add upstream https://github.com/zhebuilds/TunePeerly.git
 git fetch upstream
-git checkout main
-git merge upstream/main
-git push origin main
+git checkout dev
+git merge upstream/dev
+git push origin dev
 ```
 
-`origin` is your fork. `upstream` is this project. Your `main` stays a copy of this project's `main`. Do not commit on `main`.
+`origin` is your fork. `upstream` is this project. Your `dev` stays a copy of this project's `dev`. Do not commit on `dev`.
 
-When this project's `main` moves, update yours before you branch:
+When this project's `dev` moves, update yours before you branch:
 
 ```sh
-git checkout main
+git checkout dev
 git fetch upstream
-git merge upstream/main
-git push origin main
+git merge upstream/dev
+git push origin dev
 ```
 
 ## Branch
 
-Create the branch from that updated `main`. Use one branch for one confirmed issue.
+Create the branch from that updated `dev`. Use one branch for one confirmed issue.
 
 ```sh
 git checkout -b fix/short-name
@@ -62,19 +62,19 @@ Commit on the feature branch and push it to your fork:
 git push -u origin fix/short-name
 ```
 
-If this project's `main` has moved, bring those commits into your branch and push the branch again:
+If this project's `dev` has moved, bring those commits into your branch and push the branch again:
 
 ```sh
 git fetch upstream
-git rebase upstream/main
+git rebase upstream/dev
 git push --force-with-lease origin fix/short-name
 ```
 
 `--force-with-lease` is only for that branch on your fork.
 
-Open the pull request against `zhebuilds/TunePeerly`, with `main` as the base. Link the confirmed issue, say what changed, and say how you checked it.
+Open the pull request against `zhebuilds/TunePeerly`, with `dev` as the base. Link the confirmed issue, say what changed, and say how you checked it.
 
-After the pull request is merged, update your `main` from `upstream` again.
+After the pull request is merged, update your `dev` from `upstream` again.
 
 Contributions are under the [GNU AGPLv3](https://www.gnu.org/licenses/agpl-3.0.html) and [ADDITIONAL_TERMS.md](ADDITIONAL_TERMS.md).
 
@@ -97,25 +97,25 @@ git clone https://github.com/<你的账号>/TunePeerly.git
 cd TunePeerly
 git remote add upstream https://github.com/zhebuilds/TunePeerly.git
 git fetch upstream
-git checkout main
-git merge upstream/main
-git push origin main
+git checkout dev
+git merge upstream/dev
+git push origin dev
 ```
 
-`origin` 是你的 fork。`upstream` 是本项目。你的 `main` 保持为本项目 `main` 的一份副本。不要在 `main` 上提交。
+`origin` 是你的 fork。`upstream` 是本项目。你的 `dev` 保持为本项目 `dev` 的一份副本。不要在 `dev` 上提交。
 
-本项目的 `main` 有新提交时，开分支之前先更新你的 `main`：
+本项目的 `dev` 有新提交时，开分支之前先更新你的 `dev`：
 
 ```sh
-git checkout main
+git checkout dev
 git fetch upstream
-git merge upstream/main
-git push origin main
+git merge upstream/dev
+git push origin dev
 ```
 
 ## 分支
 
-从更新后的 `main` 建分支。一个已确认的 issue 对应一个分支。
+从更新后的 `dev` 建分支。一个已确认的 issue 对应一个分支。
 
 ```sh
 git checkout -b fix/short-name
@@ -142,18 +142,18 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 git push -u origin fix/short-name
 ```
 
-如果本项目的 `main` 又有新提交，先合进你的分支，再推一次这个分支：
+如果本项目的 `dev` 又有新提交，先合进你的分支，再推一次这个分支：
 
 ```sh
 git fetch upstream
-git rebase upstream/main
+git rebase upstream/dev
 git push --force-with-lease origin fix/short-name
 ```
 
 `--force-with-lease` 只用于你 fork 上的这个分支。
 
-向 `zhebuilds/TunePeerly` 开 pull request，目标分支是 `main`。写上已确认的 issue、改了什么，以及你如何检查的。
+向 `zhebuilds/TunePeerly` 开 pull request，目标分支是 `dev`。写上已确认的 issue、改了什么，以及你如何检查的。
 
-Pull request 合并之后，再次用 `upstream` 更新你的 `main`。
+Pull request 合并之后，再次用 `upstream` 更新你的 `dev`。
 
 贡献适用 [GNU AGPLv3](https://www.gnu.org/licenses/agpl-3.0.html) 和 [ADDITIONAL_TERMS.md](ADDITIONAL_TERMS.md)。

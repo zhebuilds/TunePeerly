@@ -21,6 +21,7 @@ import { albumId, displayTitle, folderName, trackKey, type Sort, type SortKey } 
 import { clock, transport } from "../player/clock";
 import { Icons } from "../ui/icons";
 import { Cover } from "./Cover";
+import { isAndroid } from "../lib/platform";
 
 const ROW = 56;
 
@@ -231,8 +232,13 @@ const TrackRow = memo(function TrackRow({ track, index, top, number, gridClass, 
       tabIndex={0}
       data-drop={dropId}
       title={reason || undefined}
-      onPointerDown={(event) => onDrag(event, index)}
+      onPointerDown={isAndroid ? undefined : (event) => onDrag(event, index)}
       onClick={(event) => {
+        // A tap plays on a phone; there is no double-click there.
+        if (isAndroid) {
+          if (!(event.target as HTMLElement).closest("button, input, a, select, textarea")) onPlay(index);
+          return;
+        }
         if (!clickWasDrag()) onSelect(index, event);
       }}
       onDoubleClick={(event) => {
@@ -279,12 +285,6 @@ const TrackRow = memo(function TrackRow({ track, index, top, number, gridClass, 
       {cols.source && (
         <div className="cell c-source">
           <span className={`badge ${track.badge}`}>{t(`badge.${track.badge}`)}</span>
-          {track.localFileId && (
-            <span className={`badge expose${track.exposed ? " on" : ""}`} title={track.exposed ? t("list.exposedHelp") : t("list.hiddenHelp")}>
-              {track.exposed ? <Icons.eye /> : <Icons.eyeOff />}
-              {track.exposed ? t("list.exposed") : t("list.hidden")}
-            </span>
-          )}
         </div>
       )}
       {cols.album && (

@@ -9,23 +9,32 @@
   <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-TunePeerly plays the music already on this computer and shares it with paired devices. There is no account. Paired devices on the same local network find each other directly. A relay you run yourself can be used for connections outside that network.
+TunePeerly plays the music already on this computer and shares it with paired devices. There is no account. Paired devices on the same local network find each other directly. A relay you run yourself can be used for connections outside that network. Pairing happens only on the local network; the relay only carries data between devices that are already paired, and never pairs.
 
 > **Note:** The current release is an alpha test. The program is not guaranteed to match the [user guide](docs/guide.md).
 
 ## Features
 
-- Play local files, stream an exposed song from a paired device, or download the original file.
-- Find devices on the LAN, or connect by IPv4 address and port. Both sides confirm. Sync data is end-to-end encrypted with libsignal. Before pairing, **Discover nearby devices** in Settings → Network must be on, or devices cannot be found.
-- Recently played merges by the latest UTC time. A song is recorded after about 10 seconds, or half its length. It can be merged again when this computer comes online.
-- Sync liked songs and appearance, and follow playback from one online device.
-- Incognito pauses discovery, sync, and history recording. You can also block a device, or stop manual sync and following per item.
+- Play local files, stream any song from a paired device, or download the original file.
+- Find devices on the LAN. To pair, one device shows a 6-digit code and you type it on the other. Before pairing, **Discover nearby devices** on the Devices page (Nearby) must be turned on, on both devices, or they cannot be found.
+- Recently played records a song after 10 seconds, or after half of it when the song is shorter than 20 seconds. It stays on each device. You can view a connected device's list without saving or merging it.
+- Send or override liked songs and appearance by hand. Nothing syncs on its own.
+- Incognito cuts every device connection and the relay, stops discovery and sync, and stops recording history. You can also block a device.
 - Light and dark themes, English and Chinese, scrolling lyrics, a tray icon, a mini player, and playback buttons on the Windows taskbar thumbnail.
-- Some settings are marked **To be revised**, **Do not use**, or **Not completed yet, not tested**. The mark does not describe the problem. The [user guide](docs/guide.md) lists which setting has which mark. Follow playback and the relay are marked do not use. The relay is also marked not completed yet and not tested.
+- An Android app plays the same library with the screen locked, with controls in the notification, on the lock screen, and in a home screen widget. See [Android](docs/android.md).
+
+## Security and privacy
+
+- Devices talk only over TLS 1.3, and both sides prove who they are. Each device has its own key pair, and its device ID is the SHA-256 hash of its public key. After pairing, each device keeps the other's public key and accepts no other key for that device.
+- The encryption runs end to end between your devices. A relay only passes the data along and cannot read it. It does see each device's relay ID, public IP, when it is online, and who connects to whom and how much data. See [SECURITY.md](SECURITY.md).
+- A relay connection is accepted only from a paired device. When using a relay, set both devices to **Full trust** for each other.
+- The library database is encrypted with SQLCipher. Its random key is kept in `db.key` next to the database. On Windows that file is sealed with DPAPI, so it opens only under your Windows account. On Android it is wrapped by a key that stays in the Android Keystore. On any other system (development builds only) the file can be read only by its owner (mode 0600).
+- Pairing uses a 6-digit code shown on one computer and typed on the other. The code is checked with SPAKE2, so it never crosses the network and a device in the middle cannot pair in your place. A code works once, for 90 seconds. After 3 wrong codes, pairing pauses for 1 minute for every device.
+- Removing a device unpairs both sides. This computer deletes the device's key and tells the device, which removes this computer from its own list. A device that is offline is told the next time the two connect. Your other devices are not changed. To use the two together again, pair them again with a new code from either side.
 
 ## Guide
 
-[User guide](docs/guide.md)
+[User guide](docs/guide.md) · [Deploy a relay](docs/relay.md)
 
 ## Install
 
@@ -33,15 +42,21 @@ GitHub releases are packed with [Inno Setup](installer/TunePeerly.iss). The inst
 
 The database and the cache do not follow that choice, and they cannot be changed on their own. The database is always `%APPDATA%\TunePeerly`. Covers and the window cache are always in `%LOCALAPPDATA%\TunePeerly`.
 
-The downloaded installer is `TunePeerly-0.6.0-alpha.1-x64-Setup.exe`. In that file's folder, open PowerShell, compute its SHA256, and compare it with the SHA256 shown for this file on the release page. Install it when the two strings match.
+The downloaded installer is `TunePeerly-0.8.0-alpha.1-x64-Setup.exe`. In that file's folder, open PowerShell, compute its SHA256, and compare it with the SHA256 shown for this file on the release page. Install it when the two strings match.
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\TunePeerly-0.6.0-alpha.1-x64-Setup.exe
+Get-FileHash -Algorithm SHA256 .\TunePeerly-0.8.0-alpha.1-x64-Setup.exe
 ```
 
 ## Develop
 
-You need Node.js, npm, a Rust toolchain, and the Microsoft Edge WebView2 Runtime on Windows.
+You need Node.js, npm, a Rust toolchain, Perl, and the Microsoft Edge WebView2 Runtime on Windows.
+
+The library database is encrypted with SQLCipher. The build compiles its own copy of OpenSSL for it, which needs Perl and takes a few minutes the first time.
+- Windows: install [Strawberry Perl](https://strawberryperl.com/) and make sure `perl` in your terminal is Strawberry Perl, not the Perl that comes with Git for Windows. `nmake` comes with the Visual Studio C++ build tools that Rust already needs. [NASM](https://www.nasm.us/) is optional: with `nasm` on PATH OpenSSL is built with its faster assembly code, without it OpenSSL is built without assembly.
+- Linux and macOS: `perl` and `make` are usually already installed.
+
+This is for the desktop app. To build the Android app, see [Android: Build from source](docs/android.md#build-from-source). On Windows, Android builds run in WSL2.
 
 ```powershell
 npm install
@@ -67,7 +82,7 @@ npm run tauri build -- --no-bundle
 & "${env:ProgramFiles}\Inno Setup 7\ISCC.exe" installer\TunePeerly.iss
 ```
 
-`npm run tauri build -- --no-bundle` builds the executable only. It does not create an installer. The setup program is written to `installer\Output\TunePeerly-0.6.0-alpha.1-x64-Setup.exe`. `installer\Output` is gitignored. You can also open `installer\TunePeerly.iss` in Inno Setup and compile it.
+`npm run tauri build -- --no-bundle` builds the executable only. It does not create an installer. The setup program is written to `installer\Output\TunePeerly-0.8.0-alpha.1-x64-Setup.exe`. `installer\Output` is gitignored. You can also open `installer\TunePeerly.iss` in Inno Setup and compile it.
 
 A compile that stops at `EndUpdateResource failed (110)` means the new setup program was locked while its icons were being written. Windows Defender real-time scanning locks that unsigned exe, and Windows Security does not show a prompt. Wait a few seconds and run the `ISCC.exe` command above again. Do not compile again immediately after the failure. If it is still 110, add the repository's `installer\Output` folder to the Windows Security exclusions and compile again: Virus & threat protection → Manage settings → Exclusions → Add an exclusion → Folder.
 

@@ -37,12 +37,9 @@ const VISIBLE_BANNERS = 3;
 export function Banners() {
   const { t } = useTranslation();
   const app = useApp();
-  const pending = app.boot?.pending ?? [];
   const asks = app.overwriteAsks;
-  const sourceName = (id: string | null) => (id ? app.boot?.links.find((link) => link.deviceId === id)?.name ?? id.slice(0, 7) : "");
   const rows = [
     ...asks.map((ask) => ({ key: `ask-${ask.id}`, kind: "ask" as const, ask })),
-    ...pending.map((item) => ({ key: `conflict-${item.feature}`, kind: "conflict" as const, item })),
     ...app.alerts.map((item) => ({ key: `alert-${item.id}`, kind: "alert" as const, item })),
   ].slice(0, VISIBLE_BANNERS);
   if (rows.length === 0) return null;
@@ -52,32 +49,15 @@ export function Banners() {
         if (row.kind === "ask") {
           const ask = row.ask;
           return (
-            <div key={row.key} className="banner conflict" role="alert">
+            <div key={row.key} className="banner ask" role="alert">
               <Icons.sync />
               <span>{t("overwrite.body", { feature: t(`feature.${ask.feature}`), device: ask.name || ask.deviceId.slice(0, 7), seconds: ask.remaining })}</span>
               <div className="button-row">
                 <button type="button" className="btn ghost small" onClick={() => void api.network("resolve-overwrite", { id: ask.id, accept: false }).then(app.scheduleRefresh).catch(app.say)}>
-                  {t("overwrite.keep")}
+                  {t("overwrite.decline")}
                 </button>
                 <button type="button" className="btn primary small" onClick={() => void api.network("resolve-overwrite", { id: ask.id, accept: true }).then(app.scheduleRefresh).catch(app.say)}>
-                  {t("overwrite.take")}
-                </button>
-              </div>
-            </div>
-          );
-        }
-        if (row.kind === "conflict") {
-          const item = row.item;
-          return (
-            <div key={row.key} className="banner conflict" role="alert">
-              <Icons.sync />
-              <span>{t("conflict.body", { feature: t(`feature.${item.feature}`), device: sourceName(item.source) })}</span>
-              <div className="button-row">
-                <button type="button" className="btn ghost small" onClick={() => void api.network("resolve", { feature: item.feature, take: false }).then(app.scheduleRefresh).catch(app.say)}>
-                  {t("conflict.keep")}
-                </button>
-                <button type="button" className="btn primary small" onClick={() => void api.network("resolve", { feature: item.feature, take: true }).then(app.scheduleRefresh).catch(app.say)}>
-                  {t("conflict.take")}
+                  {t("overwrite.accept")}
                 </button>
               </div>
             </div>
@@ -160,6 +140,8 @@ function DialogHost() {
     try {
       if (dialog.kind === "prompt") await dialog.run(value.trim());
       else await dialog.run();
+    } catch (error) {
+      app.say(error);
     } finally {
       setBusy(false);
       close();
@@ -195,43 +177,120 @@ function DialogHost() {
   );
 }
 
+const FINISHED = ["expired", "locked", "busy", "cancelled", "failed"];
+
 function OfferDialog() {
   const { t } = useTranslation();
   const app = useApp();
   const offer = app.boot?.offer;
   const answering = useRef(false);
-  const [trust, setTrust] = useState("full");
+  const [trust, setTrust] = useState(() => (offer?.trust === "verify" ? "verify" : "full"));
+  const [typed, setTyped] = useState("");
+  const [now, setNow] = useState(() => Date.now());
+  const deviceId = offer?.deviceId;
+  const savedTrust = offer?.trust === "verify" ? "verify" : "full";
+  const status = offer?.status ?? "";
+  const expiresAt = offer?.expiresAt ?? null;
+  useEffect(() => {
+    // A saved device starts from the trust chosen for it before; a new one from full trust.
+    setTrust(savedTrust);
+    setTyped("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deviceId]);
+  useEffect(() => {
+    // A wrong code is used up: clear the box for the new one.
+    if (status === "wrong") setTyped("");
+  }, [status]);
+  useEffect(() => {
+    if (!expiresAt) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [expiresAt]);
   if (!offer) return null;
-  const incoming = offer.role !== "outgoing";
+  const role = offer.role ?? "incoming";
   const name = offer.name || offer.deviceId.slice(0, 7);
-  const groups = offer.safetyNumber.replace(/\s+/g, "").match(/.{1,5}/g) ?? [offer.safetyNumber];
-  const answer = (action: "confirm" | "reject") => {
+  const finished = FINISHED.includes(status);
+  const checking = status === "checking";
+  const digits = typed.replace(/\D/g, "").slice(0, 6);
+  const send = (action: string, payload: unknown) => {
     if (answering.current) return;
     answering.current = true;
-    const payload = action === "confirm" ? { deviceId: offer.deviceId, trust } : offer.deviceId;
     void api.network(action, payload).then(app.scheduleRefresh).catch(app.say).finally(() => {
       answering.current = false;
     });
   };
+  const close = () => send("reject", offer.deviceId);
+  const chooseTrust = (value: string) => {
+    setTrust(value);
+    // Kept with the pairing until the device is saved.
+    if (role === "incoming") void api.network("trust", { deviceId: offer.deviceId, trust: value }).catch(app.say);
+  };
+  const submit = () => {
+    if (role === "approve") send("confirm", { deviceId: offer.deviceId, trust });
+    else if (role === "outgoing" && digits.length === 6 && !checking) send("confirm", { deviceId: offer.deviceId, trust, code: digits });
+  };
+  const seconds = expiresAt ? Math.max(0, Math.ceil((expiresAt - now) / 1000)) : 0;
+  const shown = offer.code ? `${offer.code.slice(0, 3)} ${offer.code.slice(3)}` : "";
+  const title = role === "approve" ? t("offer.approveTitle") : role === "outgoing" ? t("offer.enterTitle", { name }) : t("offer.title");
+  const message = (() => {
+    if (role === "approve") return t("offer.approveBody", { name });
+    if (finished) return t(`offer.${role === "outgoing" ? "asking" : "asked"}.${status}`, { name });
+    if (role === "outgoing") {
+      if (checking) return t("offer.checking");
+      if (status === "wrong") return t("offer.asking.wrong", { name });
+      if (status === "badCode") return t("offer.badCode");
+      return t("offer.enterBody", { name });
+    }
+    if (checking) return t("offer.checking");
+    if (status === "wrong") return t("offer.asked.wrong", { name, count: offer.triesLeft ?? 0 });
+    return t("offer.showBody", { name });
+  })();
+  const problem = status === "wrong" || status === "badCode" || (finished && status !== "cancelled");
   return (
-    <Modal onClose={() => !incoming && answer("reject")} label={t("offer.title")}>
-      <div className="offer">
+    <Modal onClose={() => (role !== "incoming" || finished) && close()} label={title}>
+      <form
+        className="offer"
+        onSubmit={(event) => {
+          event.preventDefault();
+          submit();
+        }}
+      >
         <div className="offer-icon">
           <Icons.link />
         </div>
-        <h2 className="modal-title">{t("offer.title")}</h2>
-        <p className="modal-body">{incoming ? t("offer.body", { name }) : t("offer.waiting", { name })}</p>
-        <div className="safety-number mono">
-          {groups.map((group, at) => (
-            <span key={`${at}-${group}`}>{group}</span>
-          ))}
-        </div>
-        <p className="setting-help">{t("offer.help")}</p>
-        {incoming && (
+        <h2 className="modal-title">{title}</h2>
+        <p className={`modal-body${problem ? " offer-problem" : ""}`} role={problem ? "alert" : undefined}>
+          {message}
+        </p>
+        {role === "incoming" && shown && (
+          <>
+            <div className="pair-code mono" aria-label={t("offer.codeLabel")}>
+              {shown}
+            </div>
+            <p className="setting-help">{t("offer.codeTime", { count: seconds })}</p>
+          </>
+        )}
+        {role === "outgoing" && !finished && (
+          <label className="field pair-code-field">
+            <span>{t("offer.codeLabel")}</span>
+            <input
+              className="input pair-code-input mono"
+              value={typed}
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              maxLength={7}
+              placeholder="000000"
+              disabled={checking}
+              onChange={(event) => setTyped(event.target.value.replace(/[^\d ]/g, ""))}
+            />
+          </label>
+        )}
+        {!finished && (
           <Select
             label={t("devices.trust")}
             value={trust}
-            onChange={setTrust}
+            onChange={chooseTrust}
             options={[
               { value: "full", label: t("devices.trustFull"), hint: t("offer.trustHelp") },
               { value: "verify", label: t("devices.trustVerify"), hint: t("offer.trustHelp") },
@@ -239,16 +298,29 @@ function OfferDialog() {
           />
         )}
         <div className="modal-actions">
-          <button type="button" className="btn ghost" onClick={() => answer("reject")}>
-            {incoming ? t("offer.reject") : t("offer.cancel")}
-          </button>
-          {incoming && (
-            <button type="button" className="btn primary" onClick={() => answer("confirm")}>
-              {t("offer.confirm")}
+          {finished ? (
+            <button type="button" className="btn primary" onClick={close}>
+              {t("offer.close")}
             </button>
+          ) : (
+            <>
+              <button type="button" className="btn ghost" onClick={close}>
+                {role === "outgoing" ? t("offer.cancel") : t("offer.reject")}
+              </button>
+              {role === "outgoing" && (
+                <button type="submit" className="btn primary" disabled={digits.length !== 6 || checking}>
+                  {t("offer.pair")}
+                </button>
+              )}
+              {role === "approve" && (
+                <button type="submit" className="btn primary">
+                  {t("offer.allow")}
+                </button>
+              )}
+            </>
           )}
         </div>
-      </div>
+      </form>
     </Modal>
   );
 }
@@ -288,7 +360,8 @@ function DownloadWatcher() {
   const seen = useRef("");
   useEffect(() => {
     if (!download) return;
-    const key = `${download.contentId}:${download.state}:${download.detail}`;
+    // seq changes on every new request, so asking again after a cancel shows the dialog again.
+    const key = `${download.seq ?? 0}:${download.contentId}:${download.state}:${download.detail}`;
     if (key === seen.current) return;
     seen.current = key;
     const track = app.index.get({ contentId: download.contentId });

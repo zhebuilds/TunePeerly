@@ -10,6 +10,15 @@ export function Tooltip() {
   useEffect(() => {
     const hide = () => {
       window.clearTimeout(timer.current);
+      // Give back the `title` taken on hover, so React stays the owner of it and a title that
+      // later changes or goes away is not shown from a stale copy.
+      const shown = current.current;
+      if (shown?.dataset.tipTitle) {
+        shown.setAttribute("title", shown.getAttribute("data-tip") ?? "");
+        shown.removeAttribute("data-tip");
+        if (shown.dataset.tipTitle === "label") shown.removeAttribute("aria-label");
+        delete shown.dataset.tipTitle;
+      }
       current.current = null;
       setTip(null);
     };
@@ -23,9 +32,11 @@ export function Tooltip() {
       hide();
       const title = target.getAttribute("title");
       if (title) {
-        if (!target.getAttribute("aria-label") && !target.textContent?.trim()) target.setAttribute("aria-label", title);
+        const label = !target.getAttribute("aria-label") && !target.textContent?.trim();
+        if (label) target.setAttribute("aria-label", title);
         target.setAttribute("data-tip", title);
         target.removeAttribute("title");
+        target.dataset.tipTitle = label ? "label" : "1";
       }
       const text = target.getAttribute("data-tip");
       if (!text) return;

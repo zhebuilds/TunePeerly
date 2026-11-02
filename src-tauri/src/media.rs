@@ -1,6 +1,7 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rand::RngCore;
@@ -40,6 +41,8 @@ pub enum Pull {
         start: u64,
         end: Option<u64>,
         reply: mpsc::UnboundedSender<AudioPiece>,
+        /// Bytes delivered but not yet taken by the reader.
+        queued: Arc<AtomicUsize>,
     },
     Cancel {
         id: u64,
@@ -56,10 +59,32 @@ struct Route {
 
 const ROUTE_LIMIT: usize = 32;
 
+/// Bytes one transfer may hold in memory before its reader catches up. The player stops reading once it
+/// has buffered enough, while the other device keeps sending; past this the transfer is dropped and the
+/// player asks again from where it is.
+pub const QUEUE_LIMIT: usize = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+struct Waiter {
+    sender: mpsc::UnboundedSender<AudioPiece>,
+    queued: Option<Arc<AtomicUsize>>,
+}
+
+/// Picks an online device holding a song, skipping the given devices. Installed by the app (see `lib.rs`).
+pub type HolderPicker = Arc<dyn Fn(&str, &[String]) -> Option<String> + Send + Sync>;
+
+/// How long a device that failed to deliver a song is skipped for that song on stream URLs.
+const STREAM_FAILURE_MEMORY: Duration = Duration::from_secs(60);
+
 pub struct AudioBus {
-    waiters: Mutex<HashMap<u64, mpsc::UnboundedSender<AudioPiece>>>,
+    waiters: Mutex<HashMap<u64, Waiter>>,
     routes: Mutex<HashMap<String, Route>>,
     pub base: Mutex<String>,
+    /// Secret part of the stream URLs (`stream_base`), new on every start.
+    secret: String,
+    picker: Mutex<Option<HolderPicker>>,
+    /// Devices that recently failed a stream request, per content id.
+    stream_failures: Mutex<HashMap<String, Vec<(String, std::time::Instant)>>>,
 }
 
 impl AudioBus {
@@ -68,14 +93,53 @@ impl AudioBus {
             waiters: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
             base: Mutex::new(String::new()),
+            secret: random_hex(),
+            picker: Mutex::new(None),
+            stream_failures: Mutex::new(HashMap::new()),
         })
     }
 
+    pub fn set_picker(&self, picker: HolderPicker) {
+        *self.picker.lock().unwrap_or_else(PoisonError::into_inner) = Some(picker);
+    }
+
+    /// A song's stream URL is this followed by its content id. Unlike `open_route`, such a URL does not
+    /// expire and picks the device to read from on every request, so a player can reach any song of the
+    /// queue, and retry it after a dropped link, without asking the page for a new URL first.
+    pub fn stream_base(&self) -> String {
+        format!("{}/s{}.", self.base.lock().unwrap_or_else(PoisonError::into_inner), self.secret)
+    }
+
+    /// The route a stream URL token stands for right now, or None when it is not one or no device has the song.
+    fn stream_route(&self, token: &str) -> Option<Result<Route, ()>> {
+        let rest = token.strip_prefix('s')?.strip_prefix(self.secret.as_str())?.strip_prefix('.')?;
+        if rest.is_empty() || rest.len() > 200 || !rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Some(Err(()));
+        }
+        let skip: Vec<String> = {
+            let mut failures = self.stream_failures.lock().unwrap_or_else(PoisonError::into_inner);
+            failures.retain(|_, list| {
+                list.retain(|(_, at)| at.elapsed() < STREAM_FAILURE_MEMORY);
+                !list.is_empty()
+            });
+            failures.get(rest).map(|list| list.iter().map(|(device, _)| device.clone()).collect()).unwrap_or_default()
+        };
+        let picker = self.picker.lock().unwrap_or_else(PoisonError::into_inner).clone()?;
+        // Every device failed recently: try them all again rather than give up.
+        let device = picker(rest, &skip).or_else(|| if skip.is_empty() { None } else { picker(rest, &[]) });
+        Some(device.map(|device_id| Route { content_id: rest.to_string(), device_id, created: std::time::Instant::now() }).ok_or(()))
+    }
+
+    fn stream_failed(&self, content_id: &str, device_id: &str) {
+        let mut failures = self.stream_failures.lock().unwrap_or_else(PoisonError::into_inner);
+        let list = failures.entry(content_id.to_string()).or_default();
+        list.retain(|(device, _)| device != device_id);
+        list.push((device_id.to_string(), std::time::Instant::now()));
+    }
+
     pub fn open_route(&self, content_id: &str, device_id: &str) -> String {
-        let mut bytes = [0u8; 16];
-        rand::rng().fill_bytes(&mut bytes);
-        let token = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-        let mut routes = self.routes.lock().expect("routes");
+        let token = random_hex();
+        let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
         // Playback fetches one token many times (ranges), so tokens cannot be spent. Keep only the newest few.
         while routes.len() >= ROUTE_LIMIT {
             let Some(oldest) = routes.iter().min_by_key(|(_, route)| route.created).map(|(key, _)| key.clone()) else { break };
@@ -90,35 +154,57 @@ impl AudioBus {
             },
         );
         drop(routes);
-        format!("{}/{token}", self.base.lock().expect("base"))
+        format!("{}/{token}", self.base.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Drops every playback token and fails transfers in flight.
     pub fn close_routes(&self) {
-        self.routes.lock().expect("routes").clear();
-        let waiters = std::mem::take(&mut *self.waiters.lock().expect("waiters"));
-        for (_, sender) in waiters {
-            let _ = sender.send(AudioPiece::failed("cancelled"));
+        self.routes.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        let waiters = std::mem::take(&mut *self.waiters.lock().unwrap_or_else(PoisonError::into_inner));
+        for (_, waiter) in waiters {
+            let _ = waiter.sender.send(AudioPiece::failed("cancelled"));
         }
     }
 
     pub fn register(&self, id: u64, sender: mpsc::UnboundedSender<AudioPiece>) {
-        self.waiters.lock().expect("waiters").insert(id, sender);
+        self.waiters.lock().unwrap_or_else(PoisonError::into_inner).insert(id, Waiter { sender, queued: None });
     }
 
-    pub fn deliver(&self, id: u64, piece: AudioPiece) {
-        let sender = self.waiters.lock().expect("waiters").get(&id).cloned();
-        if let Some(sender) = sender {
-            let last = piece.eof || piece.error.is_some();
-            if sender.send(piece).is_err() || last {
-                self.waiters.lock().expect("waiters").remove(&id);
+    /// Like `register`, but the transfer is dropped once more than `QUEUE_LIMIT` bytes wait in `queued`.
+    /// The reader subtracts what it takes (see `taken`).
+    pub fn register_limited(&self, id: u64, sender: mpsc::UnboundedSender<AudioPiece>, queued: Arc<AtomicUsize>) {
+        self.waiters.lock().unwrap_or_else(PoisonError::into_inner).insert(id, Waiter { sender, queued: Some(queued) });
+    }
+
+    /// Returns false when the transfer was dropped because its reader fell too far behind;
+    /// the sender should then be told to stop.
+    pub fn deliver(&self, id: u64, piece: AudioPiece) -> bool {
+        let waiter = self.waiters.lock().unwrap_or_else(PoisonError::into_inner).get(&id).cloned();
+        let Some(waiter) = waiter else { return true };
+        if let Some(queued) = &waiter.queued {
+            let size = piece.data.len();
+            if queued.fetch_add(size, Ordering::Relaxed).saturating_add(size) > QUEUE_LIMIT {
+                self.waiters.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+                let _ = waiter.sender.send(AudioPiece::failed("busy"));
+                return false;
             }
         }
+        let last = piece.eof || piece.error.is_some();
+        if waiter.sender.send(piece).is_err() || last {
+            self.waiters.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+        }
+        true
     }
 
     pub fn finish(&self, id: u64) {
-        self.waiters.lock().expect("waiters").remove(&id);
+        self.waiters.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
     }
+}
+
+fn random_hex() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
 }
 
 /// Starts the loopback media proxy and signals once route URLs are usable.
@@ -129,11 +215,18 @@ pub async fn serve(
 ) {
     let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else { return };
     if let Ok(addr) = listener.local_addr() {
-        *bus.base.lock().expect("base") = format!("http://127.0.0.1:{}", addr.port());
+        *bus.base.lock().unwrap_or_else(PoisonError::into_inner) = format!("http://127.0.0.1:{}", addr.port());
     }
     let _ = ready.send(());
     loop {
-        let Ok((socket, _)) = listener.accept().await else { continue };
+        let socket = match listener.accept().await {
+            Ok((socket, _)) => socket,
+            Err(_) => {
+                // For example too many open sockets; wait instead of spinning.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
         let bus = bus.clone();
         let pulls = pulls.clone();
         tokio::task::spawn_local(async move {
@@ -169,45 +262,61 @@ async fn handle(mut socket: TcpStream, bus: Arc<AudioBus>, pulls: mpsc::Unbounde
         socket.write_all(status_response(400, "Bad Request").as_bytes()).await?;
         return Ok(());
     };
-    let route = bus.routes.lock().expect("routes").get(&request.token).cloned();
+    let stream = bus.stream_route(&request.token);
+    let streamed = stream.is_some();
+    let route = match stream {
+        Some(Ok(route)) => Some(route),
+        Some(Err(())) => {
+            // A stream URL, but no device that has the song is connected now. The player retries.
+            socket.write_all(status_response(503, "Service Unavailable").as_bytes()).await?;
+            return Ok(());
+        }
+        None => bus.routes.lock().unwrap_or_else(PoisonError::into_inner).get(&request.token).cloned(),
+    };
     let Some(route) = route else {
         socket.write_all(status_response(404, "Not Found").as_bytes()).await?;
         return Ok(());
     };
-    let (start, end) = request.range.unwrap_or((0, None));
-    let id = rand::random::<u64>();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let device_id = route.device_id.clone();
-    let cancel = |pulls: &mpsc::UnboundedSender<Pull>| {
-        let _ = pulls.send(Pull::Cancel { id, device_id: device_id.clone() });
+    let (mut start, end, suffix) = match &request.range {
+        None => (0, None, None),
+        Some(ByteRange::From(start, end)) => (*start, *end, None),
+        Some(ByteRange::Last(count)) => (0, None, Some(*count)),
     };
-    if pulls.send(Pull::Open {
-        id,
-        device_id: route.device_id,
-        content_id: route.content_id,
-        start,
-        end,
-        reply: tx,
-    }).is_err() {
-        socket.write_all(status_response(502, "Bad Gateway").as_bytes()).await?;
-        return Ok(());
-    }
-
-    let first = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
-    let total = match first {
-        Ok(Some(piece)) if piece.error.is_none() && piece.total.is_some() => piece.total.unwrap_or(0),
-        Ok(Some(piece)) if piece.error.as_deref() == Some("range") => {
-            bus.finish(id);
-            cancel(&pulls);
+    let device_id = route.device_id.clone();
+    let mut opened = match open_pull(&bus, &pulls, &route.device_id, &route.content_id, start, end).await {
+        Ok(opened) => opened,
+        Err((code, reason)) => {
+            if streamed && code != 416 {
+                bus.stream_failed(&route.content_id, &route.device_id);
+            }
+            socket.write_all(status_response(code, reason).as_bytes()).await?;
+            return Ok(());
+        }
+    };
+    // "bytes=-N" asks for the last N bytes. The length is only known once the peer answers.
+    if let Some(count) = suffix {
+        if count == 0 {
+            bus.finish(opened.id);
+            let _ = pulls.send(Pull::Cancel { id: opened.id, device_id: device_id.clone() });
             socket.write_all(status_response(416, "Range Not Satisfiable").as_bytes()).await?;
             return Ok(());
         }
-        _ => {
-            bus.finish(id);
-            cancel(&pulls);
-            socket.write_all(status_response(502, "Bad Gateway").as_bytes()).await?;
-            return Ok(());
+        start = opened.total.saturating_sub(count);
+        if start > 0 {
+            bus.finish(opened.id);
+            let _ = pulls.send(Pull::Cancel { id: opened.id, device_id: device_id.clone() });
+            opened = match open_pull(&bus, &pulls, &route.device_id, &route.content_id, start, None).await {
+                Ok(opened) => opened,
+                Err((code, reason)) => {
+                    socket.write_all(status_response(code, reason).as_bytes()).await?;
+                    return Ok(());
+                }
+            };
         }
+    }
+    let Opened { id, mut rx, queued, total } = opened;
+    let cancel = |pulls: &mpsc::UnboundedSender<Pull>| {
+        let _ = pulls.send(Pull::Cancel { id, device_id: device_id.clone() });
     };
     let stop = if request.range.is_some() {
         let Some(stop) = range_stop(start, end, total) else {
@@ -238,13 +347,21 @@ async fn handle(mut socket: TcpStream, bus: Arc<AudioBus>, pulls: mpsc::Unbounde
     }
 
     let mut written = start;
+    // The other device stopped sending, as opposed to the player hanging up (a seek or a stop).
+    let mut peer_failed = false;
     loop {
         let piece = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
-        let Ok(Some(piece)) = piece else { break };
+        let Ok(Some(piece)) = piece else {
+            peer_failed = true;
+            break;
+        };
+        taken(&queued, &piece);
         if piece.error.is_some() {
+            peer_failed = piece.error.as_deref() != Some("cancelled");
             break;
         }
         if piece.offset > written {
+            peer_failed = true;
             break;
         }
         let skip = (written - piece.offset) as usize;
@@ -263,9 +380,67 @@ async fn handle(mut socket: TcpStream, bus: Arc<AudioBus>, pulls: mpsc::Unbounde
     bus.finish(id);
     if written < stop {
         cancel(&pulls);
+        if streamed && peer_failed {
+            bus.stream_failed(&route.content_id, &route.device_id);
+        }
     }
     let _ = socket.shutdown().await;
     Ok(())
+}
+
+/// The reader took `piece` off the queue.
+pub fn taken(queued: &AtomicUsize, piece: &AudioPiece) {
+    let size = piece.data.len();
+    let mut current = queued.load(Ordering::Relaxed);
+    loop {
+        match queued.compare_exchange_weak(current, current.saturating_sub(size), Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(seen) => current = seen,
+        }
+    }
+}
+
+struct Opened {
+    id: u64,
+    rx: mpsc::UnboundedReceiver<AudioPiece>,
+    queued: Arc<AtomicUsize>,
+    total: u64,
+}
+
+/// Asks the peer for the song from `start` and waits for its first answer, which carries the full length.
+async fn open_pull(
+    bus: &AudioBus,
+    pulls: &mpsc::UnboundedSender<Pull>,
+    device_id: &str,
+    content_id: &str,
+    start: u64,
+    end: Option<u64>,
+) -> Result<Opened, (u16, &'static str)> {
+    let id = rand::random::<u64>();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let queued = Arc::new(AtomicUsize::new(0));
+    if pulls.send(Pull::Open {
+        id,
+        device_id: device_id.to_string(),
+        content_id: content_id.to_string(),
+        start,
+        end,
+        reply: tx,
+        queued: queued.clone(),
+    }).is_err() {
+        return Err((502, "Bad Gateway"));
+    }
+    let first = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
+    let failed = match first {
+        Ok(Some(piece)) if piece.error.is_none() && piece.total.is_some() => {
+            return Ok(Opened { id, rx, queued, total: piece.total.unwrap_or(0) });
+        }
+        Ok(Some(piece)) if piece.error.as_deref() == Some("range") => (416, "Range Not Satisfiable"),
+        _ => (502, "Bad Gateway"),
+    };
+    bus.finish(id);
+    let _ = pulls.send(Pull::Cancel { id, device_id: device_id.to_string() });
+    Err(failed)
 }
 
 async fn read_header(socket: &mut TcpStream) -> std::io::Result<Vec<u8>> {
@@ -284,9 +459,17 @@ async fn read_header(socket: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+#[derive(Debug, PartialEq)]
+enum ByteRange {
+    /// From a byte, up to an exclusive end or the end of the file.
+    From(u64, Option<u64>),
+    /// The last this many bytes.
+    Last(u64),
+}
+
 struct Request {
     token: String,
-    range: Option<(u64, Option<u64>)>,
+    range: Option<ByteRange>,
     head_only: bool,
 }
 
@@ -313,12 +496,15 @@ fn parse_request(bytes: &[u8]) -> Option<Request> {
     Some(Request { token, range, head_only: method == "HEAD" })
 }
 
-fn parse_range(value: &str) -> Option<(u64, Option<u64>)> {
+fn parse_range(value: &str) -> Option<ByteRange> {
     let value = value.strip_prefix("bytes=")?;
     let (start, end) = value.split_once('-')?;
+    if start.is_empty() {
+        return Some(ByteRange::Last(end.parse().ok()?));
+    }
     let start = start.parse().ok()?;
     let end = if end.is_empty() { None } else { Some(end.parse::<u64>().ok()?.saturating_add(1)) };
-    Some((start, end))
+    Some(ByteRange::From(start, end))
 }
 
 /// Resolves an inclusive HTTP byte range (stored internally with an exclusive
@@ -335,9 +521,17 @@ mod tests {
 
     #[test]
     fn parses_open_and_closed_ranges() {
-        assert_eq!(parse_range("bytes=0-"), Some((0, None)));
-        assert_eq!(parse_range("bytes=10-19"), Some((10, Some(20))));
+        assert_eq!(parse_range("bytes=0-"), Some(ByteRange::From(0, None)));
+        assert_eq!(parse_range("bytes=10-19"), Some(ByteRange::From(10, Some(20))));
         assert_eq!(parse_range("items=1-2"), None);
+    }
+
+    #[test]
+    fn parses_suffix_ranges() {
+        assert_eq!(parse_range("bytes=-500"), Some(ByteRange::Last(500)));
+        assert_eq!(parse_range("bytes=-0"), Some(ByteRange::Last(0)));
+        assert_eq!(parse_range("bytes=-"), None);
+        assert_eq!(parse_range("bytes=-x"), None);
     }
 
     #[test]
@@ -350,10 +544,35 @@ mod tests {
     }
 
     #[test]
+    fn stream_urls_pick_a_device_per_request_and_skip_recent_failures() {
+        let bus = AudioBus::new();
+        *bus.base.lock().unwrap() = "http://127.0.0.1:9".into();
+        let base = bus.stream_base();
+        assert!(base.starts_with("http://127.0.0.1:9/s") && base.ends_with('.'));
+        let token = format!("{}abc", base.trim_start_matches("http://127.0.0.1:9/"));
+        // No picker yet: nothing can serve it.
+        assert!(matches!(bus.stream_route(&token), None));
+        bus.set_picker(Arc::new(|content: &str, skip: &[String]| {
+            assert_eq!(content, "abc");
+            ["one", "two"].iter().find(|device| !skip.iter().any(|s| s == *device)).map(|d| d.to_string())
+        }));
+        assert_eq!(bus.stream_route(&token).unwrap().unwrap().device_id, "one");
+        bus.stream_failed("abc", "one");
+        assert_eq!(bus.stream_route(&token).unwrap().unwrap().device_id, "two");
+        bus.stream_failed("abc", "two");
+        // Both failed lately: start over instead of giving up.
+        assert_eq!(bus.stream_route(&token).unwrap().unwrap().device_id, "one");
+        // Wrong secret, a bad id, or an ordinary route token are not stream URLs.
+        assert!(bus.stream_route("sdeadbeef.abc").is_none());
+        assert!(matches!(bus.stream_route(&format!("{}a.b", token.trim_end_matches("abc"))), Some(Err(()))));
+        assert!(bus.stream_route("0123456789abcdef0123456789abcdef").is_none());
+    }
+
+    #[test]
     fn parses_request_token_and_method() {
         let request = parse_request(b"HEAD /abc?x=1 HTTP/1.1\r\nRange: bytes=5-\r\n\r\n").expect("request");
         assert_eq!(request.token, "abc");
-        assert_eq!(request.range, Some((5, None)));
+        assert_eq!(request.range, Some(ByteRange::From(5, None)));
         assert!(request.head_only);
         assert!(parse_request(b"POST /abc HTTP/1.1\r\n\r\n").is_none());
         assert!(parse_request(b"GET /abc\r\n\r\n").is_none());

@@ -1,5 +1,5 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
-//! App device ids come from the Signal identity public key.
+//! App device ids are the SHA-256 of the device's TLS public key (its SubjectPublicKeyInfo).
 //! Relay certificate ids use the strelaysrv / Syncthing device-id algorithm
 //! on the certificate's raw bytes.
 
@@ -8,17 +8,17 @@ use sha2::{Digest, Sha256};
 
 const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-pub fn app_device_id(identity_public: &[u8]) -> String {
-    hex_encode(identity_public)
+pub fn app_device_id(public_key: &[u8]) -> String {
+    hex_encode(&Sha256::digest(public_key))
 }
 
-pub fn identity_bytes_from_app_id(id: &str) -> Option<Vec<u8>> {
-    hex_decode(id)
+pub fn key_hash_from_device_id(id: &str) -> Option<[u8; 32]> {
+    hex_decode(id)?.try_into().ok()
 }
 
 pub fn smaller_device(a: &str, b: &str) -> std::cmp::Ordering {
-    let aa = identity_bytes_from_app_id(a).unwrap_or_default();
-    let bb = identity_bytes_from_app_id(b).unwrap_or_default();
+    let aa = hex_decode(a).unwrap_or_default();
+    let bb = hex_decode(b).unwrap_or_default();
     aa.cmp(&bb)
 }
 
@@ -189,9 +189,12 @@ mod tests {
     }
 
     #[test]
-    fn device_id_orders_by_public_key_bytes() {
-        let low = app_device_id(&[0x01, 0x02]);
-        let high = app_device_id(&[0x01, 0x03]);
+    fn device_id_is_the_public_key_hash_and_orders_by_it() {
+        let low = app_device_id(b"key-a");
+        let high = app_device_id(b"key-b");
+        assert_eq!(key_hash_from_device_id(&low), Some(Sha256::digest(b"key-a").into()));
+        assert!(key_hash_from_device_id("abcd").is_none());
+        let (low, high) = if low < high { (low, high) } else { (high, low) };
         assert_eq!(smaller_device(&low, &high), std::cmp::Ordering::Less);
         assert_eq!(smaller_device(&high, &low), std::cmp::Ordering::Greater);
     }

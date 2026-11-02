@@ -2,6 +2,20 @@
 
 This file describes each released version. 0.6.0 is the first release under the name TunePeerly (声渡).
 
+## [0.8.0-alpha.1] - 2026-11-02
+
+This is an alpha test release. It adds an Android app and changes how devices pair, connect, and sync.
+
+TunePeerly now runs on Android phones (arm64). The phone layout has a tab bar, a mini player, and a top bar menu. Songs play in a native Media3 player, so the queue keeps playing with the screen locked, with repeat, shuffle, and controls on the lock screen and in the notification. Imported music goes into the app's own storage. The library database key is kept in the Android Keystore, and if that key cannot be read, the app stops instead of creating a new library. The phone uses its own device name, caches the next songs from linked devices, and redials when the network changes. Android is built in WSL2 on Windows, and the Android build guide lists the setup.
+
+Pairing uses a one-time 6-digit code (SPAKE2). Devices talk over TLS 1.3 and accept only the keys saved when pairing. libsignal was removed. The library database is encrypted with SQLCipher. On Windows its key is protected by DPAPI. Unpairing removes the pairing on both sides, also when the other device is offline. The relay never pairs, and only devices that are already paired can connect through it.
+
+The LAN port is picked automatically. Discovery announces every 3 seconds by multicast and every 15 seconds by broadcast, and Nearby has a refresh button. Connecting by a typed address was removed. Paired devices stay in the Paired list when they disconnect. Their addresses are remembered and redialed with backoff and keepalive, and the relay is used as a fallback.
+
+Follow playback and Connect mode were removed. Each device plays on its own. Every song is visible to paired devices, and per-song exposure was removed. Songs from linked devices use stable stream URLs that pick an online device for each request. Sync is manual: Send or Override, per device, and the receiving device chooses to accept silently, ask, or deny. Automatic sync, history sync, and conflict handling were removed. A paired device's Recently played is read-only. Search always covers all music, and the scope buttons were removed.
+
+Settings has a This computer section with the device name, network information, and device ID, followed by the music and download folders. Relay settings moved to the Devices page. The unfinished-setting marks were removed. The About page is shorter. Database migrations and backward-compatibility code were removed.
+
 ## [0.6.0] - 2026-10-19
 
 TunePeerly plays local audio from the original file, streams an exposed song from a paired device, and can download that file into the library. Pairing is by LAN discovery or by IPv4 address and port. Both computers must accept. Sync traffic is end-to-end encrypted.
@@ -15,6 +29,20 @@ Some settings are marked because they are not finished. **To be revised** means 
 ## 更新日志
 
 这里说明每个发布版本的情况。0.6.0 是以 TunePeerly（声渡）这个名字发布的第一个版本。
+
+## [0.8.0-alpha.1] - 2026-11-02
+
+这是 alpha 测试版。这个版本加入了安卓应用，并改变了设备配对、连接和同步的方式。
+
+TunePeerly 现在可以在安卓手机（arm64）上运行。手机界面有底部标签栏、迷你播放器和顶栏菜单。歌曲由原生的 Media3 播放器播放，锁屏后队列会继续播放，支持循环、随机，锁屏和通知栏上有播放控制。导入的音乐保存在应用自己的存储里。音乐库数据库的密钥保存在安卓 Keystore 中，读不到这个密钥时，应用会停止启动，而不是新建一个曲库。手机使用自己的设备名，会提前缓存来自已连接设备的后几首歌，网络变化时会重新连接。安卓版在 Windows 上通过 WSL2 编译，安卓编译手册列出了需要的环境。
+
+配对使用一次性的 6 位配对码（SPAKE2）。设备之间使用 TLS 1.3 通信，只接受配对时保存的密钥。移除了 libsignal。音乐库数据库用 SQLCipher 加密，在 Windows 上它的密钥由 DPAPI 保护。取消配对会在两边同时生效，对方离线时也一样。中继从不配对，只有已经配对的设备才能通过它连接。
+
+局域网端口自动选择。设备发现每 3 秒组播一次、每 15 秒广播一次，附近设备有刷新按钮。移除了手动输入地址连接。已配对设备断开后仍留在已配对列表里。程序会记住它们的地址，并按退避间隔重新连接、保持心跳，连不上时改用中继。
+
+移除了跟随播放和连接模式，每台设备各自播放。所有歌曲对已配对设备都可见，移除了按歌曲公开的设置。来自已连接设备的歌曲使用固定的串流地址，每次请求时挑选一台在线设备。同步改为手动：按设备发送或覆盖，接收方可以选择静默接受、询问或拒绝。移除了自动同步、播放记录同步和冲突处理。已配对设备的最近播放是只读的。搜索总是覆盖全部音乐，移除了搜索范围按钮。
+
+设置里新增“这台电脑”，包括设备名、网络信息和设备 ID，后面是音乐文件夹和下载文件夹。中继设置移到了设备页面。移除了未完成设置的标签。关于页面更简洁了。移除了数据库迁移和向后兼容代码。
 
 ## [0.6.0] - 2026-10-19
 

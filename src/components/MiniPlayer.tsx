@@ -1,5 +1,5 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { api, type DesktopTrack } from "../api";
 import { coverSrc } from "./Cover";
@@ -55,6 +55,11 @@ export function MiniPlayer() {
 
   const command = (action: string) => void api.desktopCommand(action).catch(() => {});
   const restore = useDragOrClick(() => command("restore"));
+  const restoreKey = (event: ReactKeyboardEvent) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    command("restore");
+  };
   const title = track?.title || t("player.idle");
   const cover = track?.coverPath ? coverSrc(track.coverPath) : "";
   return (
@@ -65,10 +70,10 @@ export function MiniPlayer() {
         void import("@tauri-apps/api/window").then(({ getCurrentWindow }) => getCurrentWindow().startDragging()).catch(() => {});
       }}
     >
-      <div className="mini-open" role="button" tabIndex={0} aria-label={t("now.open")} {...restore}>
+      <div className="mini-open" role="button" tabIndex={0} aria-label={t("now.open")} {...restore} onKeyDown={restoreKey}>
         {cover ? <img src={cover} alt="" /> : <Icons.music />}
       </div>
-      <div className="mini-text" role="button" tabIndex={0} {...restore}>
+      <div className="mini-text" role="button" tabIndex={0} {...restore} onKeyDown={restoreKey}>
         <span className="mini-title">{title}</span>
         <span className="mini-artist">{track?.artist || t("library.unknownArtist")}</span>
       </div>

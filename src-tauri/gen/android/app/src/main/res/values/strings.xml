@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">"TunePeerly"</string>
+    <string name="main_activity_title">"TunePeerly"</string>
+    <string name="widget_description">Now playing, with play, skip and like</string>
+</resources>

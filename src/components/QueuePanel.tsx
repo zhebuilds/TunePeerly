@@ -9,12 +9,13 @@ import { albumParts, displayTitle } from "../lib/library";
 import { transport } from "../player/clock";
 import { Icons } from "../ui/icons";
 import { Cover } from "./Cover";
+import { isAndroid } from "../lib/platform";
 
 export function QueuePanel() {
   const { t } = useTranslation();
   const app = useApp();
   const { playing } = useSyncExternalStore(transport.subscribe, transport.get);
-  const future = app.queue.future.map((ref) => ({ ref, track: app.index.get(ref) }));
+  const future = app.queue.future.map((ref) => ({ ref, track: app.lookup(ref) }));
   const contextLabel = useContextLabel(app.queue.contextId);
 
   return (
@@ -57,6 +58,7 @@ export function QueuePanel() {
                   className="queue-item"
                   data-drop={`queue:${at}`}
                   onPointerDown={(event) =>
+                    !isAndroid &&
                     track &&
                     beginDrag(
                       event,

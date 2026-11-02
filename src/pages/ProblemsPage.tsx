@@ -6,6 +6,7 @@ import { Cover } from "../components/Cover";
 import { displayTitle, problemGroups, trackKey } from "../lib/library";
 import { Icons } from "../ui/icons";
 import { EmptyHint } from "./TrackListPage";
+import { isAndroid } from "../lib/platform";
 
 export function ProblemsPage() {
   const { t } = useTranslation();
@@ -62,7 +63,7 @@ function ProblemGroup({ title, help, tracks }: { title: string; help: string; tr
                 <Icons.play /> {t("problems.retry")}
               </button>
             )}
-            {track.localFileId && (
+            {track.localFileId && !isAndroid && (
               <button type="button" className="icon-btn" title={t("menu.showInFolder")} aria-label={t("menu.showInFolder")} onClick={() => void api.showInFolder(track.localFileId!).catch(app.say)}>
                 <Icons.external />
               </button>

@@ -2,34 +2,32 @@
 import { useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
-import { mirrorPosition, useApp, type PlaybackMirror } from "../app/model";
+import { useApp } from "../app/model";
 import { coverSrc, Cover } from "./Cover";
 import { clockText } from "../lib/format";
 import { displayTitle, trackKey } from "../lib/library";
 import { clock, transport } from "../player/clock";
 import { Icons } from "../ui/icons";
+import { isAndroid } from "../lib/platform";
 
 export function PlayerBar() {
   const { t } = useTranslation();
   const app = useApp();
   const { playing } = useSyncExternalStore(transport.subscribe, transport.get);
-  const mirror = app.following ? app.mirror : null;
   const track = app.shown;
   const order = app.queue.order;
   const repeat = app.queue.repeat;
-  const failed = Boolean(!mirror && track && app.failure?.key === trackKey(track));
-  const remoteName = mirror
-    ? app.boot?.links.find((link) => link.deviceId === mirror.deviceId)?.name
-    : app.engine.remoteDevice
-      ? app.boot?.links.find((link) => link.deviceId === app.engine.remoteDevice)?.name
-      : null;
-  const showPlaying = playing && !mirror;
+  const failed = Boolean(track && app.failure?.key === trackKey(track));
+  // The badge names the device streaming to this computer, if any.
+  const remoteName = app.engine.remoteDevice ? app.boot?.links.find((link) => link.deviceId === app.engine.remoteDevice)?.name : null;
+  const showPlaying = playing;
 
   useMediaSession();
   useDesktopNowPlaying();
 
   return (
-    <footer className="player-bar">
+    <footer className={`player-bar${isAndroid && app.route.name === "now" && !app.queueOpen && !app.noticesOpen ? " expanded" : ""}`}>
+      {isAndroid && <MiniProgress fallback={(track?.durationMs ?? 0) / 1000} />}
       <div className="player-left">
         {track ? (
           <>
@@ -67,20 +65,20 @@ export function PlayerBar() {
           <button type="button" className={`icon-btn${order !== "manual" ? " on" : ""}`} aria-pressed={order !== "manual"} aria-label={t("player.shuffle")} title={order === "libraryRandom" ? t("player.libraryRandom") : t("player.shuffle")} onClick={app.toggleShuffle}>
             <Icons.shuffle />
           </button>
-          <button type="button" className="icon-btn" aria-label={t("player.previous")} title={t("player.previousShortcut")} onClick={() => { if (!mirror) app.previous(); }} disabled={!track}>
+          <button type="button" className="icon-btn" aria-label={t("player.previous")} title={t("player.previousShortcut")} onClick={app.previous} disabled={!track}>
             <Icons.prev />
           </button>
-          <button type="button" className="play-btn" aria-label={showPlaying ? t("player.pause") : t("player.play")} title={t("player.playShortcut")} onClick={() => { if (!mirror) app.toggle(); }} disabled={!track && app.library.length === 0 && app.queue.future.length === 0}>
+          <button type="button" className="play-btn" aria-label={showPlaying ? t("player.pause") : t("player.play")} title={t("player.playShortcut")} onClick={app.toggle} disabled={!track && app.library.length === 0 && app.queue.future.length === 0}>
             {showPlaying ? <Icons.pause /> : <Icons.play />}
           </button>
-          <button type="button" className="icon-btn" aria-label={t("player.next")} title={t("player.nextShortcut")} onClick={() => { if (!mirror) app.next(); }} disabled={!track}>
+          <button type="button" className="icon-btn" aria-label={t("player.next")} title={t("player.nextShortcut")} onClick={app.next} disabled={!track}>
             <Icons.next />
           </button>
           <button type="button" className={`icon-btn${repeat !== "off" ? " on" : ""}`} aria-label={t(`player.repeat.${repeat}`)} title={t(`player.repeat.${repeat}`)} onClick={app.cycleRepeat}>
             {repeat === "one" ? <Icons.repeatOne /> : <Icons.repeat />}
           </button>
         </div>
-        <Seek disabled={!track} fallback={(track?.durationMs ?? 0) / 1000} mirror={mirror} />
+        <Seek disabled={!track} fallback={(track?.durationMs ?? 0) / 1000} />
       </div>
 
       <div className="player-right">
@@ -100,28 +98,29 @@ export function PlayerBar() {
   );
 }
 
-function Seek({ disabled, fallback, mirror }: { disabled: boolean; fallback: number; mirror: PlaybackMirror | null }) {
+/** The phone's thin, read-only progress line along the top of the mini player. */
+function MiniProgress({ fallback }: { fallback: number }) {
+  const time = useSyncExternalStore(clock.subscribe, clock.get);
+  const duration = time.duration > 0 ? time.duration : fallback;
+  const fill = duration > 0 ? Math.min(100, (time.position / duration) * 100) : 0;
+  return (
+    <div className="mini-progress" aria-hidden="true">
+      <span style={{ width: `${fill}%` }} />
+    </div>
+  );
+}
+
+function Seek({ disabled, fallback }: { disabled: boolean; fallback: number }) {
   const { t } = useTranslation();
   const app = useApp();
   const time = useSyncExternalStore(clock.subscribe, clock.get);
   const [scrub, setScrub] = useState<number | null>(null);
   const [remaining, setRemaining] = useState(() => localStorage.getItem("showRemaining") === "1");
-  const [now, setNow] = useState(() => performance.now());
-  useEffect(() => {
-    if (!mirror?.playing) return;
-    const timer = window.setInterval(() => setNow(performance.now()), 200);
-    return () => window.clearInterval(timer);
-  }, [mirror?.playing, mirror?.at]);
-  const duration = mirror ? (mirror.duration > 0 ? mirror.duration : fallback) : time.duration > 0 ? time.duration : fallback;
-  const mirrored = mirror ? mirrorPosition(mirror, now) : null;
-  const position = mirrored !== null ? Math.min(mirrored, duration || mirrored) : scrub ?? Math.min(time.position, duration || time.position);
+  const duration = time.duration > 0 ? time.duration : fallback;
+  const position = scrub ?? Math.min(time.position, duration || time.position);
   const fill = duration > 0 ? (position / duration) * 100 : 0;
   const commit = () => {
-    if (mirror) {
-      setScrub(null);
-      return;
-    }
-    if (scrub !== null) app.engine.seek(scrub);
+    if (scrub !== null) app.seek(scrub);
     setScrub(null);
   };
   return (
@@ -137,9 +136,7 @@ function Seek({ disabled, fallback, mirror }: { disabled: boolean; fallback: num
         disabled={disabled || duration <= 0}
         aria-label={t("player.seek")}
         style={{ "--fill": `${fill}%` } as CSSProperties}
-        onChange={(event) => {
-          if (!mirror) setScrub(Number(event.target.value));
-        }}
+        onChange={(event) => setScrub(Number(event.target.value))}
         onPointerUp={commit}
         onKeyUp={commit}
         onBlur={() => scrub !== null && commit()}
@@ -205,16 +202,17 @@ function useDesktopNowPlaying() {
   const { playing } = useSyncExternalStore(transport.subscribe, transport.get);
   const time = useSyncExternalStore(clock.subscribe, clock.get);
   const track = app.shown;
-  const mirror = app.following ? app.mirror : null;
-  const [now, setNow] = useState(() => performance.now());
-  useEffect(() => {
-    if (!mirror?.playing) return;
-    const timer = window.setInterval(() => setNow(performance.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [mirror?.playing, mirror?.at]);
-  const position = mirror ? mirrorPosition(mirror, now) : time.position;
+  const position = time.position;
   const second = Math.floor(position);
-  const duration = mirror ? (mirror.duration > 0 ? mirror.duration : (track?.durationMs ?? 0) / 1000) : time.duration || (track?.durationMs ?? 0) / 1000;
+  const duration = time.duration || (track?.durationMs ?? 0) / 1000;
+  // Android colours its status and navigation bars from the theme sent here, so resend when it changes.
+  const [look, setLook] = useState(0);
+  useEffect(() => {
+    if (!isAndroid) return;
+    const watch = new MutationObserver(() => setLook((value) => value + 1));
+    watch.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    return () => watch.disconnect();
+  }, []);
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
     const cover = track?.coverUrl && !/^(data:|blob:|https?:)/.test(track.coverUrl) ? track.coverUrl : null;
@@ -223,8 +221,7 @@ function useDesktopNowPlaying() {
       artist: track?.artist ?? "",
       album: track?.album ?? "",
       coverPath: cover,
-      // Following only watches the other device, so the system button stays on Play.
-      playing: Boolean(track) && playing && !mirror,
+      playing: Boolean(track) && playing,
       favorite: Boolean(track?.favorite),
       duration,
       position,
@@ -238,7 +235,7 @@ function useDesktopNowPlaying() {
         like: t("menu.like"),
       },
     }).catch(() => {});
-  }, [track, playing, second, duration, mirror, i18n.language, t]);
+  }, [track, playing, second, duration, i18n.language, t, look]);
 }
 
 function useMediaSession() {
@@ -257,8 +254,8 @@ function useMediaSession() {
           artwork: track.coverUrl ? [{ src: coverSrc(track.coverUrl) }] : [],
         })
       : null;
-    session.playbackState = app.following || !playing ? "paused" : "playing";
-  }, [track, t, app.following, playing]);
+    session.playbackState = playing ? "playing" : "paused";
+  }, [track, t, playing]);
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
     const session = navigator.mediaSession;
@@ -269,19 +266,15 @@ function useMediaSession() {
         // Some actions are not supported by every WebView.
       }
     };
-    if (app.following) {
-      for (const action of ["play", "pause", "previoustrack", "nexttrack", "seekto"] as MediaSessionAction[]) set(action, () => {});
-    } else {
-      set("play", () => app.toggle());
-      set("pause", () => app.engine.pause());
-      set("previoustrack", () => app.previous());
-      set("nexttrack", () => app.next());
-      set("seekto", (details) => {
-        if (details.seekTime !== undefined) app.engine.seek(details.seekTime);
-      });
-    }
+    set("play", () => app.play());
+    set("pause", () => app.pause());
+    set("previoustrack", () => app.previous());
+    set("nexttrack", () => app.next());
+    set("seekto", (details) => {
+      if (details.seekTime !== undefined) app.seek(details.seekTime);
+    });
     return () => {
       for (const action of ["play", "pause", "previoustrack", "nexttrack", "seekto"] as MediaSessionAction[]) set(action, null);
     };
-  }, [app.following, app.toggle, app.previous, app.next, app.engine]);
+  }, [app.play, app.pause, app.previous, app.next, app.seek]);
 }

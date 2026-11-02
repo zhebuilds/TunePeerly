@@ -11,27 +11,19 @@ import { covers, displayTitle, groupTracks, pickCovers } from "../lib/library";
 import { Icons } from "../ui/icons";
 import { EmptyHint } from "./TrackListPage";
 
-export function SearchPage({ scope: initialScope }: { scope?: string }) {
+export function SearchPage() {
   const { t } = useTranslation();
   const app = useApp();
-  const [scope, setScope] = useState(initialScope ?? "all");
   const [results, setResults] = useState<Track[] | null>(null);
   const [showAll, setShowAll] = useState(false);
   const ticket = useRef(0);
   const query = app.search.trim();
-
-  useEffect(() => setScope(initialScope ?? "all"), [initialScope]);
 
   useEffect(() => {
     setShowAll(false);
     const mine = ++ticket.current;
     if (!query) {
       setResults(null);
-      return;
-    }
-    const local = app.findTracks(query, scope);
-    if (local) {
-      setResults(local);
       return;
     }
     const timer = window.setTimeout(() => {
@@ -45,29 +37,15 @@ export function SearchPage({ scope: initialScope }: { scope?: string }) {
         });
     }, 160);
     return () => window.clearTimeout(timer);
-  }, [query, scope, app.findTracks, app.tracks]);
+  }, [query, app.tracks]);
 
   const lower = query.toLowerCase();
   const artists = useMemo(() => (results ? groupTracks(results, "artist").filter((group) => group.name && group.name.toLowerCase().includes(lower)).slice(0, 8) : []), [results, lower]);
   const albums = useMemo(() => (results ? groupTracks(results, "album").filter((group) => group.name && group.name.toLowerCase().includes(lower)).slice(0, 8) : []), [results, lower]);
   const playlists = useMemo(() => (app.boot?.playlists ?? []).filter((item) => lower && item.name.toLowerCase().includes(lower)), [app.boot, lower]);
 
-  const scopes = [
-    { id: "all", label: t("search.all") },
-    ...(initialScope?.startsWith("playlist:") ? [{ id: initialScope, label: t("search.thisPlaylist") }] : []),
-    { id: "queue", label: t("search.queue") },
-  ];
-
   return (
     <div className="page search-page">
-      <div className="chip-row">
-        {scopes.map((item) => (
-          <button type="button" key={item.id} className={`chip${scope === item.id ? " on" : ""}`} onClick={() => setScope(item.id)}>
-            {item.label}
-          </button>
-        ))}
-      </div>
-
       {!query && <BrowseTiles />}
 
       {query && results && results.length === 0 && artists.length === 0 && playlists.length === 0 && (

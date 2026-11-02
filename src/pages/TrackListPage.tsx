@@ -1,7 +1,8 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { api, type Track } from "../api";
+import { api, type RemoteHistory, type Track } from "../api";
 import { useApp, type Route } from "../app/model";
 import { Cover, LikedCover } from "../components/Cover";
 import { Select } from "../components/controls";
@@ -9,7 +10,7 @@ import { ActionBar, PageHeader } from "../components/PageHeader";
 import { SyncButton } from "../components/SyncButton";
 import { TrackTable, type Columns } from "../components/TrackTable";
 import { tintFor, totalText } from "../lib/format";
-import { albumParts, covers, filterText, folderName, sortTracks, type Sort } from "../lib/library";
+import { albumParts, covers, filterText, folderName, sortTracks, trackKey, type Sort } from "../lib/library";
 import { transport } from "../player/clock";
 import { Icons } from "../ui/icons";
 
@@ -36,16 +37,27 @@ export function TrackListPage({ route }: { route: Route }) {
   const routeKey = `${route.name}:${route.id ?? ""}`;
   const [filter, setFilter] = useState("");
   const [filterOpen, setFilterOpen] = useState(false);
-  const [sharingOpen, setSharingOpen] = useState(false);
   const filterInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setFilter("");
     setFilterOpen(false);
-    setSharingOpen(false);
   }, [routeKey]);
 
-  const info = usePageInfo(route);
+  const online = (app.boot?.links ?? []).filter((link) => link.state === "online" && link.deviceId !== app.boot?.deviceId);
+  const [viewing, setViewing] = useState("");
+  const viewed = route.name === "recent" ? viewing : "";
+  const remote = useRemoteHistory(viewed, () => setViewing(""));
+  const local = usePageInfo(route);
+  const info: PageInfo = viewed
+    ? {
+        ...local,
+        tracks: remote.tracks,
+        contextId: `recent-device:${viewed}`,
+        extraMeta: remote.missing > 0 ? <span className="muted">{t("recent.notHere", { count: remote.missing })}</span> : undefined,
+        empty: remote.loading ? t("recent.loading") : <EmptyHint icon={<Icons.clock />} title={t("empty.recentTitle")} body={t("recent.remoteEmpty")} />,
+      }
+    : local;
   const [sort, setSortState] = useState<Sort>(() => sorts.get(routeKey) ?? info.defaultSort);
   useEffect(() => setSortState(sorts.get(routeKey) ?? info.defaultSort), [routeKey]);
   const setSort = (value: Sort) => {
@@ -102,17 +114,24 @@ export function TrackListPage({ route }: { route: Route }) {
             <button type="button" className="btn ghost" title={t("library.scanHint")} aria-label={t("library.scanHint")} onClick={() => void app.rescan()}>
               <Icons.sync /> <span className="btn-label">{t("library.scan")}</span>
             </button>
-            <button type="button" className={`icon-btn lg${sharingOpen ? " on" : ""}`} aria-label={t("playlist.sharing")} title={t("playlist.sharing")} aria-pressed={sharingOpen} onClick={() => setSharingOpen((value) => !value)}>
-              <Icons.eye />
-            </button>
           </>
         )}
         {route.name === "liked" && <SyncButton feature="favorites" />}
+        {route.name === "recent" && (online.length > 0 || viewed) && (
+          <span className={`recent-source${remote.loading ? " loading" : ""}`} title={t("recent.sourceHelp")}>
+            <Select
+              label={t("recent.source")}
+              value={viewed}
+              onChange={setViewing}
+              options={[
+                { value: "", label: t("recent.thisDevice") },
+                ...online.map((link) => ({ value: link.deviceId, label: link.name || link.deviceId.slice(0, 7) })),
+              ]}
+            />
+          </span>
+        )}
         {playlist && (
           <>
-            <button type="button" className={`icon-btn lg${sharingOpen ? " on" : ""}`} aria-label={t("playlist.sharing")} title={t("playlist.sharing")} onClick={() => setSharingOpen((value) => !value)}>
-              {playlist.exposure === "hide" ? <Icons.eyeOff /> : <Icons.eye />}
-            </button>
             <button type="button" className="icon-btn lg" aria-label={t("playlist.rename")} title={t("playlist.rename")} onClick={() => app.renamePlaylist(playlist.id)}>
               <Icons.pencil />
             </button>
@@ -171,8 +190,6 @@ export function TrackListPage({ route }: { route: Route }) {
           <Icons.chevronDown className={sort.dir === 1 ? "up" : ""} />
         </button>
       </ActionBar>
-      {playlist && sharingOpen && <SharingPanel playlistId={playlist.id} exposure={playlist.exposure} />}
-      {route.name === "library" && sharingOpen && <LibrarySharingPanel />}
       <TrackTable
         tracks={shown}
         contextId={info.contextId}
@@ -216,83 +233,56 @@ function sortOptions(defaultSort: Sort, t: (key: string) => string, history: boo
   return options;
 }
 
-function SharingPanel({ playlistId, exposure }: { playlistId: string; exposure: string }) {
+/** Another connected device's Recently Played, asked for when chosen and shown read-only. Nothing is
+ * stored or merged here. If that device goes offline, the page goes back to this computer's list. */
+function useRemoteHistory(deviceId: string, back: () => void) {
   const { t } = useTranslation();
   const app = useApp();
-  return (
-    <div className="sharing-panel">
-      <div className="sharing-row">
-        <div>
-          <div className="setting-title">{t("playlist.exposureDefault")}</div>
-          <div className="setting-help">{t("settings.exposureHelp")}</div>
-        </div>
-        <Select
-          label={t("playlist.exposureDefault")}
-          value={exposure}
-          onChange={(value) => void api.setExposure("playlist", playlistId, value).then(app.scheduleRefresh).catch(app.say)}
-          options={[
-            { value: "follow", label: t("exposure.follow"), hint: t("exposure.followHint") },
-            { value: "expose", label: t("exposure.expose"), hint: t("exposure.exposeHint") },
-            { value: "hide", label: t("exposure.hide"), hint: t("exposure.hideHint") },
-          ]}
-        />
-      </div>
-      <div className="sharing-row">
-        <div className="setting-help">{t("settings.exposeNowHelp")}</div>
-        <div className="button-row">
-          <button type="button" className="btn soft" title={t("exposure.exposeAllHint")} onClick={() => void api.exposeMembers("playlist", playlistId, true).then(() => { app.toast(t("toast.exposed")); app.scheduleRefresh(); }).catch(app.say)}>
-            <Icons.eye /> {t("exposure.exposeAll")}
-          </button>
-          <button type="button" className="btn soft" title={t("exposure.hideAllHint")} onClick={() => void api.exposeMembers("playlist", playlistId, false).then(() => { app.toast(t("toast.hidden")); app.scheduleRefresh(); }).catch(app.say)}>
-            <Icons.eyeOff /> {t("exposure.hideAll")}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
+  const [reply, setReply] = useState<RemoteHistory | null>(null);
+  const link = app.boot?.links.find((item) => item.deviceId === deviceId);
+  const name = link?.name || deviceId.slice(0, 7);
+  const gone = Boolean(deviceId) && link?.state !== "online";
+  const backRef = useRef(back);
+  backRef.current = back;
 
-function LibrarySharingPanel() {
-  const { t } = useTranslation();
-  const app = useApp();
-  const run = (expose: boolean) =>
-    void api
-      .exposeMembers("library", "", expose)
-      .then(() => {
-        app.toast(t(expose ? "toast.exposed" : "toast.hidden"));
-        app.scheduleRefresh();
-      })
-      .catch(app.say);
-  return (
-    <div className="sharing-panel">
-      <div className="sharing-row">
-        <div>
-          <div className="setting-title">{t("settings.exposeDefault")}</div>
-          <div className="setting-help">{t("settings.exposeDefaultHelp")}</div>
-        </div>
-        <Select
-          label={t("settings.exposeDefault")}
-          value={app.settings.exposeDefault === "expose" ? "expose" : "hide"}
-          onChange={(value) => void app.setSetting("exposeDefault", value)}
-          options={[
-            { value: "hide", label: t("exposure.hideDefault"), hint: t("exposure.hideDefaultHint") },
-            { value: "expose", label: t("exposure.exposeDefault"), hint: t("exposure.exposeDefaultHint") },
-          ]}
-        />
-      </div>
-      <div className="sharing-row">
-        <div className="setting-help">{t("settings.exposeNowHelp")}</div>
-        <div className="button-row">
-          <button type="button" className="btn soft" title={t("exposure.exposeAllHint")} onClick={() => run(true)}>
-            <Icons.eye /> {t("exposure.exposeAll")}
-          </button>
-          <button type="button" className="btn soft" title={t("exposure.hideAllHint")} onClick={() => run(false)}>
-            <Icons.eyeOff /> {t("exposure.hideAll")}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
+  useEffect(() => {
+    setReply(null);
+    if (!deviceId) return;
+    let live = true;
+    const stop = listen<RemoteHistory>("remote-history", (event) => {
+      if (live && event.payload.deviceId === deviceId) setReply(event.payload);
+    });
+    void stop.then(() => (live ? api.network("view-history", { deviceId }) : null)).catch(app.say);
+    return () => {
+      live = false;
+      void stop.then((off) => off()).catch(() => {});
+    };
+  }, [deviceId]);
+
+  useEffect(() => {
+    if (!deviceId) return;
+    const error = reply?.error;
+    if (!gone && !error) return;
+    app.toast(error === "denied" ? t("recent.denied", { name }) : error === "timeout" ? t("recent.noAnswer", { name }) : t("recent.offline", { name }));
+    backRef.current();
+  }, [deviceId, gone, reply?.error]);
+
+  return useMemo(() => {
+    const seen = new Set<string>();
+    const tracks: Track[] = [];
+    let missing = 0;
+    for (const entry of reply?.entries ?? []) {
+      const track = app.index.get({ contentId: entry.contentId });
+      if (!track) {
+        missing += 1;
+        continue;
+      }
+      if (seen.has(trackKey(track))) continue;
+      seen.add(trackKey(track));
+      tracks.push(track);
+    }
+    return { tracks, missing, loading: Boolean(deviceId) && !reply };
+  }, [reply, app.index, deviceId]);
 }
 
 function usePageInfo(route: Route): PageInfo {

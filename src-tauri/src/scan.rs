@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::UNIX_EPOCH;
 
 use lofty::config::ParseOptions;
@@ -50,7 +50,6 @@ struct ExistingRow {
     content_id: Option<String>,
     mtime_ms: Option<i64>,
     size_bytes: Option<i64>,
-    exposed: i64,
     lyrics_stamp: Option<String>,
 }
 
@@ -67,6 +66,38 @@ struct Prepared {
     unreadable: bool,
 }
 
+/// Adds one finished download to the grant of its folder without rescanning the rest of the folder.
+pub fn import_downloaded_file(db: &Arc<Mutex<Db>>, directory: &Path, file: &Path) -> AppResult<ImportSummary> {
+    if !directory.is_dir() || !file.is_file() {
+        return Err(AppError::Message("file.missing".into()));
+    }
+    let path_text = directory.to_string_lossy().to_string();
+    let (grant_id, existing) = {
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+        let grant_id = guard.insert_grant("directory", &path_text)?;
+        adopt_orphans(&guard, grant_id, directory, true)?;
+        (grant_id, existing_rows(&guard, grant_id)?)
+    };
+    let files = if is_audio_candidate(file) { vec![file.to_path_buf()] } else { Vec::new() };
+    let prepared = prepare_files(directory, true, &files, &existing);
+
+    let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.conn.execute_batch("BEGIN IMMEDIATE")?;
+    match write_prepared(&guard, grant_id, &prepared, &existing) {
+        Ok((added, updated)) => match guard.conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(ImportSummary { kind: "directory".into(), path: path_text, grant_id, added, updated, missing: 0 }),
+            Err(error) => {
+                let _ = guard.conn.execute_batch("ROLLBACK");
+                Err(error.into())
+            }
+        },
+        Err(error) => {
+            let _ = guard.conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 /// Walks a grant and reads tags without holding the database, then writes the batch in one transaction.
 pub fn import_path(db: &Arc<Mutex<Db>>, path: &Path, kind: &str) -> AppResult<ImportSummary> {
     let kind = match kind {
@@ -81,30 +112,36 @@ pub fn import_path(db: &Arc<Mutex<Db>>, path: &Path, kind: &str) -> AppResult<Im
     }
     let path_text = path.to_string_lossy().to_string();
     let (grant_id, existing) = {
-        let guard = db.lock().expect("db");
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
         let grant_id = guard.insert_grant(kind, &path_text)?;
         adopt_orphans(&guard, grant_id, path, kind == "directory")?;
         (grant_id, existing_rows(&guard, grant_id)?)
     };
     let mut files = Vec::new();
+    let mut unreadable = Vec::new();
     if kind == "file" {
         if is_audio_candidate(path) {
             files.push(path.to_path_buf());
         }
     } else {
-        collect_audio(path, &mut files);
+        unreadable = collect_audio(path, &mut files);
     }
     let root_is_dir = kind == "directory";
     let prepared = prepare_files(path, root_is_dir, &files, &existing);
 
-    let guard = db.lock().expect("db");
+    let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
     guard.conn.execute_batch("BEGIN IMMEDIATE")?;
     let written = (|| {
         let (added, updated) = write_prepared(&guard, grant_id, &prepared, &existing)?;
         let seen: HashSet<&str> = prepared.iter().map(|item| item.relative.as_str()).collect();
         let mut missing = 0;
         for (relative, row) in &existing {
-            if !seen.contains(relative.as_str()) {
+            // A song inside a folder that could not be listed this time is unknown, not gone.
+            let inside_unreadable = || {
+                let absolute = path.join(relative);
+                unreadable.iter().any(|dir| absolute.starts_with(dir))
+            };
+            if !seen.contains(relative.as_str()) && !inside_unreadable() {
                 guard.conn.execute(
                     "UPDATE local_files SET access_status = 'missing', access_reason = 'file.missing'
                      WHERE local_file_id = ?1",
@@ -200,7 +237,7 @@ fn relative_under(root: &Path, file: &Path) -> Option<String> {
 
 fn existing_rows(db: &Db, grant_id: i64) -> AppResult<HashMap<String, ExistingRow>> {
     let mut stmt = db.conn.prepare(
-        "SELECT relative_path, local_file_id, content_id, mtime_ms, size_bytes, exposed, lyrics_stamp
+        "SELECT relative_path, local_file_id, content_id, mtime_ms, size_bytes, lyrics_stamp
          FROM local_files WHERE grant_id = ?1",
     )?;
     let rows = stmt.query_map(params![grant_id], |row| {
@@ -211,8 +248,7 @@ fn existing_rows(db: &Db, grant_id: i64) -> AppResult<HashMap<String, ExistingRo
                 content_id: row.get(2)?,
                 mtime_ms: row.get(3)?,
                 size_bytes: row.get(4)?,
-                exposed: row.get(5)?,
-                lyrics_stamp: row.get(6)?,
+                lyrics_stamp: row.get(5)?,
             },
         ))
     })?;
@@ -310,7 +346,6 @@ fn write_prepared(
 ) -> AppResult<(usize, usize)> {
     let mut added = 0;
     let mut updated = 0;
-    let new_exposed = if db.exposure_for_new_folder_file(grant_id)? { 1 } else { 0 };
     for item in prepared {
         let previous = existing.get(&item.relative);
         if item.unreadable {
@@ -359,16 +394,15 @@ fn write_prepared(
         let local_file_id = previous
             .map(|row| row.local_file_id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let exposed = previous.map(|row| row.exposed).unwrap_or(new_exposed);
         let folder = file.parent().map(|path| path.to_string_lossy().to_string()).unwrap_or_default();
         db.conn.execute(
             "INSERT INTO local_files(
                 local_file_id, grant_id, relative_path, absolute_path, file_name, lyrics,
                 metadata_status, metadata_reason, access_status, access_reason,
-                playback_status, playback_reason, exposed, added_at, mtime_ms, size_bytes,
+                playback_status, playback_reason, added_at, mtime_ms, size_bytes,
                 content_id, duration_ms, title, artist, album, track_number, codec,
                 sample_rate, bit_depth, video, cover_path, cover_checked, lyrics_stamp
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'available',NULL,'untried',NULL,?9,?10,?11,?12,NULL,?13,?14,?15,?16,?17,?18,?19,?20,?21,NULL,0,?22)
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'available',NULL,'untried',NULL,?9,?10,?11,NULL,?12,?13,?14,?15,?16,?17,?18,?19,?20,NULL,0,?21)
              ON CONFLICT(local_file_id) DO UPDATE SET
                 absolute_path = excluded.absolute_path,
                 file_name = excluded.file_name,
@@ -403,7 +437,6 @@ fn write_prepared(
                 read.lyrics,
                 read.metadata_status,
                 read.metadata_reason,
-                exposed,
                 now,
                 item.mtime_ms,
                 item.size,
@@ -433,21 +466,31 @@ fn write_prepared(
     Ok((added, updated))
 }
 
-fn collect_audio(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Returns the folders and entries that could not be read, so songs under them are not marked missing.
+fn collect_audio(dir: &Path, out: &mut Vec<PathBuf>) -> Vec<PathBuf> {
     // Directory junctions and symlinks can point at an ancestor. Following them
     // walks the same tree forever, so each real directory is entered once.
     let mut pending = vec![dir.to_path_buf()];
     let mut seen = HashSet::new();
+    let mut unreadable = Vec::new();
     while let Some(next) = pending.pop() {
         let key = fs::canonicalize(&next).unwrap_or_else(|_| next.clone());
         if !seen.insert(key) {
             continue;
         }
         let Ok(entries) = fs::read_dir(&next) else {
+            eprintln!("scan: could not list {}", next.display());
+            unreadable.push(next);
             continue;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                // The listing broke off part way, so any song in this folder may simply not have been seen.
+                unreadable.push(next.clone());
+                break;
+            };
             let Ok(file_type) = entry.file_type() else {
+                unreadable.push(entry.path());
                 continue;
             };
             if file_type.is_dir() && !file_type.is_symlink() && !is_reparse_point(&entry) {
@@ -460,9 +503,11 @@ fn collect_audio(dir: &Path, out: &mut Vec<PathBuf>) {
             }
         }
     }
+    unreadable
 }
 
-/// A Windows directory junction is not reported as a symlink, but it is a reparse point.
+/// A Windows directory junction or link is a reparse point that names another folder. OneDrive and other
+/// cloud folders are reparse points too but hold real files, so only a folder that reads as a link is skipped.
 #[cfg(windows)]
 fn is_reparse_point(entry: &fs::DirEntry) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -471,6 +516,7 @@ fn is_reparse_point(entry: &fs::DirEntry) -> bool {
         .metadata()
         .map(|meta| meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
         .unwrap_or(false)
+        && fs::read_link(entry.path()).is_ok()
 }
 
 #[cfg(not(windows))]
@@ -504,7 +550,7 @@ pub fn file_extension_for_codec(codec: &str) -> String {
     if AUDIO_EXT.contains(&codec.as_str()) {
         return codec;
     }
-    // Names that older versions stored from the probe instead of from the file name.
+    // Names the probe reports for some formats instead of the file extension.
     let mapped = match codec.as_str() {
         "mpeg" | "mp2" => "mp3",
         "vorbis" => "ogg",
@@ -631,8 +677,22 @@ fn sidecar_path(path: &Path) -> PathBuf {
 
 fn sidecar_lyrics(path: &Path) -> String {
     let Ok(bytes) = fs::read(sidecar_path(path)) else { return String::new() };
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
-    String::from_utf8(bytes.to_vec()).unwrap_or_default()
+    decode_lyrics(&bytes)
+}
+
+/// `.lrc` files come as UTF-8, UTF-16 with a byte order mark, or GBK on Chinese Windows.
+fn decode_lyrics(bytes: &[u8]) -> String {
+    if let Some((encoding, bom)) = encoding_rs::Encoding::for_bom(bytes) {
+        return encoding.decode_without_bom_handling(&bytes[bom..]).0.into_owned();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    if let Some(text) = encoding_rs::GB18030.decode_without_bom_handling_and_without_replacement(bytes) {
+        return text.into_owned();
+    }
+    eprintln!("scan: lyrics file is in an unknown encoding");
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// Modified time and size of the `.lrc` next to a song. Empty when there is none.
@@ -680,12 +740,17 @@ fn container_has_video(path: &Path) -> bool {
 /// Walks the top-level boxes to `moov` and looks at each track's handler type.
 /// Text inside tags or audio data can never be mistaken for a video track this way.
 fn mp4_has_video_track(file: &mut File) -> Option<bool> {
-    use std::io::{Seek as _, SeekFrom};
-    const MOOV_LIMIT: u64 = 16 * 1024 * 1024;
     let total = file.metadata().ok()?.len();
+    mp4_reader_has_video(file, total)
+}
+
+/// Box sizes come from the file, so every sum is checked: a crafted 64-bit size must end the walk, not wrap.
+fn mp4_reader_has_video<R: Read + std::io::Seek>(file: &mut R, total: u64) -> Option<bool> {
+    use std::io::SeekFrom;
+    const MOOV_LIMIT: u64 = 16 * 1024 * 1024;
     let mut pos = 0u64;
     for _ in 0..4096 {
-        if pos + 8 > total {
+        if pos.checked_add(8)? > total {
             return None;
         }
         file.seek(SeekFrom::Start(pos)).ok()?;
@@ -703,16 +768,17 @@ fn mp4_has_video_track(file: &mut File) -> Option<bool> {
         if size < header {
             return None;
         }
+        let end = pos.checked_add(size)?;
         if &head[4..8] == b"moov" {
             let len = size - header;
-            if len > MOOV_LIMIT || pos + size > total {
+            if len > MOOV_LIMIT || end > total {
                 return None;
             }
             let mut buf = vec![0u8; len as usize];
             file.read_exact(&mut buf).ok()?;
             return Some(moov_has_video(&buf));
         }
-        pos += size;
+        pos = end;
     }
     None
 }
@@ -723,7 +789,7 @@ fn mp4_boxes(buf: &[u8]) -> Vec<([u8; 4], &[u8])> {
     while at + 8 <= buf.len() {
         let size = u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize;
         let kind = [buf[at + 4], buf[at + 5], buf[at + 6], buf[at + 7]];
-        if size < 8 || at + size > buf.len() {
+        if size < 8 || at.checked_add(size).is_none_or(|end| end > buf.len()) {
             break;
         }
         out.push((kind, &buf[at + 8..at + size]));
@@ -752,7 +818,8 @@ pub struct HashJob {
 }
 
 /// The preferred file is the one the player just used; other files wait their turn by import time.
-pub fn next_hash_job(db: &Db, prefer: Option<&str>, only_prefer: bool) -> AppResult<Option<HashJob>> {
+/// Files in `waiting` failed recently and are passed over until their retry time.
+pub fn next_hash_job(db: &Db, prefer: Option<&str>, only_prefer: bool, waiting: &HashSet<String>) -> AppResult<Option<HashJob>> {
     let map = |row: &rusqlite::Row<'_>| {
         Ok(HashJob {
             local_file_id: row.get(0)?,
@@ -762,29 +829,37 @@ pub fn next_hash_job(db: &Db, prefer: Option<&str>, only_prefer: bool) -> AppRes
         })
     };
     if let Some(prefer) = prefer {
-        let job = db
-            .conn
-            .query_row(
-                "SELECT local_file_id, absolute_path, mtime_ms, size_bytes FROM local_files
-                 WHERE local_file_id = ?1 AND content_id IS NULL AND access_status = 'available'",
-                params![prefer],
-                map,
-            )
-            .ok();
-        if job.is_some() || only_prefer {
-            return Ok(job);
+        if waiting.contains(prefer) {
+            if only_prefer {
+                return Ok(None);
+            }
+        } else {
+            let job = db
+                .conn
+                .query_row(
+                    "SELECT local_file_id, absolute_path, mtime_ms, size_bytes FROM local_files
+                     WHERE local_file_id = ?1 AND content_id IS NULL AND access_status = 'available'",
+                    params![prefer],
+                    map,
+                )
+                .ok();
+            if job.is_some() || only_prefer {
+                return Ok(job);
+            }
         }
     }
-    Ok(db
-        .conn
-        .query_row(
-            "SELECT local_file_id, absolute_path, mtime_ms, size_bytes FROM local_files
-             WHERE content_id IS NULL AND access_status = 'available'
-             ORDER BY added_at LIMIT 1",
-            [],
-            map,
-        )
-        .ok())
+    let mut stmt = db.conn.prepare(
+        "SELECT local_file_id, absolute_path, mtime_ms, size_bytes FROM local_files
+         WHERE content_id IS NULL AND access_status = 'available'
+         ORDER BY added_at",
+    )?;
+    let rows = stmt.query_map([], map)?;
+    for job in rows.flatten() {
+        if !waiting.contains(&job.local_file_id) {
+            return Ok(Some(job));
+        }
+    }
+    Ok(None)
 }
 
 /// Reads the whole file in 1 MiB blocks. Runs without the database lock.
@@ -978,28 +1053,40 @@ fn bind_content(db: &Db, local_file_id: &str, content_id: &str) -> AppResult<()>
     Ok(())
 }
 
-pub fn refresh_access(db: &Db) -> AppResult<()> {
+/// Re-checks whether every song file can still be read. The disk is checked without holding the
+/// database, so a slow or sleeping drive does not stall the rest of the app.
+pub fn refresh_access(db: &Arc<Mutex<Db>>) -> AppResult<()> {
     let files: Vec<(String, String)> = {
-        let mut stmt = db
+        let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut stmt = guard
             .conn
             // Songs of a removed folder stay unavailable, whether or not their files still exist.
             .prepare("SELECT local_file_id, absolute_path FROM local_files WHERE grant_id IS NOT NULL")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    for (id, path) in files {
-        // `Path::exists` is false both when a file is gone and when it cannot be checked.
-        let (status, reason) = match fs::metadata(&path) {
-            Ok(_) => ("available", None),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ("missing", Some("file.missing")),
-            Err(_) => ("unreadable", Some("file.unreadable")),
-        };
-        db.conn.execute(
+    let checked: Vec<(String, &str, Option<&str>)> = files
+        .into_iter()
+        .map(|(id, path)| {
+            // `Path::exists` is false both when a file is gone and when it cannot be checked.
+            let (status, reason) = match fs::metadata(&path) {
+                Ok(_) => ("available", None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => ("missing", Some("file.missing")),
+                Err(_) => ("unreadable", Some("file.unreadable")),
+            };
+            (id, status, reason)
+        })
+        .collect();
+    let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+    let tx = guard.conn.unchecked_transaction()?;
+    for (id, status, reason) in checked {
+        tx.execute(
             "UPDATE local_files SET access_status = ?1, access_reason = ?2
              WHERE local_file_id = ?3 AND (access_status != ?1 OR access_status IS NULL)",
             params![status, reason, id],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1109,6 +1196,23 @@ mod tests {
     }
 
     #[test]
+    fn every_readable_local_song_is_offered_to_paired_devices_unless_incognito() {
+        let (db, _keep) = open_db();
+        let music = temp("offered");
+        fs::write(music.join("a.mp3"), b"not really audio").unwrap();
+        fs::write(music.join("b.mp3"), b"not really audio either").unwrap();
+        import_path(&db, &music, "directory").unwrap();
+        let guard = db.lock().unwrap();
+        guard.conn.execute("UPDATE local_files SET content_id = 'c-' || file_name", []).unwrap();
+        let mut offered: Vec<String> = crate::catalog::local_publishable(&guard).unwrap().into_iter().map(|row| row.content_id).collect();
+        offered.sort();
+        assert_eq!(offered, vec!["c-a.mp3".to_string(), "c-b.mp3".to_string()]);
+        assert_eq!(crate::catalog::readable_paths(&guard, "c-a.mp3").unwrap().len(), 1);
+        guard.set_device_setting("incognito", serde_json::json!(true)).unwrap();
+        assert!(crate::catalog::local_publishable(&guard).unwrap().is_empty());
+    }
+
+    #[test]
     fn lyrics_added_later_are_picked_up_by_a_rescan() {
         let (db, _keep) = open_db();
         let music = temp("lyrics");
@@ -1130,6 +1234,93 @@ mod tests {
     }
 
     fn scan_refresh(db: &Arc<Mutex<Db>>) {
-        refresh_access(&db.lock().unwrap()).unwrap();
+        refresh_access(db).unwrap();
+    }
+
+    #[test]
+    fn lyrics_in_common_encodings_are_read() {
+        assert_eq!(decode_lyrics("[00:01.00]你好".as_bytes()), "[00:01.00]你好");
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice("[00:01.00]hi".as_bytes());
+        assert_eq!(decode_lyrics(&bom), "[00:01.00]hi");
+        let (gbk, _, _) = encoding_rs::GBK.encode("[00:01.00]晴天");
+        assert_eq!(decode_lyrics(&gbk), "[00:01.00]晴天");
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "[00:01.00]晴天".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(decode_lyrics(&utf16), "[00:01.00]晴天");
+        let mut utf16be = vec![0xFE, 0xFF];
+        for unit in "abc".encode_utf16() {
+            utf16be.extend_from_slice(&unit.to_be_bytes());
+        }
+        assert_eq!(decode_lyrics(&utf16be), "abc");
+        assert_eq!(decode_lyrics(b""), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn songs_in_a_folder_that_cannot_be_listed_are_not_marked_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (db, root) = open_db();
+        let music = root.join("music");
+        let locked = music.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(music.join("a.mp3"), b"not really audio a").unwrap();
+        fs::write(locked.join("b.mp3"), b"not really audio b").unwrap();
+        import_path(&db, &music, "directory").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            // Running as root: permissions are not enforced, so the case cannot be set up here.
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let summary = import_path(&db, &music, "directory").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(summary.missing, 0);
+        let missing: i64 = db
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM local_files WHERE access_status = 'missing'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(missing, 0);
+        fs::remove_file(locked.join("b.mp3")).unwrap();
+        let summary = import_path(&db, &music, "directory").unwrap();
+        assert_eq!(summary.missing, 1);
+    }
+
+    #[test]
+    fn mp4_walk_stops_on_oversized_boxes() {
+        // A 64-bit box size near u64::MAX must end the walk instead of wrapping around.
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(b"free");
+        data.extend_from_slice(&(u64::MAX - 4).to_be_bytes());
+        data.extend_from_slice(&[0u8; 32]);
+        let total = data.len() as u64;
+        assert_eq!(mp4_reader_has_video(&mut std::io::Cursor::new(data), total), None);
+
+        let mut boxes = Vec::new();
+        boxes.extend_from_slice(&u32::MAX.to_be_bytes());
+        boxes.extend_from_slice(b"trak");
+        assert!(mp4_boxes(&boxes).is_empty());
+    }
+
+    #[test]
+    fn mp4_walk_finds_a_video_handler() {
+        fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(kind);
+            out.extend_from_slice(body);
+            out
+        }
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend_from_slice(b"vide");
+        let moov = boxed(b"moov", &boxed(b"trak", &boxed(b"mdia", &boxed(b"hdlr", &hdlr))));
+        let mut data = boxed(b"ftyp", b"isom");
+        data.extend_from_slice(&moov);
+        let total = data.len() as u64;
+        assert_eq!(mp4_reader_has_video(&mut std::io::Cursor::new(data), total), Some(true));
     }
 }

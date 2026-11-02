@@ -5,10 +5,10 @@
 ; Output is installer\Output, which is gitignored.
 
 #define MyAppName "TunePeerly"
-#define MyAppVersion "0.6.0"
+#define MyAppVersion "0.8.0"
 ; Prerelease suffix used in the installer file name only. Keep it non-empty: the
 ; OutputBaseFilename line below joins the three defines with "-", so an empty value
-; would produce "TunePeerly-0.6.0--x64-Setup".
+; would produce "TunePeerly-0.8.0--x64-Setup".
 #define MyAppRelease "alpha.1"
 #define MyAppPublisher "zhebuilds"
 #define MyAppURL "https://github.com/zhebuilds/TunePeerly"
@@ -31,7 +31,7 @@ VersionInfoCompany={#MyAppPublisher}
 VersionInfoProductName={#MyAppName} Setup
 VersionInfoVersion={#MyAppVersion}
 VersionInfoDescription={#MyAppName} {#MyAppVersion} setup
-VersionInfoCopyright=Copyright (c) 2026 {#MyAppPublisher}
+VersionInfoCopyright=Copyright (c) 2026 zhebuilds and contributors
 DefaultDirName={autopf64}\{#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 ; 64-bit Setup avoids 32-bit registry and System32 redirection. x64compatible still includes Windows 11 on ARM.
@@ -316,10 +316,10 @@ begin
     begin
       { Sandbox has a per-machine Edge updater, so an unelevated install is switched to per-machine and returns 0x80040902. }
       if (not IsAdminInstallMode) and (ExitCode = -2147219198) and
-         (MsgBox(TextEnZh(
+         (SuppressibleMsgBox(TextEnZh(
            'Microsoft Edge WebView2 Runtime has to be installed for all users. This needs an administrator account. Continue?',
            'Microsoft Edge WebView2 运行库需要为所有用户安装。这需要管理员权限。是否继续？'),
-           mbConfirmation, MB_YESNO) = IDYES) then
+           mbConfirmation, MB_YESNO, IDNO) = IDYES) then
       begin
         DownloadPage.Msg2Label.Caption := TextEnZh(
           'Approve the administrator prompt to continue.',
@@ -361,7 +361,8 @@ begin
   finally
     Missing.Free;
   end;
-  Result := MsgBox(Prompt, mbConfirmation, MB_YESNO) = IDYES;
+  { A silent install with /SUPPRESSMSGBOXES goes ahead and downloads them. }
+  Result := SuppressibleMsgBox(Prompt, mbConfirmation, MB_YESNO, IDYES) = IDYES;
 end;
 
 procedure InitializeWizard;
@@ -477,9 +478,15 @@ begin
       '无法删除 ' + Plain + '。'), mbError, MB_OK, IDOK);
 end;
 
+{ A silent uninstall must not wait on a prompt. It keeps the user data, the same as the default button. }
 function DeleteUserDataPrompt(const Roaming, Local: String): Boolean;
 begin
-  Result := MsgBox(TextEnZh(
+  if UninstallSilent then
+  begin
+    Result := False;
+    Exit;
+  end;
+  Result := SuppressibleMsgBox(TextEnZh(
     'Delete TunePeerly user data?'#13#10#13#10 +
     Roaming + #13#10 +
     Local + #13#10#13#10 +
@@ -489,7 +496,7 @@ begin
     Roaming + #13#10 +
     Local + #13#10#13#10 +
     '选“是”会删除这两个文件夹里的数据库、封面和界面缓存。音乐文件不在这两个文件夹里。'#13#10#13#10 +
-    '当前选中的是“否”。'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
+    '当前选中的是“否”。'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES;
 end;
 
 function InstallDirIsProtected(const Path: String): Boolean;
@@ -526,15 +533,21 @@ begin
     Log('Install directory was not removed: ' + AppDir);
 end;
 
+{ Silently, the rules are removed only when that needs no administrator prompt. }
 function DeleteFirewallPrompt: Boolean;
 begin
-  Result := MsgBox(TextEnZh(
+  if UninstallSilent then
+  begin
+    Result := IsAdminInstallMode;
+    Exit;
+  end;
+  Result := SuppressibleMsgBox(TextEnZh(
     'Delete the firewall rules for this copy of TunePeerly?'#13#10#13#10 +
     'Windows created them when it asked whether to allow the program. Deleting them needs an administrator account.'#13#10#13#10 +
     'Yes is selected.',
     '是否删除这一份 TunePeerly 的防火墙规则？'#13#10#13#10 +
     '这些规则是 Windows 询问是否允许程序时创建的。删除需要管理员权限。'#13#10#13#10 +
-    '当前选中的是「是」。'), mbConfirmation, MB_YESNO) = IDYES;
+    '当前选中的是「是」。'), mbConfirmation, MB_YESNO, IDYES) = IDYES;
 end;
 
 procedure RemoveFirewallRules;

@@ -2,6 +2,7 @@
 type Clock = { position: number; duration: number };
 type Transport = { playing: boolean };
 
+/** The player engine writes this computer's playback here, and every progress bar and play button reads it. */
 function createStore<T>(initial: T) {
   let value = initial;
   const listeners = new Set<() => void>();

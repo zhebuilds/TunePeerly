@@ -1,18 +1,18 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
 import { useEffect, useRef, useState } from "react";
-import { useTranslation } from "react-i18next";
-import { api, pickFolder, type BlockFlags, type Feature, type Grant } from "../api";
+import { Trans, useTranslation } from "react-i18next";
+import { api, pickFolder, type Feature, type Grant } from "../api";
 import { useApp } from "../app/model";
-import { CommitInput, DoNotUse, NotImplemented, Revise, Row, Segmented, Select, Switch } from "../components/controls";
+import { CommitInput, Row, Segmented, Select, Switch } from "../components/controls";
 import { SyncButton } from "../components/SyncButton";
 import { problemGroups } from "../lib/library";
+import { isAndroid } from "../lib/platform";
 import { Icons } from "../ui/icons";
-import { relayLabel } from "./DevicesPage";
 
 const SOURCE_URL = "https://github.com/zhebuilds/TunePeerly";
 const LICENSE_URL = "https://www.gnu.org/licenses/agpl-3.0.html";
 const TERMS_URL = `${SOURCE_URL}/blob/main/ADDITIONAL_TERMS.md`;
-const FALLBACK_VERSION = "0.6.0";
+const FALLBACK_VERSION = "0.8.0-alpha.1";
 
 function openLink(url: string) {
   if ("__TAURI_INTERNALS__" in window) {
@@ -25,34 +25,43 @@ function openLink(url: string) {
 }
 
 const FEATURES: Feature[] = ["favorites", "appearance"];
-const BLOCKS = ["manual", "source", "all"] as const;
-type BlockKey = (typeof BLOCKS)[number];
 
 export function SettingsPage() {
   const { t } = useTranslation();
   const app = useApp();
   const boot = app.boot;
   const refs = useRef<Record<string, HTMLElement | null>>({});
+  const [nameEpoch, setNameEpoch] = useState(0);
   useEffect(() => {
-    if (app.route.name === "settings" && app.route.id) {
-      refs.current[app.route.id]?.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
+    if (app.route.name !== "settings" || !app.route.id) return;
+    const id = app.route.id;
+    // Wait a frame: the app scrolls back to the top on every route change after this effect runs.
+    const frame = window.requestAnimationFrame(() => refs.current[id]?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    return () => window.cancelAnimationFrame(frame);
   }, [app.route.name, app.route.id]);
   if (!boot) return null;
   const settings = app.settings;
   const set = (key: string, value: unknown) => void app.setSetting(key, value);
   const groups = problemGroups(app.tracks);
   const problems = groups.access.length + groups.playback.length;
-  const relay = relayLabel(boot.relay, t);
+  const net = boot.network;
+  const rename = (value: string) => {
+    const name = value.trim().slice(0, 64);
+    // A blank name is not saved; remounting the field puts the current name back.
+    if (!name) {
+      setNameEpoch((epoch) => epoch + 1);
+      return;
+    }
+    void app.setSetting("displayName", name).then(app.scheduleRefresh);
+  };
 
   const sections = [
     { id: "appearance", label: t("settings.appearance") },
     { id: "library", label: t("settings.library") },
+    { id: "sync", label: t("settings.sync") },
     { id: "history", label: t("settings.history") },
     { id: "notices", label: t("settings.notices") },
-    { id: "network", label: t("settings.network") },
-    { id: "sync", label: t("settings.sync") },
-    { id: "storage", label: t("settings.storage") },
+    { id: "device", label: t("settings.thisDevice") },
     { id: "about", label: t("settings.about") },
   ];
 
@@ -83,24 +92,29 @@ export function SettingsPage() {
             ]}
           />
         </Row>
-        <Row title={t("settings.miniPlayer")} help={t("settings.miniPlayerHelp")}>
-          <Switch label={t("settings.miniPlayer")} checked={Boolean(settings.miniPlayer)} onChange={(value) => set("miniPlayer", value)} />
-        </Row>
-        <Row title={t("settings.miniTray")} help={t("settings.miniTrayHelp")}>
-          <Switch label={t("settings.miniTray")} checked={settings.miniTray !== false} onChange={(value) => set("miniTray", value)} />
-        </Row>
-        <Row title={t("settings.closeWindow")} help={t("settings.closeWindowHelp")}>
-          <Segmented
-            label={t("settings.closeWindow")}
-            value={settings.closeAction === "tray" || settings.closeAction === "quit" ? String(settings.closeAction) : "ask"}
-            onChange={(value) => set("closeAction", value === "ask" ? "" : value)}
-            options={[
-              { value: "ask", label: t("settings.closeAsk") },
-              { value: "tray", label: t("settings.closeTray") },
-              { value: "quit", label: t("settings.closeQuit") },
-            ]}
-          />
-        </Row>
+        {/* Mini player and close-to-tray are desktop window behaviours. */}
+        {!isAndroid && (
+          <>
+            <Row title={t("settings.miniPlayer")} help={t("settings.miniPlayerHelp")}>
+              <Switch label={t("settings.miniPlayer")} checked={Boolean(settings.miniPlayer)} onChange={(value) => set("miniPlayer", value)} />
+            </Row>
+            <Row title={t("settings.miniTray")} help={t("settings.miniTrayHelp")}>
+              <Switch label={t("settings.miniTray")} checked={settings.miniTray !== false} onChange={(value) => set("miniTray", value)} />
+            </Row>
+            <Row title={t("settings.closeWindow")} help={t("settings.closeWindowHelp")}>
+              <Segmented
+                label={t("settings.closeWindow")}
+                value={settings.closeAction === "tray" || settings.closeAction === "quit" ? String(settings.closeAction) : "ask"}
+                onChange={(value) => set("closeAction", value === "ask" ? "" : value)}
+                options={[
+                  { value: "ask", label: t("settings.closeAsk") },
+                  { value: "tray", label: t("settings.closeTray") },
+                  { value: "quit", label: t("settings.closeQuit") },
+                ]}
+              />
+            </Row>
+          </>
+        )}
         <Row title={t("settings.language")}>
           <Segmented
             label={t("settings.language")}
@@ -137,23 +151,54 @@ export function SettingsPage() {
         <Row title={t("settings.showUnavailable")} help={t("settings.showUnavailableHelp")}>
           <Switch label={t("settings.showUnavailable")} checked={settings.showUnavailable !== false} onChange={(value) => set("showUnavailable", value)} />
         </Row>
-        <Row title={t("settings.exposeDefault")} help={t("settings.exposeDefaultHelp")}>
-          <Select
-            label={t("settings.exposeDefault")}
-            value={settings.exposeDefault === "expose" ? "expose" : "hide"}
-            onChange={(value) => set("exposeDefault", value)}
-            options={[
-              { value: "hide", label: t("exposure.hideDefault"), hint: t("exposure.hideDefaultHint") },
-              { value: "expose", label: t("exposure.exposeDefault"), hint: t("exposure.exposeDefaultHint") },
-            ]}
-          />
-        </Row>
         <Row title={t("settings.problems")} help={t("settings.problemsHelp")}>
           <button type="button" className="btn soft" onClick={() => app.navigate({ name: "problems" })}>
             {problems > 0 && <span className="count-badge">{problems}</span>}
             {t("settings.openProblems")} <Icons.chevronRight />
           </button>
         </Row>
+        <Row title={t("settings.downloadFolder")} help={settings.downloadFolder ? <span className="mono">{settings.downloadFolder}</span> : t("settings.downloadFolderNone")}>
+          {/* Android keeps downloads in the app's own folder; there is no other folder to choose. */}
+          {!isAndroid && <button
+            type="button"
+            className="btn soft"
+            onClick={() =>
+              void pickFolder()
+                .then((folder) => {
+                  if (folder) set("downloadFolder", folder);
+                })
+                .catch(app.say)
+            }
+          >
+            <Icons.folder /> {t("common.choose")}
+          </button>}
+        </Row>
+      </section>
+
+      <section className="panel" ref={(node) => { refs.current.sync = node; }}>
+        <h2>{t("settings.sync")}</h2>
+        <p className="setting-help">{t("settings.syncHelp")}</p>
+        <p className="setting-help">{t("settings.overwritePolicyHelp")}</p>
+        {FEATURES.map((feature) => {
+          const policy = settings.overwritePolicy?.[feature];
+          return (
+            <Row key={feature} title={t(`feature.${feature}`)} help={t("settings.overwritePolicy", { feature: t(`feature.${feature}`) })}>
+              <div className="sync-feature-controls">
+                <Select
+                  label={t("settings.overwritePolicy", { feature: t(`feature.${feature}`) })}
+                  value={policy === "ask" || policy === "deny" ? policy : "silent"}
+                  onChange={(value) => set("overwritePolicy", { ...(settings.overwritePolicy ?? {}), [feature]: value })}
+                  options={[
+                    { value: "silent", label: t("devices.overwriteSilent") },
+                    { value: "ask", label: t("devices.overwriteAsk") },
+                    { value: "deny", label: t("devices.overwriteDeny") },
+                  ]}
+                />
+                <SyncButton feature={feature} compact />
+              </div>
+            </Row>
+          );
+        })}
       </section>
 
       <section className="panel" ref={(node) => { refs.current.history = node; }}>
@@ -169,26 +214,6 @@ export function SettingsPage() {
               if (Number.isFinite(cap) && cap >= 1 && cap <= 10000) set("historyCap", cap);
               else app.setNotice(t("settings.historyCapInvalid"));
             }}
-          />
-        </Row>
-        <Row title={<span className="setting-title-line">{t("settings.historySync")}<Revise /></span>} help={t("settings.historySyncHelp")}>
-          <Switch
-            label={t("settings.historySync")}
-            checked={Boolean(settings.historySync)}
-            onChange={(value) => {
-              void app.setSetting("historySync", value).then(() => {
-                if (!value) void app.setSetting("historyStartup", false);
-                else void api.network("sync", { feature: "history", refresh: true }).catch(() => { });
-              });
-            }}
-          />
-        </Row>
-        <Row title={<span className="setting-title-line">{t("settings.historyStartup")}<Revise /></span>} help={t("settings.historyStartupHelp")}>
-          <Switch
-            label={t("settings.historyStartup")}
-            checked={Boolean(settings.historySync && settings.historyStartup)}
-            disabled={!settings.historySync}
-            onChange={(value) => set("historyStartup", value)}
           />
         </Row>
         <Row title={t("settings.historyPause")} help={t("settings.historyPauseHelp")}>
@@ -210,18 +235,6 @@ export function SettingsPage() {
               }
               void app.setSetting("silenceSeconds", seconds);
             }}
-          />
-        </Row>
-        <Row title={<span className="setting-title-line">{t("settings.conflictPolicy")}<Revise /></span>} help={t("settings.conflictPolicyHelp")}>
-          <Select
-            label={t("settings.conflictPolicy")}
-            value={settings.conflictPolicy === "keep" || settings.conflictPolicy === "take" ? settings.conflictPolicy : "ask"}
-            onChange={(value) => set("conflictPolicy", value)}
-            options={[
-              { value: "ask", label: t("settings.conflictAsk") },
-              { value: "keep", label: t("settings.conflictKeep") },
-              { value: "take", label: t("settings.conflictTake") },
-            ]}
           />
         </Row>
       </section>
@@ -254,143 +267,30 @@ export function SettingsPage() {
         </Row>
       </section>
 
-      <section className="panel" ref={(node) => { refs.current.network = node; }}>
-        <h2>{t("settings.network")}</h2>
+      <section className="panel" ref={(node) => { refs.current.device = node; }}>
+        <h2>{t("settings.thisDevice")}</h2>
         {settings.incognito && (
           <div className="banner warn">
             <Icons.incognito /> <span>{t("settings.networkIncognito")}</span>
           </div>
         )}
-        <Row title={t("settings.discovery")} help={t("settings.discoveryHelp")}>
-          <Switch label={t("settings.discovery")} checked={Boolean(settings.discovery)} onChange={(value) => set("discovery", value)} />
+        <p className="setting-help">{t("settings.thisDeviceHelp")}</p>
+        <Row title={t("devices.name")} help={t("devices.nameHelp")}>
+          <CommitInput key={nameEpoch} label={t("devices.name")} value={boot.deviceName} width={260} onCommit={rename} />
         </Row>
-        <Row title={<span className="setting-title-line">{t("settings.autoSend")}<Revise /></span>} help={t("settings.autoSendHelp")}>
-          <div className="chip-row">
-            {FEATURES.map((feature) => {
-              const on = Boolean(settings.autoSend?.[feature]);
-              return (
-                <button
-                  key={feature}
-                  type="button"
-                  className={`chip small${on ? " on" : ""}`}
-                  aria-pressed={on}
-                  onClick={() => set("autoSend", { ...(settings.autoSend ?? {}), [feature]: !on })}
-                >
-                  {t(`feature.${feature}`)}
-                </button>
-              );
-            })}
-          </div>
+        <Row title={t("settings.lanPort")} help={t("settings.lanPortHelp")}>
+          <code className="mono small selectable" data-testid="lan-port">{net?.tcpPort || "—"}</code>
         </Row>
-        <Row title={<span className="setting-title-line">{t("settings.positionSync")}<DoNotUse /></span>} help={t("settings.positionSyncHelp")}>
-          <Select
-            label={t("settings.positionSync")}
-            value={String(settings.positionSyncDevice ?? "")}
-            disabled={Boolean(settings.incognito)}
-            onChange={(value) => set("positionSyncDevice", value)}
-            options={[
-              { value: "", label: t("settings.positionSyncOff") },
-              ...boot.links
-                .filter((link) => link.deviceId !== boot.deviceId && (link.state === "online" || link.deviceId === settings.positionSyncDevice))
-                .map((link) => ({ value: link.deviceId, label: link.name || link.deviceId })),
-            ]}
-          />
+        <Row title={t("settings.discoveryUdp")}>
+          <code className="mono small selectable" data-testid="discovery-port">{net?.discovery ? net.udpPort : t("settings.discoveryOff")}</code>
         </Row>
-        <h3><span className="setting-title-line">{t("settings.relay")}<NotImplemented /><DoNotUse /></span></h3>
-        <p className="setting-help">
-          {t("settings.relayHelp")} <span className={`state-pill ${relay.tone}`}>{relay.text}</span>
-        </p>
-        <Row title={t("settings.relayHost")}>
-          <CommitInput label={t("settings.relayHost")} width={240} value={String(settings.relayHost ?? "")} placeholder="relay.example.com" onCommit={(value) => set("relayHost", value.trim())} />
+        <Row title={t("settings.discoveryGroup")}>
+          <code className="mono small selectable" data-testid="discovery-group">{net?.discovery ? net.multicastGroup : t("settings.discoveryOff")}</code>
         </Row>
-        <Row title={t("settings.relayPort")}>
-          <CommitInput
-            label={t("settings.relayPort")}
-            type="number"
-            width={110}
-            value={String(settings.relayPort ?? 22067)}
-            onCommit={(value) => {
-              const port = Number(value);
-              if (Number.isInteger(port) && port > 0 && port < 65536) set("relayPort", port);
-              else app.setNotice(t("settings.portInvalid"));
-            }}
-          />
+        <Row title={t("settings.lanAddresses")} help={t("settings.lanAddressesHelp")}>
+          <code className="mono small selectable" data-testid="lan-addresses">{net?.discovery && net.addresses.length > 0 ? net.addresses.join(", ") : "—"}</code>
         </Row>
-        <Row title={t("settings.relayId")} help={t("settings.relayIdHelp")}>
-          <CommitInput label={t("settings.relayId")} width={320} value={String(settings.relayDeviceId ?? "")} placeholder="XXXXXXX-XXXXXXX-…" onCommit={(value) => set("relayDeviceId", value.trim())} />
-        </Row>
-        <Row title={t("settings.relayToken")}>
-          <CommitInput label={t("settings.relayToken")} width={240} secret value={String(settings.relayToken ?? "")} onCommit={(value) => set("relayToken", value.trim())} />
-        </Row>
-      </section>
-
-      <section className="panel" ref={(node) => { refs.current.sync = node; }}>
-        <h2>{t("settings.sync")}<Revise /></h2>
-        <p className="setting-help">{t("settings.syncHelp")}</p>
-        <Row title={t("settings.requestDevice")} help={t("settings.requestDeviceHelp")}>
-          <Select
-            label={t("settings.requestDevice")}
-            value={String(settings.syncRequestDevice ?? "")}
-            onChange={(value) => set("syncRequestDevice", value)}
-            options={[{ value: "", label: t("sync.requestNone") }, ...boot.links.map((link) => ({ value: link.deviceId, label: link.name || link.deviceId }))]}
-          />
-        </Row>
-        <Row title={t("settings.overwriteMode")} help={t("settings.overwriteModeHelp")}>
-          <Select
-            label={t("settings.overwriteMode")}
-            value={settings.overwriteMode === "ask" ? "ask" : "silent"}
-            onChange={(value) => set("overwriteMode", value)}
-            options={[
-              { value: "silent", label: t("devices.overwriteSilent") },
-              { value: "ask", label: t("devices.overwriteAsk") },
-            ]}
-          />
-        </Row>
-        <SyncTable />
-      </section>
-
-      <section className="panel" ref={(node) => { refs.current.storage = node; }}>
-        <h2>{t("settings.storage")}</h2>
-        <Row title={t("settings.downloadFolder")} help={settings.downloadFolder ? <span className="mono">{settings.downloadFolder}</span> : t("settings.downloadFolderNone")}>
-          <button
-            type="button"
-            className="btn soft"
-            onClick={() =>
-              void pickFolder()
-                .then((folder) => {
-                  if (folder) set("downloadFolder", folder);
-                })
-                .catch(app.say)
-            }
-          >
-            <Icons.folder /> {t("common.choose")}
-          </button>
-        </Row>
-        <Row
-          title={<span className="setting-title-line">{t("settings.lanPort")}<Revise /></span>}
-          help={
-            <>
-              <div>{t("settings.lanPortHelp", { port: boot.listenPort || "—" })}</div>
-              {boot.portFallback ? <div className="setting-error">{t("settings.portFallback", { saved: boot.portFallback, port: boot.listenPort || "—" })}</div> : null}
-            </>
-          }
-        >
-          <CommitInput
-            label={t("settings.lanPort")}
-            type="number"
-            width={110}
-            value={String(settings.listenPort || "")}
-            onCommit={(value) => {
-              const port = Number(value);
-              if (!Number.isInteger(port) || port < 1024 || port > 65535) {
-                app.setNotice(t("settings.portInvalid"));
-                return;
-              }
-              void app.setSetting("listenPort", port).then(() => app.scheduleRefresh());
-            }}
-          />
-        </Row>
-        <Row title={<span className="setting-title-line">{t("settings.deviceId")}<Revise /></span>}>
+        <Row title={t("settings.deviceId")}>
           <code className="mono small selectable">{boot.certId}</code>
         </Row>
       </section>
@@ -427,35 +327,18 @@ function AboutPanel({ nodeRef }: { nodeRef: (node: HTMLElement | null) => void }
         </div>
       </div>
       <p className="setting-help about-summary">{t("about.summary")}</p>
-      <h3>{t("about.credits")}</h3>
-      <p className="setting-help">{t("about.creditsOriginal")}</p>
-      <p className="setting-help">{t("about.creditsModify")}</p>
-      <Row title={t("about.license")} help={t("about.licenseHelp")}>
+      <Row
+        title={t("about.copyright")}
+        help={<Trans i18nKey="about.licenseLine" components={{ terms: <button type="button" className="about-terms" onClick={() => openLink(TERMS_URL)} /> }} />}
+      >
         <button type="button" className="btn soft" onClick={() => openLink(LICENSE_URL)}>
           {t("about.licenseName")} <Icons.external />
         </button>
-      </Row>
-      <Row title={t("about.additionalTerms")}>
-        <button type="button" className="btn soft" onClick={() => openLink(TERMS_URL)}>
-          {t("about.open")} <Icons.external />
-        </button>
-      </Row>
-      <Row
-        title={t("about.source")}
-        help={
-          <>
-            <div className="mono selectable about-url">{SOURCE_URL}</div>
-            <div>{t("about.sourceNote")}</div>
-          </>
-        }
-      >
         <button type="button" className="btn soft" onClick={() => openLink(SOURCE_URL)}>
-          {t("about.open")} <Icons.external />
+          {t("about.source")} <Icons.external />
         </button>
       </Row>
-      <Row title={t("about.author")} help={t("about.copyright")} />
       <Row title={t("about.privacy")} help={t("about.privacyHelp")} />
-      <Row title={t("about.components")} help={t("about.componentsHelp")} />
     </section>
   );
 }
@@ -479,25 +362,9 @@ function GrantRow({ grant }: { grant: Grant }) {
           {grant.path}
         </div>
         <div className="setting-help">
-          {grant.kind === "directory" ? t("list.songCount", { count }) : t("settings.singleFile")} · {t("settings.exposeNowHelp")}
+          {grant.kind === "directory" ? t("list.songCount", { count }) : t("settings.singleFile")}
         </div>
       </div>
-      <Select
-        label={t("playlist.exposureDefault")}
-        value={grant.exposure}
-        onChange={(value) => void api.setExposure("grant", String(grant.id), value).then(refresh).catch(app.say)}
-        options={[
-          { value: "follow", label: t("exposure.follow"), hint: t("exposure.followHint") },
-          { value: "expose", label: t("exposure.expose"), hint: t("exposure.exposeHint") },
-          { value: "hide", label: t("exposure.hide"), hint: t("exposure.hideHint") },
-        ]}
-      />
-      <button type="button" className="icon-btn" title={`${t("exposure.exposeAll")}: ${t("exposure.exposeAllHint")}`} aria-label={t("exposure.exposeAll")} onClick={() => void api.exposeMembers("grant", String(grant.id), true).then(() => { app.toast(t("toast.exposed")); refresh(); }).catch(app.say)}>
-        <Icons.eye />
-      </button>
-      <button type="button" className="icon-btn" title={`${t("exposure.hideAll")}: ${t("exposure.hideAllHint")}`} aria-label={t("exposure.hideAll")} onClick={() => void api.exposeMembers("grant", String(grant.id), false).then(() => { app.toast(t("toast.hidden")); refresh(); }).catch(app.say)}>
-        <Icons.eyeOff />
-      </button>
       <button
         type="button"
         className="icon-btn danger"
@@ -517,115 +384,5 @@ function GrantRow({ grant }: { grant: Grant }) {
         <Icons.trash />
       </button>
     </div>
-  );
-}
-
-function SyncTable() {
-  const { t } = useTranslation();
-  const app = useApp();
-  const boot = app.boot!;
-  const settings = app.settings;
-  const sources = settings.syncSources ?? {};
-  const blocks = settings.syncBlocks ?? {};
-  const disabled = Boolean(settings.incognito);
-
-  const setBlocks = (next: Partial<Record<string, BlockFlags>>) => void app.setSetting("syncBlocks", next);
-  const flag = (feature: Feature, block: BlockKey) => Boolean(blocks[feature]?.[block]);
-  const toggle = (feature: Feature, block: BlockKey, value: boolean) => {
-    const current = { ...(blocks[feature] ?? {}) };
-    if (block === "all") {
-      for (const key of BLOCKS) current[key] = value;
-    } else {
-      current[block] = value;
-      if (!value) current.all = false;
-    }
-    setBlocks({ ...blocks, [feature]: current });
-  };
-  const globalState = (block: BlockKey) => {
-    const count = FEATURES.filter((feature) => flag(feature, block)).length;
-    return count === 0 ? "off" : count === FEATURES.length ? "on" : "mixed";
-  };
-  const toggleGlobal = (block: BlockKey) => {
-    const value = globalState(block) !== "on";
-    const next = { ...blocks };
-    for (const feature of FEATURES) {
-      const current = { ...(next[feature] ?? {}) };
-      if (block === "all") {
-        for (const key of BLOCKS) current[key] = value;
-      } else {
-        current[block] = value;
-        if (!value) current.all = false;
-      }
-      next[feature] = current;
-    }
-    setBlocks(next);
-  };
-  const setSource = (feature: Feature, value: string) => void app.setSetting("syncSources", { ...sources, [feature]: value || boot.deviceId });
-
-  return (
-    <div className={`sync-table${disabled ? " disabled" : ""}`}>
-      <div className="sync-head">
-        <span>{t("sync.feature")}</span>
-        <span title={t("sync.sourceHelp")}>{t("sync.source")}</span>
-        <span title={t("sync.blockManualHelp")}>{t("sync.blockManual")}</span>
-        <span title={t("sync.blockSourceHelp")}>{t("sync.blockSource")}</span>
-        <span title={t("sync.blockAllHelp")}>{t("sync.blockAll")}</span>
-        <span />
-      </div>
-      <div className="sync-row global">
-        <span className="sync-name">{t("sync.everything")}</span>
-        <span className="muted small">{t("sync.globalHelp")}</span>
-        {BLOCKS.map((block) => (
-          <span key={block} className="sync-check">
-            <Check state={globalState(block)} label={t(`sync.block${block[0].toUpperCase()}${block.slice(1)}`)} onChange={() => toggleGlobal(block)} />
-          </span>
-        ))}
-        <span />
-      </div>
-      {FEATURES.map((feature) => {
-        const stored = sources[feature] ?? "";
-        const remote = stored && stored !== boot.deviceId ? stored : "";
-        const online = boot.links.filter((link) => link.state === "online" && link.deviceId !== boot.deviceId);
-        const options = [{ value: "", label: t("sync.thisDevice") }, ...online.map((link) => ({ value: link.deviceId, label: link.name }))];
-        if (remote && !options.some((item) => item.value === remote)) {
-          const current = boot.links.find((link) => link.deviceId === remote);
-          if (current) options.push({ value: current.deviceId, label: current.name });
-        }
-        const pending = boot.pending.find((item) => item.feature === feature);
-        return (
-          <div className="sync-row" key={feature}>
-            <span className="sync-name">
-              {t(`feature.${feature}`)}
-              {settings.dirty?.[feature] && <span className="dirty-dot" title={t("sync.dirty")} />}
-              {pending && <span className="state-pill pending small">{t("sync.waiting")}</span>}
-            </span>
-            <span className="sync-follow">
-              <Select
-                label={t("sync.source")}
-                value={remote}
-                onChange={(value) => setSource(feature, value)}
-                options={options}
-              />
-            </span>
-            {BLOCKS.map((block) => (
-              <span key={block} className="sync-check">
-                <Check state={flag(feature, block) ? "on" : "off"} label={t(`sync.block${block[0].toUpperCase()}${block.slice(1)}`)} onChange={(value) => toggle(feature, block, value)} />
-              </span>
-            ))}
-            <span>
-              <SyncButton feature={feature} compact />
-            </span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-function Check({ state, label, onChange }: { state: "on" | "off" | "mixed"; label: string; onChange: (value: boolean) => void }) {
-  return (
-    <button type="button" role="checkbox" aria-checked={state === "mixed" ? "mixed" : state === "on"} aria-label={label} className={`check ${state}`} onClick={() => onChange(state !== "on")}>
-      {state === "on" ? <Icons.check /> : state === "mixed" ? <span className="dash" /> : null}
-    </button>
   );
 }

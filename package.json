@@ -1,13 +1,13 @@
 {
   "name": "tunepeerly",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.8.0-alpha.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test src/player/advance.test.ts src/lib/lrc.test.ts",
+    "test": "node --experimental-strip-types --test src/player/advance.test.ts src/lib/lrc.test.ts src/lib/devices.test.ts src/player/nativePlan.test.ts",
     "tauri": "tauri"
   },
   "dependencies": {
