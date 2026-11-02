@@ -132,38 +132,20 @@ Windows 上先装好 WSL2 和 Ubuntu：用管理员身份打开 PowerShell，执
 
 第一次构建要编译 OpenSSL，需要几分钟。
 
-### 发布版 APK
+### 验证官方 APK
 
-发布版 APK 需要签名密钥。只需创建一次，放在仓库之外：
+官方 APK 发布在 [GitHub Releases](https://github.com/zhebuilds/TunePeerly/releases)，签名证书的 SHA-256 指纹是：
+
+```
+f02eb081eabeb8b1a4b77ab1d4a7325722d6cda978226066e15ef423e759f2f0
+```
+
+可以用 Android SDK 的 `apksigner` 核对：
 
 ```sh
-keytool -genkeypair -keystore ~/tunepeerly-release.jks -alias tunepeerly -keyalg RSA -keysize 3072 -validity 10000
+apksigner verify --print-certs TunePeerly-<版本>-arm64-v8a.apk
 ```
 
-然后设置这些环境变量：
+输出里 `certificate SHA-256 digest` 那一行应该和上面一致。下载的文件可以用发布页上的 `SHA256SUMS.txt` 核对是否完整。
 
-```sh
-export TUNEPEERLY_KEYSTORE=$HOME/tunepeerly-release.jks
-export TUNEPEERLY_KEYSTORE_PASSWORD=...
-export TUNEPEERLY_KEY_ALIAS=tunepeerly
-export TUNEPEERLY_KEY_PASSWORD=...
-```
-
-或者写进 `src-tauri/gen/android/keystore.properties`（git 会忽略这个文件）：
-
-```properties
-storeFile=/home/you/tunepeerly-release.jks
-storePassword=...
-keyAlias=tunepeerly
-keyPassword=...
-```
-
-再构建：
-
-```sh
-npm run tauri android build -- --target aarch64 --apk
-```
-
-签好名的 APK 在 `src-tauri/gen/android/app/build/outputs/apk/universal/release/`。在 WSL2 里，用 `cp` 把它复制到 `/mnt/c` 下的文件夹就能在 Windows 上拿到，例如 `cp src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk /mnt/c/Users/<你的 Windows 用户名>/Downloads/`。
-
-没有密钥时，发布版 APK 不会签名，Android 无法安装。每次更新都必须用同一个密钥签名，否则 Android 不允许覆盖安装旧版本。
+自己构建的发布版需要用自己的密钥签名（通过 `TUNEPEERLY_KEYSTORE`、`TUNEPEERLY_KEYSTORE_PASSWORD`、`TUNEPEERLY_KEY_ALIAS`、`TUNEPEERLY_KEY_PASSWORD` 环境变量设置）。它的签名和官方版本不同，不能覆盖安装官方版本，反过来也一样。
