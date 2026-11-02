@@ -98,6 +98,10 @@ On Windows, install WSL2 with Ubuntu first by running `wsl --install -d Ubuntu` 
    export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
    export ANDROID_HOME=$HOME/android-sdk
    export NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370
+   export NDK_BIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+   export AR_aarch64_linux_android=$NDK_BIN/llvm-ar
+   export RANLIB_aarch64_linux_android=$NDK_BIN/llvm-ranlib
+   export RANLIB=$NDK_BIN/llvm-ranlib
    export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH
    ENV
    source ~/.bashrc
@@ -106,6 +110,8 @@ On Windows, install WSL2 with Ubuntu first by running `wsl --install -d Ubuntu` 
    ```
 
    On an ARM64 machine, `JAVA_HOME` is `/usr/lib/jvm/java-17-openjdk-arm64`.
+
+   NDK r23 and later no longer ship `aarch64-linux-android-ranlib`, which the OpenSSL build looks for. `AR_aarch64_linux_android`, `RANLIB_aarch64_linux_android`, and `RANLIB` point it to the NDK's `llvm-ar` and `llvm-ranlib` instead.
 
 5. Clone the repository into your Linux home folder. In WSL2, do not build from a Windows folder under `/mnt/c`: it is many times slower, and `node_modules` installed by Windows does not work in Linux.
 
@@ -126,38 +132,20 @@ On Windows, install WSL2 with Ubuntu first by running `wsl --install -d Ubuntu` 
 
 The first build compiles OpenSSL and takes a few minutes.
 
-### Release APK
+### Verifying official APKs
 
-A release APK needs a signing key. Create one once and keep it outside the repository:
+Official APKs are published on [GitHub Releases](https://github.com/zhebuilds/TunePeerly/releases). The SHA-256 fingerprint of the signing certificate is:
+
+```
+f02eb081eabeb8b1a4b77ab1d4a7325722d6cda978226066e15ef423e759f2f0
+```
+
+Check it with `apksigner` from the Android SDK:
 
 ```sh
-keytool -genkeypair -keystore ~/tunepeerly-release.jks -alias tunepeerly -keyalg RSA -keysize 3072 -validity 10000
+apksigner verify --print-certs TunePeerly-<version>-arm64-v8a.apk
 ```
 
-Then either set these environment variables:
+The `certificate SHA-256 digest` line should match the value above. Check that a download is complete with `SHA256SUMS.txt` from the release page.
 
-```sh
-export TUNEPEERLY_KEYSTORE=$HOME/tunepeerly-release.jks
-export TUNEPEERLY_KEYSTORE_PASSWORD=...
-export TUNEPEERLY_KEY_ALIAS=tunepeerly
-export TUNEPEERLY_KEY_PASSWORD=...
-```
-
-or write them to `src-tauri/gen/android/keystore.properties`, which git ignores:
-
-```properties
-storeFile=/home/you/tunepeerly-release.jks
-storePassword=...
-keyAlias=tunepeerly
-keyPassword=...
-```
-
-and build:
-
-```sh
-npm run tauri android build -- --target aarch64 --apk
-```
-
-The signed APK is in `src-tauri/gen/android/app/build/outputs/apk/universal/release/`. In WSL2, copy it to Windows with `cp` into a folder under `/mnt/c`, for example `cp src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk /mnt/c/Users/<your Windows user>/Downloads/`.
-
-Without a key the release APK is built unsigned, and Android will not install it. Every update has to be signed with the same key, or Android refuses to install it over the old version.
+A release build you make yourself has to be signed with your own key, set through the `TUNEPEERLY_KEYSTORE`, `TUNEPEERLY_KEYSTORE_PASSWORD`, `TUNEPEERLY_KEY_ALIAS`, and `TUNEPEERLY_KEY_PASSWORD` environment variables. Its signature differs from the official one, so it cannot be installed over an official release, or the other way round.
