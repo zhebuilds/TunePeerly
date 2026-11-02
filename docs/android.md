@@ -49,13 +49,80 @@ Some phones stop background apps aggressively to save battery. If playback stops
 
 ## Build from source
 
-You need Node.js, Rust with the Android targets, the Android SDK and NDK, and JDK 17. See the [Tauri Android prerequisites](https://v2.tauri.app/start/prerequisites/#android).
+Android builds run on Linux or macOS. On Windows, build in WSL2 (Ubuntu). The library database uses SQLCipher, and its build compiles OpenSSL, which needs a Unix-style Perl and `make`. Strawberry Perl and the Perl that comes with Git for Windows cannot configure OpenSSL for Android, so a native Windows Android build fails. The Windows desktop build in the [README](../README.md#develop) is not affected.
 
-```sh
-rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
-npm install
-npm run tauri android build -- --debug --target aarch64 --apk
-```
+You need Node.js, Rust with the Android targets, JDK 17, the Android SDK with platform 36 and build tools 36.0.0, and NDK 30.0.16248370. See also the [Tauri Android prerequisites](https://v2.tauri.app/start/prerequisites/#android).
+
+### Linux and WSL2
+
+On Windows, install WSL2 with Ubuntu first by running `wsl --install -d Ubuntu` in PowerShell as administrator, then run every command below in the Ubuntu terminal. On Linux, run them in a normal terminal. The commands are for Ubuntu and Debian.
+
+1. Install the system packages:
+
+   ```sh
+   sudo apt update
+   sudo apt install -y build-essential perl make pkg-config git curl unzip openjdk-17-jdk
+   ```
+
+2. Install Rust and the Android targets:
+
+   ```sh
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+   source ~/.cargo/env
+   rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
+   ```
+
+3. Install Node.js with [nvm](https://github.com/nvm-sh/nvm):
+
+   ```sh
+   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+   source ~/.bashrc
+   nvm install --lts
+   ```
+
+4. Install the Android SDK command-line tools, the SDK packages, and the NDK. Android Studio is not needed. The download link for the newest command-line tools is on the [Android Studio download page](https://developer.android.com/studio#command-line-tools-only).
+
+   ```sh
+   mkdir -p ~/android-sdk/cmdline-tools && cd ~/android-sdk/cmdline-tools
+   curl -o tools.zip https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip
+   unzip -q tools.zip && mv cmdline-tools latest && rm tools.zip
+   cat >> ~/.bashrc <<'ENV'
+   export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+   export ANDROID_HOME=$HOME/android-sdk
+   export NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370
+   export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH
+   ENV
+   source ~/.bashrc
+   yes | sdkmanager --licenses
+   sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;30.0.16248370"
+   ```
+
+   On an ARM64 machine, `JAVA_HOME` is `/usr/lib/jvm/java-17-openjdk-arm64`.
+
+5. Clone the repository into your Linux home folder. In WSL2, do not build from a Windows folder under `/mnt/c`: it is many times slower, and `node_modules` installed by Windows does not work in Linux.
+
+   ```sh
+   cd ~
+   git clone https://github.com/zhebuilds/TunePeerly.git
+   cd TunePeerly
+   npm install
+   ```
+
+6. Build a debug APK:
+
+   ```sh
+   npm run tauri android build -- --debug --target aarch64 --apk
+   ```
+
+   The APK is in `src-tauri/gen/android/app/build/outputs/apk/universal/debug/`.
+
+The first build compiles OpenSSL and takes a few minutes.
+
+### macOS
+
+Install the Xcode command line tools with `xcode-select --install`, which provide `perl` and `make`. Install JDK 17, and install the Android SDK and NDK with Android Studio or the macOS command-line tools, using the same `sdkmanager` packages as above. Set `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME`, then run steps 2, 3, 5, and 6.
+
+### Release APK
 
 A release APK needs a signing key. Create one once and keep it outside the repository:
 
@@ -86,5 +153,7 @@ and build:
 ```sh
 npm run tauri android build -- --target aarch64 --apk
 ```
+
+The signed APK is in `src-tauri/gen/android/app/build/outputs/apk/universal/release/`. In WSL2, copy it to Windows with `cp` into a folder under `/mnt/c`, for example `cp src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk /mnt/c/Users/<your Windows user>/Downloads/`.
 
 Without a key the release APK is built unsigned, and Android will not install it. Every update has to be signed with the same key, or Android refuses to install it over the old version.

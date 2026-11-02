@@ -55,6 +55,8 @@ The library database is encrypted with SQLCipher. The build compiles its own cop
 - Windows: install [Strawberry Perl](https://strawberryperl.com/) and make sure `perl` in your terminal is Strawberry Perl, not the Perl that comes with Git for Windows. `nmake` comes with the Visual Studio C++ build tools that Rust already needs. [NASM](https://www.nasm.us/) is optional: with `nasm` on PATH OpenSSL is built with its faster assembly code, without it OpenSSL is built without assembly.
 - Linux and macOS: `perl` and `make` are usually already installed.
 
+This is for the desktop app. To build the Android app, see [Android: Build from source](docs/android.md#build-from-source). On Windows, Android builds run in WSL2.
+
 ```powershell
 npm install
 npm run tauri dev

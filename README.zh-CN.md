@@ -55,6 +55,8 @@ Get-FileHash -Algorithm SHA256 .\TunePeerly-0.6.0-alpha.1-x64-Setup.exe
 - Windows：安装 [Strawberry Perl](https://strawberryperl.com/)，并确认终端里的 `perl` 是 Strawberry Perl，而不是 Git for Windows 自带的 Perl。`nmake` 随 Rust 本来就需要的 Visual Studio C++ 生成工具一起安装。[NASM](https://www.nasm.us/) 可选：PATH 里有 `nasm` 时，OpenSSL 会带上更快的汇编代码；没有时，OpenSSL 不用汇编编译。
 - Linux 和 macOS：一般已经装好了 `perl` 和 `make`。
 
+以上是桌面版的要求。构建 Android 版见 [Android：从源码构建](docs/android.zh-CN.md#从源码构建)。Windows 上的 Android 版要在 WSL2 里构建。
+
 ```powershell
 npm install
 npm run tauri dev

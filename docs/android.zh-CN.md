@@ -49,13 +49,80 @@ Android 不允许应用直接读取你的音乐文件夹。请在 **设置 → �
 
 ## 从源码构建
 
-需要 Node.js、带 Android 目标的 Rust、Android SDK 和 NDK，以及 JDK 17。见 [Tauri 的 Android 环境要求](https://v2.tauri.app/start/prerequisites/#android)。
+Android 版在 Linux 或 macOS 上构建。Windows 上请在 WSL2（Ubuntu）里构建：音乐库数据库用 SQLCipher，构建时要编译 OpenSSL，而 OpenSSL 的构建需要类 Unix 的 Perl 和 `make`。Strawberry Perl 和 Git for Windows 自带的 Perl 都无法为 Android 配置 OpenSSL，所以在原生 Windows 上构建 Android 版会失败。[README](../README.zh-CN.md#开发) 里的 Windows 桌面版构建不受影响。
 
-```sh
-rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
-npm install
-npm run tauri android build -- --debug --target aarch64 --apk
-```
+需要 Node.js、带 Android 目标的 Rust、JDK 17、带 platform 36 和 build tools 36.0.0 的 Android SDK，以及 NDK 30.0.16248370。另见 [Tauri 的 Android 环境要求](https://v2.tauri.app/start/prerequisites/#android)。
+
+### Linux 和 WSL2
+
+Windows 上先装好 WSL2 和 Ubuntu：用管理员身份打开 PowerShell，执行 `wsl --install -d Ubuntu`，之后下面的命令都在 Ubuntu 终端里执行。Linux 上在普通终端里执行即可。这些命令适用于 Ubuntu 和 Debian。
+
+1. 安装系统依赖：
+
+   ```sh
+   sudo apt update
+   sudo apt install -y build-essential perl make pkg-config git curl unzip openjdk-17-jdk
+   ```
+
+2. 安装 Rust 和 Android 目标：
+
+   ```sh
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+   source ~/.cargo/env
+   rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
+   ```
+
+3. 用 [nvm](https://github.com/nvm-sh/nvm) 安装 Node.js：
+
+   ```sh
+   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+   source ~/.bashrc
+   nvm install --lts
+   ```
+
+4. 安装 Android SDK 命令行工具、SDK 组件和 NDK，不需要 Android Studio。最新命令行工具的下载链接见 [Android Studio 下载页](https://developer.android.com/studio#command-line-tools-only)。
+
+   ```sh
+   mkdir -p ~/android-sdk/cmdline-tools && cd ~/android-sdk/cmdline-tools
+   curl -o tools.zip https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip
+   unzip -q tools.zip && mv cmdline-tools latest && rm tools.zip
+   cat >> ~/.bashrc <<'ENV'
+   export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+   export ANDROID_HOME=$HOME/android-sdk
+   export NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370
+   export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH
+   ENV
+   source ~/.bashrc
+   yes | sdkmanager --licenses
+   sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;30.0.16248370"
+   ```
+
+   ARM64 机器上，`JAVA_HOME` 是 `/usr/lib/jvm/java-17-openjdk-arm64`。
+
+5. 把仓库克隆到 Linux 的主目录。在 WSL2 里不要在 `/mnt/c` 下的 Windows 文件夹里构建：那样会慢很多倍，而且 Windows 装的 `node_modules` 在 Linux 里不能用。
+
+   ```sh
+   cd ~
+   git clone https://github.com/zhebuilds/TunePeerly.git
+   cd TunePeerly
+   npm install
+   ```
+
+6. 构建调试版 APK：
+
+   ```sh
+   npm run tauri android build -- --debug --target aarch64 --apk
+   ```
+
+   APK 在 `src-tauri/gen/android/app/build/outputs/apk/universal/debug/`。
+
+第一次构建要编译 OpenSSL，需要几分钟。
+
+### macOS
+
+用 `xcode-select --install` 安装 Xcode 命令行工具，它带有 `perl` 和 `make`。安装 JDK 17，再用 Android Studio 或 macOS 版命令行工具安装 Android SDK 和 NDK，组件和上面 `sdkmanager` 装的一样。设置好 `JAVA_HOME`、`ANDROID_HOME` 和 `NDK_HOME`，然后执行第 2、3、5、6 步。
+
+### 发布版 APK
 
 发布版 APK 需要签名密钥。只需创建一次，放在仓库之外：
 
@@ -86,5 +153,7 @@ keyPassword=...
 ```sh
 npm run tauri android build -- --target aarch64 --apk
 ```
+
+签好名的 APK 在 `src-tauri/gen/android/app/build/outputs/apk/universal/release/`。在 WSL2 里，用 `cp` 把它复制到 `/mnt/c` 下的文件夹就能在 Windows 上拿到，例如 `cp src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk /mnt/c/Users/<你的 Windows 用户名>/Downloads/`。
 
 没有密钥时，发布版 APK 不会签名，Android 无法安装。每次更新都必须用同一个密钥签名，否则 Android 不允许覆盖安装旧版本。
