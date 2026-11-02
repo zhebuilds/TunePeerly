@@ -367,7 +367,7 @@
     "nearby": "Nearby",
     "discoveryOff": "Discovery is off. Turn on the switch above to find computers running this app on your network.",
     "discovery": "Discover nearby devices",
-    "discoveryHelp": "Announces this computer on the local network a few times a minute. Shares only the device name, never song names.",
+    "discoveryHelp": "Announces this computer on the local network every few seconds. Shares the device name, device ID, port, and LAN addresses, never song names.",
     "noNearby": "Looking for computers running this app on your network…",
     "refreshNearby": "Refresh",
     "refreshNearbyHelp": "Look for nearby devices again now. Devices that have left drop off the list.",
@@ -389,9 +389,6 @@
     "noBlocked": "No blocked devices.",
     "blockHelp": "A blocked device cannot connect to this computer. Its requests are dropped, and it only sees a connection failure. You can still see it in this list.",
     "connect": "Connect",
-    "paste": "Pair with text",
-    "pasteHelp": "Paste the pairing text from the other computer.",
-    "pastePlaceholder": "Paste pairing text here",
     "networkOff": "All network features are off. This computer is not reachable.",
     "incognitoOff": "Incognito is on. Discovery, sync and sharing are paused.",
     "overwriteDeny": "Don't allow"
@@ -401,9 +398,6 @@
     "pending": "Waiting for confirmation",
     "offline": "Offline",
     "failed": "Connection failed"
-  },
-  "manual": {
-    "badText": "That pairing text is not valid."
   },
   "relay": {
     "off": "Relay not set up",
@@ -561,7 +555,7 @@
     "downloadFolderNone": "Not set. You'll be asked on the first download.",
     "lanPort": "TCP listening port",
     "lanPortHelp": "Picked automatically from the free ports each time the app starts or the network is turned back on. It cannot be set.",
-    "portInvalid": "Enter a port between 1024 and 65535.",
+    "portInvalid": "Enter a port between 1 and 65535.",
     "deviceId": "Device ID",
     "about": "About",
     "overwritePolicy": "When another device sends {{feature}}",
@@ -609,7 +603,7 @@
     "busy": "{{name}} has too many questions waiting, so {{feature}} was not taken",
     "declined": "{{name}} declined {{feature}}",
     "timeout": "{{name}} didn't answer (timed out); {{feature}} not changed",
-    "noResponse": "{{name}} sent no result (timed out). It may run an older version.",
+    "noResponse": "{{name}} sent no result (timed out)",
     "offline": "{{name}} disconnected before answering",
     "incognito": "{{name}} is in incognito, so {{feature}} was not taken"
   }

@@ -363,7 +363,7 @@
     "nearby": "附近",
     "discoveryOff": "附近设备发现已关闭。打开上方的开关，就能找到同一网络中运行本应用的电脑。",
     "discovery": "发现附近设备",
-    "discoveryHelp": "每隔几秒在局域网里广播一次这台电脑。只公开设备名，不公开歌名。",
+    "discoveryHelp": "每隔几秒在局域网里宣布一次这台电脑，内容包括设备名、设备标识、端口和局域网地址，不包括歌名。",
     "noNearby": "正在查找网络中运行本应用的电脑…",
     "refreshNearby": "刷新",
     "refreshNearbyHelp": "立即重新查找附近设备，已离开的设备会从列表中消失。",
@@ -385,9 +385,6 @@
     "noBlocked": "没有拉黑的设备。",
     "blockHelp": "被拉黑的设备无法连接这台电脑。它发来的请求会被直接丢掉，对方只看到连接失败。你可以在这个清单里看到它。",
     "connect": "连接",
-    "paste": "用文本配对",
-    "pasteHelp": "粘贴另一台电脑的配对文本。",
-    "pastePlaceholder": "在此粘贴配对文本",
     "networkOff": "所有网络功能都已关闭，其他设备无法连到这台电脑。",
     "incognitoOff": "已开启无痕模式，设备发现、同步和共享已暂停。",
     "overwriteDeny": "不允许"
@@ -397,9 +394,6 @@
     "pending": "等待确认",
     "offline": "离线",
     "failed": "连接失败"
-  },
-  "manual": {
-    "badText": "配对文本无效。"
   },
   "relay": {
     "off": "未设置中继",
@@ -555,7 +549,7 @@
     "downloadFolderNone": "未设置，第一次下载时会询问。",
     "lanPort": "TCP 监听端口",
     "lanPortHelp": "每次启动或重新打开网络时，自动选一个空闲端口，不能手动指定。",
-    "portInvalid": "请输入 1024 到 65535 之间的端口。",
+    "portInvalid": "请输入 1 到 65535 之间的端口。",
     "deviceId": "设备标识",
     "about": "关于",
     "overwritePolicy": "其他设备发送{{feature}}时",
@@ -602,7 +596,7 @@
     "busy": "{{name}} 待确认的请求太多，没有接收{{feature}}",
     "declined": "{{name}} 拒绝了{{feature}}",
     "timeout": "{{name}} 未响应（超时），{{feature}}没有改",
-    "noResponse": "{{name}} 没有回复结果（超时），可能是旧版本",
+    "noResponse": "{{name}} 没有回复结果（超时）",
     "offline": "{{name}} 在回复前断开了",
     "incognito": "{{name}} 处于无痕模式，没有接收{{feature}}"
   }
