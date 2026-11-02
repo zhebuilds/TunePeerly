@@ -8,7 +8,8 @@ package com.zhebuilds.tunepeerly
  * song that ends with the screen off is followed by the same song the page would pick.
  *
  * Songs are keys (content id, or the local file id before hashing). `playable` says whether the phone's
- * player can start a key; others are passed over. No Android classes, so it is tested on the JVM.
+ * player can start a key; others are passed over but stay in the queue, so a song that cannot play now
+ * (not in the catalog yet) is not lost from the Queue tab. No Android classes, so it is tested on the JVM.
  */
 class NativeQueue(
   private val playable: (String) -> Boolean,
@@ -53,17 +54,40 @@ class NativeQueue(
     future = ArrayList(list.drop(1))
   }
 
-  /** The song ended (not repeat one): what follows. False when nothing does and the music stops. */
+  /**
+   * Moves to the first song in `future` the phone can start. Songs before it that it cannot start stay
+   * at the front of `future`. False, with nothing changed, when none can start.
+   */
+  private fun takeFromFuture(): Boolean {
+    val index = future.indexOfFirst(playable)
+    if (index < 0) return false
+    val skipped = future.subList(0, index).toList()
+    val picked = future[index]
+    val rest = future.subList(index + 1, future.size).toList()
+    current?.let { past.add(it) }
+    while (past.size > PAST_LIMIT) past.removeAt(0)
+    current = picked
+    future = ArrayList(skipped + rest)
+    return true
+  }
+
+  /**
+   * The song ended (not repeat one): what follows. False when nothing does and the music stops; the
+   * queue is then left as it was, so the page still shows what was coming.
+   */
   fun afterEnd(): Boolean {
     if (future.isNotEmpty()) {
-      moveTo(ArrayList(future))
-      return passOver()
+      if (takeFromFuture()) return true
+      // Queued songs, none playable now: keep them, and stop rather than jump elsewhere.
+      if (repeat != "list") return false
     }
     if (repeat == "list") {
-      val source = pool.filter(playable).ifEmpty { playedOrder() }
+      val source = pool.filter(playable).ifEmpty { playedOrder().filter(playable) }
       if (source.isEmpty()) return false
+      val waiting = future.filter { it !in source }
       moveTo(if (order == "manual") source else shuffled(source))
-      return passOver()
+      future.addAll(waiting)
+      return current != null
     }
     // Nothing queued: keep playing from the whole library.
     val all = library.filter(playable)
@@ -79,24 +103,23 @@ class NativeQueue(
     contextId = if (order == "libraryRandom") "random" else "library"
     pool = library
     moveTo(list)
-    return passOver()
+    return current != null
   }
 
   /** Next on the lock screen (`nextOrWrap`). False when it only starts the same song over. */
   fun next(): Boolean {
-    if (future.isNotEmpty()) {
-      moveTo(ArrayList(future))
-      return passOver()
-    }
+    if (future.isNotEmpty() && takeFromFuture()) return true
     val list = pool.filter(playable)
     if (list.isEmpty()) return false
+    val waiting = future.filter { it !in list }
     val first = list[0]
     val rest = list.drop(1)
     val cur = current
     if (cur != null && cur != first) past.add(cur)
     current = first
     future = if (order == "manual") ArrayList(rest) else shuffled(rest)
-    return passOver()
+    future.addAll(waiting)
+    return true
   }
 
   /** Previous on the lock screen (`previous`). False when it only starts the same song over. */
@@ -117,16 +140,6 @@ class NativeQueue(
       return true
     }
     return false
-  }
-
-  /** Moves past songs the phone cannot start. False when none is left. */
-  private fun passOver(): Boolean {
-    var guard = 0
-    while (current != null && !playable(current!!) && guard++ < 10_000) {
-      past.add(current!!)
-      current = if (future.isNotEmpty()) future.removeAt(0) else null
-    }
-    return current != null
   }
 
   companion object {

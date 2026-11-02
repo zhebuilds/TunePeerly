@@ -93,6 +93,8 @@ export class NativeAudio extends EventTarget {
   private loadSeq = 0;
   private plan: QueuePlan | null = null;
   private planSent = "";
+  /** The phone's player turned the last queue down as stale: the next one goes even if it looks the same. */
+  private forceNext = false;
   private librarySent = "";
   private poolSent = "";
   private catalogSent = "";
@@ -239,7 +241,14 @@ export class NativeAudio extends EventTarget {
   /** The queue and its rules. The pool and library are sent again only when they changed. */
   setPlan(plan: QueuePlan): void {
     this.plan = plan;
-    this.sendPlan(false);
+    const force = this.forceNext;
+    this.forceNext = false;
+    this.sendPlan(force);
+  }
+
+  /** Sends the page's queue again as it is, with the newest change count. */
+  resend(): void {
+    this.sendPlan(true);
   }
 
   private sendPlan(force: boolean): void {
@@ -305,7 +314,9 @@ export class NativeAudio extends EventTarget {
   /** A report from the phone's player. */
   receive(event: NativeEvent): void {
     if (event.t === "queue") {
-      if (event.rev > this.rev) this.rev = event.rev;
+      // The phone's player keeps the count; it starts over at 0 when its process was restarted.
+      this.rev = event.rev;
+      if (event.reason === "stale") this.forceNext = true;
       if (event.seq < this.loadSeq) {
         // The page loaded another song after this move; the phone's player plays that one now. Send
         // the page's queue again so both agree.

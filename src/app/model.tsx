@@ -6,7 +6,8 @@ import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove
 import i18n from "../i18n";
 import { isAndroid } from "../lib/platform";
 import { nativeAudio, type CatalogSong, type QueueEvent } from "../player/native";
-import { albumParts, displayTitle, filterText, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
+import { followedFuture, nativeQueueable } from "../player/nativePlan";
+import { albumParts, displayTitle, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
 import {
   addToQueue,
   continueLibrary,
@@ -410,10 +411,13 @@ function useModel() {
     }
   }, []);
 
-  const rebuildPool = useCallback((state: QueueState): Track[] => {
-    if (state.order === "libraryRandom") return (bootRef.current?.tracks ?? []).filter(shufflable);
+  /** The list the queue starts over from. `forNative`: what the phone's player may hold (`nativeQueueable`). */
+  const rebuildPool = useCallback((state: QueueState, forNative = false): Track[] => {
+    if (state.order === "libraryRandom") {
+      return (bootRef.current?.tracks ?? []).filter((track) => shufflable(track) || (forNative && nativeQueueable(track) && track.playbackStatus !== "failed"));
+    }
     const list = context.current.id === state.contextId && context.current.tracks ? context.current.tracks : contextTracks(state.contextId);
-    return list.filter((track) => track.playable);
+    return list.filter(forNative ? nativeQueueable : (track) => track.playable);
   }, [contextTracks]);
 
   const loadLyrics = useCallback((track: Track | undefined) => {
@@ -963,7 +967,9 @@ function useModel() {
     const timer = window.setTimeout(() => {
       const songs: CatalogSong[] = [];
       for (const track of boot.tracks) {
-        if (!track.playable || track.video) continue;
+        // A linked device's songs stay in even while it is offline, so the phone's player keeps them
+        // queued and waits for the link instead of dropping them.
+        if (!nativeQueueable(track)) continue;
         const local = track.absolutePath && track.accessStatus === "available" && track.badge !== "remote";
         const cover = track.coverUrl && !/^(data:|blob:|https?:)/.test(track.coverUrl) ? track.coverUrl : null;
         songs.push({
@@ -999,8 +1005,8 @@ function useModel() {
         repeat: state.repeat,
         order: state.order,
         contextId: state.contextId,
-        pool: rebuildPool(state).map(trackKey),
-        library: contextTracks("library").filter((track) => track.playable).map(trackKey),
+        pool: rebuildPool(state, true).map(trackKey),
+        library: contextTracks("library").filter(nativeQueueable).map(trackKey),
       });
     }, 250);
     return () => window.clearTimeout(timer);
@@ -1008,8 +1014,12 @@ function useModel() {
 
   const followNative = useRef<(event: QueueEvent) => void>(() => {});
   followNative.current = (event: QueueEvent) => {
-    // Nothing loaded in the phone's player (the app just started): the page's own saved queue stays.
-    if (event.id === 0 || !event.current) return;
+    // Nothing loaded in the phone's player (the app just started): the page's own saved queue stays,
+    // and goes to the player again with the change count it reported.
+    if (event.id === 0 || !event.current) {
+      native?.resend();
+      return;
+    }
     const ref = (key: string): TrackRef => {
       const track = indexRef.current.get({ key });
       return track ? refOf(track) : { key, contentId: null, localFileId: null };
@@ -1022,7 +1032,7 @@ function useModel() {
       contextId: event.contextId,
       past: event.past.map(ref),
       current: ref(event.current),
-      future: event.future.map(ref),
+      future: followedFuture(prior.future, event.future.map(ref), event.ended),
       positionSec: 0,
     };
     if (state.contextId !== prior.contextId) {
@@ -1075,15 +1085,6 @@ function useModel() {
   useEffect(() => {
     loadLyrics(shown ?? undefined);
   }, [shown, loadLyrics, lyricsEpoch]);
-
-  const findTracks = useCallback((text: string, scope: "all" | "queue" | string) => {
-    if (scope === "queue") {
-      const state = queueRef.current;
-      return filterText([state.current, ...state.future].map((item) => indexRef.current.get(item)).filter((item): item is Track => Boolean(item)), text);
-    }
-    if (scope.startsWith("playlist:")) return filterText(indexRef.current.members(membersRef.current[scope.slice(9)] ?? []), text);
-    return null;
-  }, []);
 
   return {
     boot,
@@ -1160,7 +1161,6 @@ function useModel() {
     movePlaylistMember,
     moveLibrary,
     contextTracks,
-    findTracks,
   };
 }
 

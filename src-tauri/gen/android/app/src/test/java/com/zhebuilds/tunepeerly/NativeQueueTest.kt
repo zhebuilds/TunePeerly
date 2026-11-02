@@ -4,7 +4,6 @@ package com.zhebuilds.tunepeerly
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -69,11 +68,53 @@ class NativeQueueTest {
     assertEquals(setOf("b", "c", "d"), (listOf(q.current!!) + q.future).toSet())
   }
 
-  @Test fun passesOverSongsItCannotPlay() {
+  @Test fun passesOverSongsItCannotPlayButKeepsThemQueued() {
     val q = queue("b")
+    q.current = "a"; q.future = arrayListOf("b", "c", "d")
+    assertTrue(q.afterEnd())
+    assertEquals("c", q.current)
+    assertEquals(listOf("b", "d"), q.future)
+    assertEquals(listOf("a"), q.past)
+  }
+
+  @Test fun anOfflineSongStaysInTheQueueAndPlaysOnceItCan() {
+    val missing = HashSet<String>(listOf("b"))
+    val q = NativeQueue({ it !in missing }, java.util.Random(7))
     q.current = "a"; q.future = arrayListOf("b", "c")
     assertTrue(q.afterEnd())
     assertEquals("c", q.current)
+    assertEquals(listOf("b"), q.future)
+    missing.clear()
+    assertTrue(q.afterEnd())
+    assertEquals("b", q.current)
+    assertEquals(emptyList<String>(), q.future)
+  }
+
+  @Test fun nothingPlayableLeavesTheQueueAlone() {
+    val q = queue("b", "c")
+    q.library = listOf("a", "x", "y")
+    q.current = "a"; q.future = arrayListOf("b", "c")
+    assertFalse(q.afterEnd())
+    assertEquals("a", q.current)
+    assertEquals(listOf("b", "c"), q.future)
+    assertEquals(emptyList<String>(), q.past)
+  }
+
+  @Test fun repeatAllKeepsSongsThatCannotPlayYet() {
+    val q = queue("b")
+    q.repeat = "list"; q.pool = listOf("a", "b", "c")
+    q.current = "c"; q.future = arrayListOf("b")
+    assertTrue(q.afterEnd())
+    assertEquals("a", q.current)
+    assertTrue(q.future.contains("b"))
+  }
+
+  @Test fun nextPassesOverButKeepsSongsItCannotPlay() {
+    val q = queue("b")
+    q.pool = listOf("a", "b", "c"); q.current = "a"; q.future = arrayListOf("b", "c")
+    assertTrue(q.next())
+    assertEquals("c", q.current)
+    assertEquals(listOf("b"), q.future)
   }
 
   @Test fun nextWrapsToTheStartOfTheList() {
@@ -103,6 +144,8 @@ class NativeQueueTest {
     val missing = queue("x")
     missing.current = "a"; missing.future = arrayListOf("x")
     assertFalse(missing.afterEnd())
-    assertNull(missing.current)
+    // The song that cannot play is still queued for when it can.
+    assertEquals("a", missing.current)
+    assertEquals(listOf("x"), missing.future)
   }
 }
