@@ -3442,8 +3442,12 @@ body.resizing * {
   margin-bottom: 4px;
 }
 
-.about-url {
-  overflow-wrap: anywhere;
+.about-terms {
+  text-decoration: underline;
+}
+
+.about-terms:hover {
+  color: var(--text);
 }
 
 .panel > .button-row {

@@ -41,10 +41,10 @@ GitHub 上发布的版本用 [Inno Setup](installer/TunePeerly.iss) 打包。安
 
 数据库和缓存不跟着这个选择走，也不能单独修改。数据库始终在 `%APPDATA%\TunePeerly`。封面和界面缓存始终在 `%LOCALAPPDATA%\TunePeerly`。
 
-下载的安装包是 `TunePeerly-0.6.0-alpha.1-x64-Setup.exe`。在这个文件所在的文件夹打开 PowerShell，算出它的 SHA256，再和发布页上这个文件的 SHA256 对照。两串一致再安装。
+下载的安装包是 `TunePeerly-0.8.0-alpha.1-x64-Setup.exe`。在这个文件所在的文件夹打开 PowerShell，算出它的 SHA256，再和发布页上这个文件的 SHA256 对照。两串一致再安装。
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\TunePeerly-0.6.0-alpha.1-x64-Setup.exe
+Get-FileHash -Algorithm SHA256 .\TunePeerly-0.8.0-alpha.1-x64-Setup.exe
 ```
 
 ## 开发
@@ -81,7 +81,7 @@ npm run tauri build -- --no-bundle
 & "${env:ProgramFiles}\Inno Setup 7\ISCC.exe" installer\TunePeerly.iss
 ```
 
-`npm run tauri build -- --no-bundle` 只生成可执行文件，不生成安装包。安装包写到 `installer\Output\TunePeerly-0.6.0-alpha.1-x64-Setup.exe`。`installer\Output` 被 git 忽略。也可以用 Inno Setup 打开 `installer\TunePeerly.iss` 后编译。
+`npm run tauri build -- --no-bundle` 只生成可执行文件，不生成安装包。安装包写到 `installer\Output\TunePeerly-0.8.0-alpha.1-x64-Setup.exe`。`installer\Output` 被 git 忽略。也可以用 Inno Setup 打开 `installer\TunePeerly.iss` 后编译。
 
 编译停在 `EndUpdateResource failed (110)` 时，是往新安装包写入图标的时候文件被占用了。Windows Defender 实时扫描会锁住这个未签名的 exe，安全中心不会弹出提示。等几秒后重新执行上面的 `ISCC.exe` 命令，不要紧接着失败立刻再编译。如果还是 这样，把仓库里的 `installer\Output` 加进 Windows 安全中心的排除项后再编译。路径是：病毒和威胁防护 → 管理设置 → 排除项 → 添加排除项 → 文件夹。
 

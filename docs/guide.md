@@ -2,7 +2,7 @@ English | [简体中文](guide.zh-CN.md)
 
 # TunePeerly user guide
 
-TunePeerly (声渡) plays audio files on this computer and shares them with computers you pair. There is no account. This guide matches version 0.6.0. Version 0.6.0 is an alpha test release. The program is not guaranteed to match this guide.
+TunePeerly (声渡) plays audio files on this computer and shares them with computers you pair. There is no account. This guide matches version 0.8.0-alpha.1. Version 0.8.0-alpha.1 is an alpha test release. The program is not guaranteed to match this guide.
 
 ## Install
 

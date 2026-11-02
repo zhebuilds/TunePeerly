@@ -41,10 +41,10 @@ GitHub releases are packed with [Inno Setup](installer/TunePeerly.iss). The inst
 
 The database and the cache do not follow that choice, and they cannot be changed on their own. The database is always `%APPDATA%\TunePeerly`. Covers and the window cache are always in `%LOCALAPPDATA%\TunePeerly`.
 
-The downloaded installer is `TunePeerly-0.6.0-alpha.1-x64-Setup.exe`. In that file's folder, open PowerShell, compute its SHA256, and compare it with the SHA256 shown for this file on the release page. Install it when the two strings match.
+The downloaded installer is `TunePeerly-0.8.0-alpha.1-x64-Setup.exe`. In that file's folder, open PowerShell, compute its SHA256, and compare it with the SHA256 shown for this file on the release page. Install it when the two strings match.
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\TunePeerly-0.6.0-alpha.1-x64-Setup.exe
+Get-FileHash -Algorithm SHA256 .\TunePeerly-0.8.0-alpha.1-x64-Setup.exe
 ```
 
 ## Develop
@@ -81,7 +81,7 @@ npm run tauri build -- --no-bundle
 & "${env:ProgramFiles}\Inno Setup 7\ISCC.exe" installer\TunePeerly.iss
 ```
 
-`npm run tauri build -- --no-bundle` builds the executable only. It does not create an installer. The setup program is written to `installer\Output\TunePeerly-0.6.0-alpha.1-x64-Setup.exe`. `installer\Output` is gitignored. You can also open `installer\TunePeerly.iss` in Inno Setup and compile it.
+`npm run tauri build -- --no-bundle` builds the executable only. It does not create an installer. The setup program is written to `installer\Output\TunePeerly-0.8.0-alpha.1-x64-Setup.exe`. `installer\Output` is gitignored. You can also open `installer\TunePeerly.iss` in Inno Setup and compile it.
 
 A compile that stops at `EndUpdateResource failed (110)` means the new setup program was locked while its icons were being written. Windows Defender real-time scanning locks that unsigned exe, and Windows Security does not show a prompt. Wait a few seconds and run the `ISCC.exe` command above again. Do not compile again immediately after the failure. If it is still 110, add the repository's `installer\Output` folder to the Windows Security exclusions and compile again: Virus & threat protection → Manage settings → Exclusions → Add an exclusion → Folder.
 

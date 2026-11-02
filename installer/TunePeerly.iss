@@ -5,10 +5,10 @@
 ; Output is installer\Output, which is gitignored.
 
 #define MyAppName "TunePeerly"
-#define MyAppVersion "0.6.0"
+#define MyAppVersion "0.8.0"
 ; Prerelease suffix used in the installer file name only. Keep it non-empty: the
 ; OutputBaseFilename line below joins the three defines with "-", so an empty value
-; would produce "TunePeerly-0.6.0--x64-Setup".
+; would produce "TunePeerly-0.8.0--x64-Setup".
 #define MyAppRelease "alpha.1"
 #define MyAppPublisher "zhebuilds"
 #define MyAppURL "https://github.com/zhebuilds/TunePeerly"
@@ -31,7 +31,7 @@ VersionInfoCompany={#MyAppPublisher}
 VersionInfoProductName={#MyAppName} Setup
 VersionInfoVersion={#MyAppVersion}
 VersionInfoDescription={#MyAppName} {#MyAppVersion} setup
-VersionInfoCopyright=Copyright (c) 2026 {#MyAppPublisher}
+VersionInfoCopyright=Copyright (c) 2026 zhebuilds and contributors
 DefaultDirName={autopf64}\{#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 ; 64-bit Setup avoids 32-bit registry and System32 redirection. x64compatible still includes Windows 11 on ARM.

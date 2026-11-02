@@ -1,6 +1,6 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
 import { useEffect, useRef, useState } from "react";
-import { useTranslation } from "react-i18next";
+import { Trans, useTranslation } from "react-i18next";
 import { api, pickFolder, type Feature, type Grant } from "../api";
 import { useApp } from "../app/model";
 import { CommitInput, Row, Segmented, Select, Switch } from "../components/controls";
@@ -12,7 +12,7 @@ import { Icons } from "../ui/icons";
 const SOURCE_URL = "https://github.com/zhebuilds/TunePeerly";
 const LICENSE_URL = "https://www.gnu.org/licenses/agpl-3.0.html";
 const TERMS_URL = `${SOURCE_URL}/blob/main/ADDITIONAL_TERMS.md`;
-const FALLBACK_VERSION = "0.6.0";
+const FALLBACK_VERSION = "0.8.0-alpha.1";
 
 function openLink(url: string) {
   if ("__TAURI_INTERNALS__" in window) {
@@ -327,35 +327,18 @@ function AboutPanel({ nodeRef }: { nodeRef: (node: HTMLElement | null) => void }
         </div>
       </div>
       <p className="setting-help about-summary">{t("about.summary")}</p>
-      <h3>{t("about.credits")}</h3>
-      <p className="setting-help">{t("about.creditsOriginal")}</p>
-      <p className="setting-help">{t("about.creditsModify")}</p>
-      <Row title={t("about.license")} help={t("about.licenseHelp")}>
+      <Row
+        title={t("about.copyright")}
+        help={<Trans i18nKey="about.licenseLine" components={{ terms: <button type="button" className="about-terms" onClick={() => openLink(TERMS_URL)} /> }} />}
+      >
         <button type="button" className="btn soft" onClick={() => openLink(LICENSE_URL)}>
           {t("about.licenseName")} <Icons.external />
         </button>
-      </Row>
-      <Row title={t("about.additionalTerms")}>
-        <button type="button" className="btn soft" onClick={() => openLink(TERMS_URL)}>
-          {t("about.open")} <Icons.external />
-        </button>
-      </Row>
-      <Row
-        title={t("about.source")}
-        help={
-          <>
-            <div className="mono selectable about-url">{SOURCE_URL}</div>
-            <div>{t("about.sourceNote")}</div>
-          </>
-        }
-      >
         <button type="button" className="btn soft" onClick={() => openLink(SOURCE_URL)}>
-          {t("about.open")} <Icons.external />
+          {t("about.source")} <Icons.external />
         </button>
       </Row>
-      <Row title={t("about.author")} help={t("about.copyright")} />
       <Row title={t("about.privacy")} help={t("about.privacyHelp")} />
-      <Row title={t("about.components")} help={t("about.componentsHelp")} />
     </section>
   );
 }
