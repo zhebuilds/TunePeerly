@@ -98,6 +98,10 @@ Windows 上先装好 WSL2 和 Ubuntu：用管理员身份打开 PowerShell，执
    export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
    export ANDROID_HOME=$HOME/android-sdk
    export NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370
+   export NDK_BIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+   export AR_aarch64_linux_android=$NDK_BIN/llvm-ar
+   export RANLIB_aarch64_linux_android=$NDK_BIN/llvm-ranlib
+   export RANLIB=$NDK_BIN/llvm-ranlib
    export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH
    ENV
    source ~/.bashrc
@@ -106,6 +110,8 @@ Windows 上先装好 WSL2 和 Ubuntu：用管理员身份打开 PowerShell，执
    ```
 
    ARM64 机器上，`JAVA_HOME` 是 `/usr/lib/jvm/java-17-openjdk-arm64`。
+
+   NDK r23 起已经没有 `aarch64-linux-android-ranlib`，编译 OpenSSL 时会找不到它，所以要用 `AR_aarch64_linux_android`、`RANLIB_aarch64_linux_android` 和 `RANLIB` 指定 NDK 自带的 `llvm-ar` 和 `llvm-ranlib`。
 
 5. 把仓库克隆到 Linux 的主目录。在 WSL2 里不要在 `/mnt/c` 下的 Windows 文件夹里构建：那样会慢很多倍，而且 Windows 装的 `node_modules` 在 Linux 里不能用。
 

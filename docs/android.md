@@ -98,6 +98,10 @@ On Windows, install WSL2 with Ubuntu first by running `wsl --install -d Ubuntu` 
    export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
    export ANDROID_HOME=$HOME/android-sdk
    export NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370
+   export NDK_BIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+   export AR_aarch64_linux_android=$NDK_BIN/llvm-ar
+   export RANLIB_aarch64_linux_android=$NDK_BIN/llvm-ranlib
+   export RANLIB=$NDK_BIN/llvm-ranlib
    export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH
    ENV
    source ~/.bashrc
@@ -106,6 +110,8 @@ On Windows, install WSL2 with Ubuntu first by running `wsl --install -d Ubuntu` 
    ```
 
    On an ARM64 machine, `JAVA_HOME` is `/usr/lib/jvm/java-17-openjdk-arm64`.
+
+   NDK r23 and later no longer ship `aarch64-linux-android-ranlib`, which the OpenSSL build looks for. `AR_aarch64_linux_android`, `RANLIB_aarch64_linux_android`, and `RANLIB` point it to the NDK's `llvm-ar` and `llvm-ranlib` instead.
 
 5. Clone the repository into your Linux home folder. In WSL2, do not build from a Windows folder under `/mnt/c`: it is many times slower, and `node_modules` installed by Windows does not work in Linux.
 
