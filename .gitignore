@@ -28,3 +28,12 @@ temp/*
 
 # Inno Setup compiler output
 installer/Output/
+
+# Signing keys and secrets are never committed
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+.env
+.env.*
