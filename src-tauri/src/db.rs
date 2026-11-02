@@ -71,12 +71,16 @@ pub struct Db {
 /// The library database, encrypted with the key in `db.key` beside it.
 /// A database that key cannot open (the key file lost, or sealed under another Windows account) is
 /// renamed aside with its key file and a new library starts, so the app still opens and the old
-/// file stays recoverable by whoever has the right key.
+/// file stays recoverable by whoever has the right key. On Android a key that cannot be read stops the
+/// start instead, because the Keystore can fail for a moment and the library must not be replaced then.
 fn open_encrypted(database: &Path) -> AppResult<Connection> {
     let key_file = database.with_file_name(dbkey::KEY_NAME);
     let key = match dbkey::load_or_create(&key_file) {
         Ok(key) => key,
-        Err(err) if database.exists() => {
+        // Android: a Keystore error can be passing. Failing to start keeps the library and the device
+        // identity (and with it every pairing); moving them aside would lose both. Windows keeps its
+        // documented behaviour: a key sealed under another account starts a new library.
+        Err(err) if database.exists() && !cfg!(target_os = "android") => {
             set_aside(database, &key_file, &err.to_string())?;
             dbkey::load_or_create(&key_file)?
         }
