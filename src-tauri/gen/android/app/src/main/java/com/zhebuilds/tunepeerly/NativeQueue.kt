@@ -126,8 +126,12 @@ class NativeQueue(
   fun previous(positionSec: Double): Boolean {
     if (positionSec > 3) return false
     val cur = current
-    if (past.isNotEmpty()) {
-      val prior = past.removeAt(past.size - 1)
+    // The latest earlier song the phone's player can start. Newer ones that it cannot start (a video,
+    // a song that is gone) are dropped from the history; nothing changes when none can start.
+    val at = past.indexOfLast(playable)
+    if (at >= 0) {
+      val prior = past[at]
+      while (past.size > at) past.removeAt(past.size - 1)
       cur?.let { future.add(0, it) }
       current = prior
       return true

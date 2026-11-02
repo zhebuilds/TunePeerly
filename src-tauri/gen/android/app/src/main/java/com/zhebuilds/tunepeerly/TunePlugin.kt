@@ -387,7 +387,11 @@ private class Copier(private val resolver: android.content.ContentResolver) {
     "oga", "m4b", "mp4", "dsf", "dff", "caf", "tta", "spx", "lrc",
   )
 
-  private fun safe(name: String) = name.replace(Regex("[/\\\\:*?\"<>|\\u0000-\\u001f]"), "_").trim().ifEmpty { "song" }.take(180)
+  /** A file or folder name from the provider, which is not trusted: never a path, never `.` or `..`. */
+  private fun safe(name: String): String {
+    val cleaned = name.replace(Regex("[/\\\\:*?\"<>|\\u0000-\\u001f]"), "_").trim()
+    return (if (cleaned == "." || cleaned == "..") "_" else cleaned).ifEmpty { "song" }.take(180)
+  }
 
   private fun wanted(name: String, mime: String?) =
     (mime?.startsWith("audio/") == true) || name.substringAfterLast('.', "").lowercase() in audio

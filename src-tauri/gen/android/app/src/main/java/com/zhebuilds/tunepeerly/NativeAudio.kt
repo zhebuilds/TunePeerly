@@ -521,7 +521,8 @@ object NativeAudio {
     if (key == null || song == null || exo == null) {
       Log.i(TAG, "stop: nothing left to play after $reason")
       queue.current = currentKey
-      ended = true
+      // The song that is loaded keeps playing; only a song that already ran to its end counts as ended.
+      if (exo?.playbackState == Player.STATE_ENDED) ended = true
       rev++
       emitQueue("$reason, nothing left")
       report()

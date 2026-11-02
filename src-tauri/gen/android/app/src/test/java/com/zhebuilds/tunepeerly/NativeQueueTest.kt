@@ -136,6 +136,25 @@ class NativeQueueTest {
     assertEquals("c", q.current)
   }
 
+  @Test fun previousPassesOverEarlierSongsItCannotPlay() {
+    val q = queue("x", "y")
+    q.pool = listOf("a", "b", "c"); q.past = arrayListOf("a", "x", "y"); q.current = "b"; q.future = arrayListOf("c")
+    assertTrue(q.previous(1.0))
+    assertEquals("a", q.current)
+    assertEquals(listOf("b", "c"), q.future)
+    assertEquals(emptyList<String>(), q.past)
+  }
+
+  @Test fun previousWithNoPlayableHistoryChangesNothingBeforeFallingBack() {
+    val q = queue("x")
+    q.pool = listOf("b"); q.past = arrayListOf("x"); q.current = "b"; q.future = arrayListOf("c")
+    // Nothing earlier can play and the list's last song is the current one: the song starts over.
+    assertFalse(q.previous(1.0))
+    assertEquals(listOf("x"), q.past)
+    assertEquals("b", q.current)
+    assertEquals(listOf("c"), q.future)
+  }
+
   @Test fun stopsWhenNothingFollows() {
     val q = queue()
     q.current = "a"
