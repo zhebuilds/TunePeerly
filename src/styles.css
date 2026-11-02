@@ -2776,10 +2776,6 @@ body.resizing * {
 }
 
 /* ---------- Search ---------- */
-.search-page .chip-row {
-  margin: 4px 0 20px;
-}
-
 .search-top {
   display: grid;
   grid-template-columns: minmax(280px, 2fr) 3fr;

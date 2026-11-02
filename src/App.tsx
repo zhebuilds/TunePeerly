@@ -40,7 +40,7 @@ function Page({ route }: { route: Route }) {
     case "home":
       return <HomePage />;
     case "search":
-      return <SearchPage scope={route.id} />;
+      return <SearchPage />;
     case "artists":
     case "albums":
     case "folders":

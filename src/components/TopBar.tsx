@@ -26,7 +26,7 @@ export function TopBar() {
   };
   const openSearch = () => {
     if (app.route.name === "search") return;
-    app.navigate({ name: "search", id: app.route.name === "playlist" && app.route.id ? `playlist:${app.route.id}` : undefined });
+    app.navigate({ name: "search" });
   };
   return (
     <header className="topbar" data-tauri-drag-region>

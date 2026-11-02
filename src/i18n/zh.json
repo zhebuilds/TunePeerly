@@ -244,9 +244,6 @@
   },
   "search": {
     "placeholder": "想听什么？",
-    "all": "全部音乐",
-    "thisPlaylist": "当前歌单",
-    "queue": "播放队列",
     "browse": "浏览",
     "top": "最佳结果",
     "songs": "歌曲",

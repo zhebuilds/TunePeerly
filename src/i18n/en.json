@@ -247,9 +247,6 @@
   },
   "search": {
     "placeholder": "What do you want to play?",
-    "all": "All music",
-    "thisPlaylist": "This playlist",
-    "queue": "Queue",
     "browse": "Browse",
     "top": "Top result",
     "songs": "Songs",
