@@ -79,15 +79,17 @@ This opens TCP 22067 only if `sudo ufw status` shows `Status: active`. If ufw is
 
 ## 6. Open the port in the cloud firewall
 
-The cloud provider also has to allow inbound TCP 22067. On Azure, replace the first two lines with your resource group and VM names, then run the block in Azure Cloud Shell, or on a computer where the Azure CLI is signed in:
+The cloud provider's firewall also has to allow inbound TCP 22067. Add this rule by hand in the provider's web console.
 
-```sh
-RG=myResourceGroup
-VM=myVM
-az vm open-port --resource-group "$RG" --name "$VM" --port 22067 --priority 1010
-```
+On Azure:
 
-If you do not know the two names, run `curl -fsS -H Metadata:true "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01" | grep -o '"\(resourceGroupName\|name\)":"[^"]*"'` on the VM to print them. If priority 1010 is already taken, change it to another free number such as 1020. Instead of the CLI, you can go to VM > Networking > Add inbound port rule in the Azure portal and allow TCP 22067. On another cloud, allow inbound TCP 22067 in its firewall or security group.
+1. Open the [Azure portal](https://portal.azure.com) and go to your virtual machine.
+2. In the left menu, open **Networking** (on some versions it is **Network settings**).
+3. Choose **Create port rule** > **Inbound port rule** (on some versions it is **Add inbound port rule**).
+4. Fill in: Source **Any**, Source port ranges **\***, Destination **Any**, Service **Custom**, Destination port ranges **22067**, Protocol **TCP**, Action **Allow**, Name **tunepeerly-relay**. Leave Priority at its default.
+5. Click **Add** and wait about a minute for the rule to take effect.
+
+On another cloud, add an inbound rule in its security group or firewall that allows TCP port 22067 from any source.
 
 ## 7. Values for TunePeerly
 

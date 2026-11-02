@@ -79,15 +79,17 @@ if command -v ufw >/dev/null && sudo ufw status | grep -q "Status: active"; then
 
 ## 6. 在云防火墙里开放端口
 
-云服务商那边也要放行入站 TCP 22067。在 Azure 上，把前两行换成你的资源组名和虚拟机名，然后在 Azure Cloud Shell，或者已经登录 Azure CLI 的电脑上运行：
+云服务商那边也要放行入站 TCP 22067。这一步在云服务商的网页控制台里手动添加规则。
 
-```sh
-RG=myResourceGroup
-VM=myVM
-az vm open-port --resource-group "$RG" --name "$VM" --port 22067 --priority 1010
-```
+在 Azure 上：
 
-不知道这两个名字的话，在虚拟机上运行 `curl -fsS -H Metadata:true "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01" | grep -o '"\(resourceGroupName\|name\)":"[^"]*"'`，会打印出来。如果优先级 1010 已被占用，换一个没用过的数字，例如 1020。不用命令行的话，也可以在 Azure 门户的虚拟机 > 网络 > 添加入站端口规则里，允许 TCP 22067。其他云服务商，在它的防火墙或安全组里放行入站 TCP 22067。
+1. 打开 [Azure 门户](https://portal.azure.com)，进入你的虚拟机。
+2. 在左侧菜单打开**网络**（有的版本叫**网络设置**）。
+3. 点**创建端口规则** > **入站端口规则**（有的版本叫**添加入站端口规则**）。
+4. 这样填：源 **Any**，源端口范围 **\***，目标 **Any**，服务 **Custom**，目标端口范围 **22067**，协议 **TCP**，操作**允许**，名称 **tunepeerly-relay**。优先级保持默认。
+5. 点**添加**，等一分钟左右规则生效。
+
+其他云服务商，在它的安全组或防火墙里添加一条入站规则，允许任意来源访问 TCP 22067 端口。
 
 ## 7. 声渡里要填的值
 
