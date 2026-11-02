@@ -91,3 +91,4 @@ It should show `TcpTestSucceeded : True`.
 - The token is a secret. Do not share or publish it.
 - strelaysrv accepts the token only as a command-line flag, so other accounts on the server can see it with `ps`. Use a server dedicated to the relay.
 - `-pools=""` keeps the relay private: it is not announced to the public relay pool. `-status-srv=""` turns off the status page.
+- Incognito turns the relay connection off. A lost relay connection is tried again after 5 seconds, then after longer waits up to 2 minutes. On Android, a network change, such as switching from Wi-Fi to mobile data, registers with the relay again at once.

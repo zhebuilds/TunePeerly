@@ -30,7 +30,7 @@ When a song has LRC lyrics, the lyrics button scrolls with the song.
 
 ## Window, tray, and mini player
 
-The window has its own title bar. **When closing** in Settings → Appearance chooses what the close button does:
+The window has its own title bar. **When closing** in Settings → Appearance chooses what the close button does: **Ask me** shows a prompt every time, **Minimize to tray** keeps the player running in the background, and **Quit** closes it.
 
 **Mini player when minimized** and **Mini player in the tray** leave a small bar on screen with the cover, playback controls, and the heart, when the window is minimized or hidden in the tray. Turn both off for no bar. Drag the cover, the title, or the empty part of the bar to move it. Click the cover or the title to open the main window. The cross in its corner closes only the bar; it comes back the next time the window is minimized or hidden.
 
@@ -40,17 +40,15 @@ The Windows taskbar thumbnail shows the whole cover, scaled down to fit, with pr
 
 A playlist is a list of songs. Deleting a playlist does not delete the songs.
 
-Every readable local song is offered to paired devices. Once a device is paired and connected, it can see, play, and download all of them, including songs added later. Only incognito stops this.
-
 ## Pair a device
 
 Open **Devices**. Before pairing, **Discover nearby devices**, the switch next to **Nearby**, must be on, or devices cannot be found.
 
-- **Discover nearby devices** announces this computer's name about every 3 seconds, over UDP multicast.
-- You can also type another computer's IPv4 address and port. The port changes on every start; that computer shows its current one under Settings → **This computer** → **TCP listening port**.
-- To pair, press **Pair** on one computer. The other computer shows a 6-digit code; type it on the first one. A code works once, for 90 seconds. After 3 wrong codes, pairing pauses for 1 minute. Until pairing finishes, the connection is pending.
+- **Discover nearby devices** announces this computer on the local network about every 3 seconds by UDP multicast, and about every 15 seconds by subnet broadcast. The announcement carries the device ID, the name, the TCP port, and the LAN IPv4 addresses. It never carries song names. The same switch also listens for other devices, so it has to be switched on at both ends.
+- To pair, press **Pair** on one computer. The other computer shows a 6-digit code; type it on the first one. A code works once, for 90 seconds, and a wrong code is replaced by a new one. After 3 wrong codes, pairing pauses for 1 minute for every device. Until pairing finishes, the connection is pending. While no other pairing is going on, any device on the network that asks to pair makes this computer show a code, and nothing is paired until that code is typed on the device that asked.
 - After you decline a request, that device cannot ask again until **Silence after a decline** has passed. That setting is under History and privacy. The default is 60 seconds, and the allowed range is 1 to 86400. You can still connect to that device yourself.
-- Block removes a device. Later data from it is dropped.
+- Paired devices reconnect on their own. A device that drops is called again at once, at the address it was last reached at and where Nearby finds it, and through the relay if one is set up. If that fails, the waits grow from 1 second up to 1 minute. A device set to **Ask each time** is not called; it connects when the other device calls. **Disconnect** stops the calls, from both sides, until you press **Connect** on the device where you pressed **Disconnect**, or that app is restarted. The other device cannot reconnect before then.
+- **Block** refuses every connection from a device and hides it from the paired list and from Nearby. It is listed under **Blocked devices**, where **Unblock** brings it back.
 - **Remove** unpairs both sides. This computer deletes the device's saved key and tells the device, which removes this computer and shows a notice. If the device is offline, it is told the next time the two connect, and until then it only gets that notice from this computer. Your other devices are not changed. To use the two together again, press **Pair** on either one and type the new code.
 
 The four relay fields are on the **Devices** page, in **Relay server** below **Nearby**: address, port, the relay's certificate ID, and a token, with the relay status shown under the heading. Both devices must set each other to **Full trust**. To set up your own relay, see [Deploy a relay](relay.md).
@@ -63,13 +61,15 @@ Settings → **This computer** is where you rename this computer; other devices 
 
 ## Play a song that is on another computer
 
-Any song on an online paired device can be played from that device. **Download** saves the original file into the downloads folder (set in Settings → Music and download folders) and adds it to this library.
+Every readable local song is offered to paired devices. Once a device is paired and connected, it can see, play, and download all of them, including songs added later. Only incognito stops this. Video files, songs that cannot be read now (the file is gone or its folder was removed), and new songs the app has not finished identifying in the background are not offered.
+
+Any song on an online paired device can be played from that device. **Download** saves the original file into the downloads folder (set in Settings → Music and download folders) and adds it to this library. The downloaded file is checked against the song's content ID, and a file that does not match is discarded. One song downloads at a time; the others wait in the list.
 
 ## Sync
 
 The **Sync** section in Settings, right after Music and download folders. Nothing syncs on its own: a copy moves only when you press Send or Override.
 
-Incognito cuts every device connection, stops discovery, turns sync off, and stops offering this computer's songs to other devices.
+Incognito cuts every device connection and the relay connection, stops discovery, turns sync off, refuses downloads, stops recording Recently played, and stops offering this computer's songs to other devices.
 
 | Control | What it does |
 | --- | --- |
@@ -90,6 +90,6 @@ The bell opens the notification list. You can mark items read when they scroll i
 
 ## Where your data stays
 
-The database is in `%APPDATA%\TunePeerly`. It is encrypted, and its key file `db.key` beside it is sealed for your Windows account. Covers and the window cache are in `%LOCALAPPDATA%\TunePeerly`. These two folders cannot be changed. Uninstalling asks whether to delete them.
+The database is in `%APPDATA%\TunePeerly`. It is encrypted, and its key file `db.key` beside it is sealed for your Windows account. Covers and the window cache are in `%LOCALAPPDATA%\TunePeerly`. These two folders cannot be changed. Uninstalling asks whether to delete them. If the key file cannot be opened, for example after it was copied from another Windows account, the old database and key are renamed with `.unreadable-` and the date, and a new, empty library starts. The device identity lives in the database, so the other devices have to be paired again.
 
-There is no account. Paired devices on the same local network sync and stream directly. Outside that network they can meet through the relay configured on the **Devices** page under **Relay server**. Both devices must set each other to **Full trust**.
+On Android everything is in the app's private storage; see [Android](android.md). There is no account. Paired devices on the same local network sync and stream directly. Outside that network they can meet through the relay configured on the **Devices** page under **Relay server**. Both devices must set each other to **Full trust**.

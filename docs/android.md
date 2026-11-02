@@ -8,7 +8,7 @@ The Android app is alpha, like the desktop app.
 
 1. Copy the APK to the phone and open it.
 2. Allow installs from that app when Android asks.
-3. Open TunePeerly. Allow notifications so the playback controls show up in the notification shade and on the lock screen.
+3. Open TunePeerly. On Android 13 and newer, Android asks the first time a song plays whether TunePeerly may show notifications. Allow it, so the playback controls show up in the notification shade and on the lock screen.
 
 ## Add music
 
@@ -41,9 +41,17 @@ After pairing, the phone can reach the computer through a relay you run yourself
 
 Some phones stop background apps aggressively to save battery. If playback stops after a while with the screen off, allow TunePeerly to run in the background in the phone's battery settings (on realme, ColorOS and similar systems: **Settings → Battery → App battery management → TunePeerly → Allow background activity**).
 
+## What is different from the computer app
+
+- When the phone has no name of its own yet, or only the placeholder "localhost", it takes the device name from Android's settings. A name you set under Settings → **This computer** stays.
+- Imported songs are copied into the app, and downloads from other devices go to the app's own folder. There is no downloads folder to choose and no **Show in folder**.
+- There is no tray, mini player, or close-window setting. The back button closes whatever is open, then goes back a page, and at the first page it sends the app to the background instead of closing it.
+- Songs play in a native player in a background service, so the queue, repeat, and shuffle keep working with the screen locked. The next song from another device is copied ahead into a cache of up to 200 MB. If a song from another device cannot be loaded, for example because that device is offline, the player keeps trying for up to 5 minutes, while the link is called again, before it moves on.
+- On Android 13 and newer, TunePeerly asks for the notification permission when a song plays. If you declined, turn notifications on for TunePeerly in Android settings.
+
 ## Privacy
 
-- The library database is encrypted. Its key is sealed with the Android Keystore, so it only opens on this phone.
+- The library database is encrypted. Its key is sealed with the Android Keystore, so it only opens on this phone. If TunePeerly cannot read the key from the Keystore, it stops starting instead of creating a new library, so a passing error does not wipe your library or your pairings. Open the app again. If it keeps failing, clearing the app's storage in Android settings starts a new library, and the other devices have to be paired again.
 - Android backup is turned off for the app, so the database, the device identity, and your songs are not uploaded to a cloud backup or copied to a new phone.
 - Plain HTTP is allowed only to the phone itself, for the app's own local server.
 
