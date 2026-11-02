@@ -21,7 +21,6 @@ TunePeerly plays the music already on this computer and shares it with paired de
 - Send or override liked songs and appearance by hand. Nothing syncs on its own.
 - Incognito pauses discovery, sync, and history recording. You can also block a device.
 - Light and dark themes, English and Chinese, scrolling lyrics, a tray icon, a mini player, and playback buttons on the Windows taskbar thumbnail.
-- Some settings are marked **To be revised**, **Do not use**, or **Not completed yet, not tested**. The mark does not describe the problem. The [user guide](docs/guide.md) lists which setting has which mark. The relay is marked do not use, and also not completed yet and not tested.
 
 ## Security and privacy
 
@@ -55,6 +54,8 @@ You need Node.js, npm, a Rust toolchain, Perl, and the Microsoft Edge WebView2 R
 The library database is encrypted with SQLCipher. The build compiles its own copy of OpenSSL for it, which needs Perl and takes a few minutes the first time.
 - Windows: install [Strawberry Perl](https://strawberryperl.com/) and make sure `perl` in your terminal is Strawberry Perl, not the Perl that comes with Git for Windows. `nmake` comes with the Visual Studio C++ build tools that Rust already needs. [NASM](https://www.nasm.us/) is optional: with `nasm` on PATH OpenSSL is built with its faster assembly code, without it OpenSSL is built without assembly.
 - Linux and macOS: `perl` and `make` are usually already installed.
+
+This is for the desktop app. To build the Android app, see [Android: Build from source](docs/android.md#build-from-source). On Windows, Android builds run in WSL2.
 
 ```powershell
 npm install

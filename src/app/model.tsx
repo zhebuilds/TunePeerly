@@ -2,9 +2,12 @@
 import { listen } from "@tauri-apps/api/event";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type MemberRef, type OverwriteAsk, type Settings, type SyncResult, type Track } from "../api";
+import { api, errorText, pickFiles, pickFolder, type Bootstrap, type ContentMove, type DownloadFeed, type ImportSummary, type MemberRef, type OverwriteAsk, type Settings, type SyncResult, type Track } from "../api";
 import i18n from "../i18n";
-import { albumParts, filterText, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
+import { isAndroid } from "../lib/platform";
+import { nativeAudio, type CatalogSong, type QueueEvent } from "../player/native";
+import { followedFuture, nativeQueueable } from "../player/nativePlan";
+import { albumParts, displayTitle, refOf, reorderVisible, shufflable, trackKey, TrackIndex } from "../lib/library";
 import {
   addToQueue,
   continueLibrary,
@@ -113,7 +116,7 @@ function useModel() {
     } catch {
       /* storage unavailable: use the default */
     }
-    return window.innerWidth > 1040;
+    return !isAndroid && window.innerWidth > 1040;
   });
   const [noticesOpen, setNoticesOpenState] = useState(false);
   const setQueueOpen = useCallback((open: boolean) => {
@@ -209,7 +212,7 @@ function useModel() {
       progress: (position) => handlers.current?.progress(position),
       activity: (playing, track, enough) => handlers.current?.activity(playing, track, enough),
       playable: (track) => handlers.current?.playable(track),
-    });
+    }, isAndroid && "__TAURI_INTERNALS__" in window ? nativeAudio() : null);
   }
   const engine = engineRef.current;
 
@@ -408,10 +411,13 @@ function useModel() {
     }
   }, []);
 
-  const rebuildPool = useCallback((state: QueueState): Track[] => {
-    if (state.order === "libraryRandom") return (bootRef.current?.tracks ?? []).filter(shufflable);
+  /** The list the queue starts over from. `forNative`: what the phone's player may hold (`nativeQueueable`). */
+  const rebuildPool = useCallback((state: QueueState, forNative = false): Track[] => {
+    if (state.order === "libraryRandom") {
+      return (bootRef.current?.tracks ?? []).filter((track) => shufflable(track) || (forNative && nativeQueueable(track) && track.playbackStatus !== "failed"));
+    }
     const list = context.current.id === state.contextId && context.current.tracks ? context.current.tracks : contextTracks(state.contextId);
-    return list.filter((track) => track.playable);
+    return list.filter(forNative ? nativeQueueable : (track) => track.playable);
   }, [contextTracks]);
 
   const loadLyrics = useCallback((track: Track | undefined) => {
@@ -602,10 +608,10 @@ function useModel() {
     }
   }, [applyLook, engine, patchBoot, say, scheduleRefresh, setNotice, t]);
 
-  const importPaths = useCallback(async (paths: string[], kind: "directory" | "file" | "auto") => {
-    if (paths.length === 0) return;
+  const imported = useCallback(async (run: () => Promise<ImportSummary[]>, quietWhenNone = false) => {
     try {
-      const summaries = await api.importPaths(paths, kind);
+      const summaries = await run();
+      if (quietWhenNone && summaries.length === 0) return;
       const added = summaries.reduce((sum, item) => sum + item.added, 0);
       toast(added > 0 ? t("toast.imported", { count: added }) : t("toast.importedNone"));
       reloadLyrics();
@@ -614,6 +620,11 @@ function useModel() {
       say(error);
     }
   }, [refresh, reloadLyrics, say, t, toast]);
+
+  const importPaths = useCallback(async (paths: string[], kind: "directory" | "file" | "auto") => {
+    if (paths.length === 0) return;
+    await imported(() => api.importPaths(paths, kind));
+  }, [imported]);
 
   /** Scans every added folder and file again. Tags and lyrics files that changed are read again. */
   const rescan = useCallback(async () => {
@@ -633,13 +644,18 @@ function useModel() {
   }, [refresh, reloadLyrics, say, t, toast]);
 
   const addMusic = useCallback(async (kind: "directory" | "file") => {
+    if (isAndroid) {
+      // Cancelling the picker copies nothing and says nothing.
+      await imported(() => api.androidImport(kind === "directory"), true);
+      return;
+    }
     try {
       const paths = kind === "directory" ? [await pickFolder()].filter((item): item is string => Boolean(item)) : await pickFiles();
       await importPaths(paths, kind);
     } catch (error) {
       say(error);
     }
-  }, [importPaths, say]);
+  }, [imported, importPaths, say]);
 
   const like = useCallback(async (track: Track) => {
     const key = trackKey(track);
@@ -942,20 +958,133 @@ function useModel() {
     return () => window.removeEventListener("beforeunload", flush);
   }, [engine]);
 
+  // Android: the phone's player holds every playable song and the whole queue with its rules, so it
+  // goes on by itself with the screen off (NativeAudio.kt). The page follows what it did when it runs.
+  const native = engine.nativePlayer;
+  const [streamBase, setStreamBase] = useState("");
+  useEffect(() => {
+    if (!native || !boot) return;
+    const timer = window.setTimeout(() => {
+      const songs: CatalogSong[] = [];
+      for (const track of boot.tracks) {
+        // A linked device's songs stay in even while it is offline, so the phone's player keeps them
+        // queued and waits for the link instead of dropping them.
+        if (!nativeQueueable(track)) continue;
+        const local = track.absolutePath && track.accessStatus === "available" && track.badge !== "remote";
+        const cover = track.coverUrl && !/^(data:|blob:|https?:)/.test(track.coverUrl) ? track.coverUrl : null;
+        songs.push({
+          k: trackKey(track),
+          u: local && track.absolutePath ? api.fileUrl(track.absolutePath) : null,
+          c: track.contentId,
+          t: displayTitle(track, t("library.untitled")),
+          a: track.artist ?? "",
+          l: track.album ?? "",
+          p: cover,
+          f: Boolean(track.favorite),
+          d: (track.durationMs ?? 0) / 1000,
+        });
+      }
+      native.setCatalog(streamBase, songs);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [native, boot, streamBase, t]);
+
+  useEffect(() => {
+    // Not before the saved queue is back, so an empty queue never replaces the one still playing.
+    if (!native || !boot) return;
+    const timer = window.setTimeout(() => {
+      const state = queueRef.current;
+      const key = (ref: TrackRef) => {
+        const track = indexRef.current.get(ref);
+        return track ? trackKey(track) : ref.key;
+      };
+      native.setPlan({
+        past: state.past.slice(-50).map(key),
+        current: state.current ? key(state.current) : null,
+        future: state.future.map(key),
+        repeat: state.repeat,
+        order: state.order,
+        contextId: state.contextId,
+        pool: rebuildPool(state, true).map(trackKey),
+        library: contextTracks("library").filter(nativeQueueable).map(trackKey),
+      });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [native, queue, boot, members, rebuildPool, contextTracks]);
+
+  const followNative = useRef<(event: QueueEvent) => void>(() => {});
+  followNative.current = (event: QueueEvent) => {
+    // Nothing loaded in the phone's player (the app just started): the page's own saved queue stays,
+    // and goes to the player again with the change count it reported.
+    if (event.id === 0 || !event.current) {
+      native?.resend();
+      return;
+    }
+    const ref = (key: string): TrackRef => {
+      const track = indexRef.current.get({ key });
+      return track ? refOf(track) : { key, contentId: null, localFileId: null };
+    };
+    const prior = queueRef.current;
+    const state: QueueState = {
+      ...prior,
+      order: event.order as QueueState["order"],
+      repeat: event.repeat as QueueState["repeat"],
+      contextId: event.contextId,
+      past: event.past.map(ref),
+      current: ref(event.current),
+      future: followedFuture(prior.future, event.future.map(ref), event.ended),
+      positionSec: 0,
+    };
+    if (state.contextId !== prior.contextId) {
+      context.current = state.contextId === "library"
+        ? { id: "library", tracks: contextTracks("library").filter((track) => track.playable) }
+        : { id: state.contextId, tracks: null };
+    }
+    const track = indexRef.current.get(state.current);
+    if (track && native && native.currentId !== event.id) {
+      setFailure(null);
+      engine.follow(track, event.id, event.playing);
+    }
+    commit(state, event.pos);
+  };
+
+  useEffect(() => {
+    if (!native) return;
+    native.onQueue = (event) => followNative.current(event);
+    native.onHeard = (key) => {
+      const track = indexRef.current.get({ key });
+      if (track) handlers.current?.heard(track);
+    };
+    let live = true;
+    void api.streamBase().then(
+      (base) => {
+        if (!live) return;
+        native.streamBase = base;
+        setStreamBase(base);
+      },
+      () => {},
+    );
+    return () => {
+      live = false;
+      native.onQueue = null;
+      native.onHeard = null;
+    };
+  }, [native]);
+
+  // Once the saved queue is back: the phone's player may have played on while the page was away
+  // (the window was closed by the system); show what it plays now.
+  const synced = useRef(false);
+  useEffect(() => {
+    if (!native || !boot || synced.current) return;
+    synced.current = true;
+    native.sync();
+  }, [native, boot]);
+
   const shown = current ?? null;
   const lookup = useCallback((ref: TrackRef | null | undefined): Track | undefined => (ref ? index.get(ref) : undefined), [index]);
   useEffect(() => {
     loadLyrics(shown ?? undefined);
   }, [shown, loadLyrics, lyricsEpoch]);
-
-  const findTracks = useCallback((text: string, scope: "all" | "queue" | string) => {
-    if (scope === "queue") {
-      const state = queueRef.current;
-      return filterText([state.current, ...state.future].map((item) => indexRef.current.get(item)).filter((item): item is Track => Boolean(item)), text);
-    }
-    if (scope.startsWith("playlist:")) return filterText(indexRef.current.members(membersRef.current[scope.slice(9)] ?? []), text);
-    return null;
-  }, []);
 
   return {
     boot,
@@ -1032,7 +1161,6 @@ function useModel() {
     movePlaylistMember,
     moveLibrary,
     contextTracks,
-    findTracks,
   };
 }
 

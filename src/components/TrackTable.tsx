@@ -21,6 +21,7 @@ import { albumId, displayTitle, folderName, trackKey, type Sort, type SortKey } 
 import { clock, transport } from "../player/clock";
 import { Icons } from "../ui/icons";
 import { Cover } from "./Cover";
+import { isAndroid } from "../lib/platform";
 
 const ROW = 56;
 
@@ -231,8 +232,13 @@ const TrackRow = memo(function TrackRow({ track, index, top, number, gridClass, 
       tabIndex={0}
       data-drop={dropId}
       title={reason || undefined}
-      onPointerDown={(event) => onDrag(event, index)}
+      onPointerDown={isAndroid ? undefined : (event) => onDrag(event, index)}
       onClick={(event) => {
+        // A tap plays on a phone; there is no double-click there.
+        if (isAndroid) {
+          if (!(event.target as HTMLElement).closest("button, input, a, select, textarea")) onPlay(index);
+          return;
+        }
         if (!clickWasDrag()) onSelect(index, event);
       }}
       onDoubleClick={(event) => {

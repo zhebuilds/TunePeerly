@@ -227,6 +227,9 @@ pub enum Cmd {
     CloseRoutes,
     /// Announces this device at once and collects the Nearby list again; does nothing while discovery is off.
     RefreshNearby,
+    /// The phone moved to another network or woke from Doze: join discovery again, register with the
+    /// relay at once instead of after its back-off, and call the known devices. The listener stays.
+    NetworkChanged,
     Disconnect(String),
     ResolveOverwrite { id: u64, accept: bool },
 }
@@ -324,7 +327,12 @@ async fn run(
     let provider = tls::provider();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<NetEvent>();
     publish(&app, &db, &live, &peers);
-    let mut reconnect = tokio::time::interval(Duration::from_secs(30));
+    // Paired devices that are not connected are called again by this, with growing waits (`Redial`).
+    let mut redial = Redial::default();
+    let mut redial_tick = tokio::time::interval(REDIAL_TICK);
+    redial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The address each connected device came from, until its hello tells the port it listens on.
+    let mut came_from: HashMap<String, (u64, String)> = HashMap::new();
     let mut overwrite_tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
@@ -357,12 +365,24 @@ async fn run(
                         restart_relay(&db, &material, &provider, &event_tx, &mut relay_task, &live).await;
                         if open {
                             publish_holdings(&db, &peers, &mut published_holdings);
-                            dial_known(&db, &material, &provider, &event_tx, &live, &peers).await;
+                            redial.kick_all();
+                            redial_due(&db, &material, &provider, &event_tx, &live, &peers, &mut redial).await;
                         }
                         publish(&app, &db, &live, &peers);
                     }
                     Cmd::Publish => {
                         publish_holdings(&db, &peers, &mut published_holdings);
+                    }
+                    Cmd::NetworkChanged => {
+                        if db.lock().map(|guard| network_open(&guard)).unwrap_or(false) {
+                            restart_discovery(&db, &material, actual_port, &event_tx, &mut discovery, &live).await;
+                            restart_relay(&db, &material, &provider, &event_tx, &mut relay_task, &live).await;
+                            // A new network: every saved address may work now, so call at once and start the waits over.
+                            eprintln!("network changed: calling paired devices again");
+                            redial.kick_all();
+                            redial_due(&db, &material, &provider, &event_tx, &live, &peers, &mut redial).await;
+                            publish(&app, &db, &live, &peers);
+                        }
                     }
                     Cmd::ViewHistory(device_id) => {
                         view_history(&app, &db, &peers, &live, &device_id);
@@ -545,10 +565,24 @@ async fn run(
                 let Some(event) = event else { break };
                 match event {
                     NetEvent::Nearby(list) => {
-                        if let Ok(mut guard) = live.inner.lock() {
-                            guard.nearby = list;
+                        let appeared: Vec<String> = live
+                            .inner
+                            .lock()
+                            .map(|mut guard| {
+                                let appeared = list
+                                    .iter()
+                                    .filter(|item| !guard.nearby.iter().any(|old| old.device_id == item.device_id && old.port == item.port))
+                                    .map(|item| item.device_id.clone())
+                                    .collect();
+                                guard.nearby = list;
+                                appeared
+                            })
+                            .unwrap_or_default();
+                        // A device just showed up (or moved to another port): call it now instead of after its wait.
+                        for device_id in &appeared {
+                            redial.kick(device_id);
                         }
-                        dial_known(&db, &material, &provider, &event_tx, &live, &peers).await;
+                        redial_due(&db, &material, &provider, &event_tx, &live, &peers, &mut redial).await;
                         publish(&app, &db, &live, &peers);
                     }
                     NetEvent::Connected { device_id, conn, target, dialed_by, path, writer, audio, public_key, cert_der, name, incoming } => {
@@ -556,11 +590,28 @@ async fn run(
                             guard.failures.remove(&device_id);
                             guard.held.remove(&device_id);
                         }
-                        if let Some(target) = &target {
+                        if let Some(target) = target.as_ref().filter(|_| !incoming) {
                             eprintln!("connected to {} at {target}", short_id(&device_id));
                         }
+                        let lan = path == "lan";
                         let before = peers.get(&device_id).map(|peer| peer.conn);
                         adopt_connection(&db, &material, &live, &mut peers, &pending, &app, device_id.clone(), conn, dialed_by, incoming, path, writer, audio, public_key, cert_der, name);
+                        if peers.get(&device_id).is_some_and(|peer| peer.conn == conn) {
+                            redial.connected(&device_id);
+                            let host = target.as_deref().and_then(|text| text.parse::<SocketAddr>().ok());
+                            match host {
+                                Some(SocketAddr::V4(addr)) if lan => {
+                                    came_from.insert(device_id.clone(), (conn, addr.ip().to_string()));
+                                    // We dialed its listening address, so that address works: remember it.
+                                    if !incoming && peers.get(&device_id).is_some_and(|peer| peer.confirmed) {
+                                        remember_address(&db, &device_id, &[addr.ip().to_string()], addr.port());
+                                    }
+                                }
+                                _ => {
+                                    came_from.remove(&device_id);
+                                }
+                            }
+                        }
                         if before != Some(conn) && peers.get(&device_id).is_some_and(|peer| peer.confirmed && peer.conn == conn) {
                             say_hello(&db, &peers, &device_id);
                         }
@@ -569,6 +620,9 @@ async fn run(
                     NetEvent::DialFailed { device_id, target } => {
                         if let Some(target) = &target {
                             eprintln!("could not connect to {target}");
+                        }
+                        if let Some(device_id) = &device_id {
+                            redial.dial_failed(device_id);
                         }
                         if let Ok(mut guard) = live.inner.lock() {
                             if let Some(device_id) = device_id {
@@ -611,6 +665,19 @@ async fn run(
                                 guard.held.insert(device_id.clone());
                             }
                         } else {
+                            if let Some((port, addrs)) = hello_address(&frame)
+                                && peers.get(&device_id).is_some_and(|peer| peer.confirmed)
+                            {
+                                // The address it came from first (it works now), then the ones it says it has.
+                                let conn = peers.get(&device_id).map(|peer| peer.conn);
+                                let mut hosts: Vec<String> = came_from
+                                    .get(&device_id)
+                                    .filter(|(seen, _)| Some(*seen) == conn)
+                                    .map(|(_, ip)| vec![ip.clone()])
+                                    .unwrap_or_default();
+                                hosts.extend(addrs);
+                                remember_address(&db, &device_id, &hosts, port);
+                            }
                             handle_frame(&app, &db, &mut peers, &live, &bus, &mut pending_holdings, &mut published_holdings, &device_id, frame);
                             let wanted: Vec<String> = live
                                 .inner
@@ -630,6 +697,7 @@ async fn run(
                             continue;
                         }
                         let removed = peers.remove(&device_id);
+                        let was_linked = removed.as_ref().is_some_and(|peer| peer.confirmed);
                         pending_holdings.remove(&device_id);
                         drop_partial_snapshots(&live, &device_id);
                         if let Some(peer) = removed {
@@ -648,12 +716,16 @@ async fn run(
                             }
                             pairing_closed(&live, &device_id);
                         }
+                        came_from.remove(&device_id);
                         publish(&app, &db, &live, &peers);
-                        // Try the LAN again right away; the nearby list does not change when a connection drops.
-                        dial_known(&db, &material, &provider, &event_tx, &live, &peers).await;
-                        if !live.inner.lock().is_ok_and(|guard| guard.on_hold().contains(&device_id)) {
-                            maybe_relay_fallback(&db, &material, &provider, &event_tx, &device_id).await;
+                        // A link that worked is called again right away (saved address, Nearby, then the
+                        // relay), then with growing waits. One that closed before it was ready waits first.
+                        if was_linked {
+                            redial.link_lost(&device_id);
+                        } else {
+                            redial.closed_early(&device_id, Instant::now(), rand::random::<f64>());
                         }
+                        redial_due(&db, &material, &provider, &event_tx, &live, &peers, &mut redial).await;
                     }
                     NetEvent::Invitation(invitation) => {
                         join_invited(&db, &material, &provider, &event_tx, invitation).await;
@@ -664,23 +736,8 @@ async fn run(
                     }
                 }
             }
-            _ = reconnect.tick() => {
-                let open = db.lock().map(|guard| network_open(&guard)).unwrap_or(false);
-                if open {
-                    dial_known(&db, &material, &provider, &event_tx, &live, &peers).await;
-                    let saved: Vec<String> = {
-                        let Ok(guard) = db.lock() else { continue };
-                        guard.peers().unwrap_or_default().into_iter().filter(|peer| {
-                            peer.trust != "verify" && !guard.is_blocked(&peer.device_id).unwrap_or(false)
-                        }).map(|peer| peer.device_id).collect()
-                    };
-                    // The relay is not asked for a device the user disconnected either.
-                    let paused = live.inner.lock().map(|guard| guard.on_hold()).unwrap_or_default();
-                    let offline = redial_ids(saved, |id| peers.contains_key(id), &paused);
-                    for device_id in offline {
-                        maybe_relay_fallback(&db, &material, &provider, &event_tx, &device_id).await;
-                    }
-                }
+            _ = redial_tick.tick() => {
+                redial_due(&db, &material, &provider, &event_tx, &live, &peers, &mut redial).await;
             }
             pull = pull_rx.recv() => {
                 match pull {
@@ -735,18 +792,187 @@ fn network_open(db: &Db) -> bool {
 }
 
 
-/// Paired devices that are not connected get dialed at the address Nearby discovery found for them.
-async fn dial_known(
+/// How long a dial waits for one address to answer, and then for TLS.
+const DIAL_CONNECT_TIMEOUT: Duration = Duration::from_millis(2500);
+const DIAL_TLS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the redial schedule is checked.
+const REDIAL_TICK: Duration = Duration::from_secs(1);
+/// The longest wait between two calls to a paired device that is not connected.
+const REDIAL_MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// When each paired device that is not connected is called next. Rust keeps the links by itself,
+/// whether the window shows, discovery is on, or the phone's screen is off: a dropped device is
+/// called at once, then after 1, 2, 4 ... up to 60 seconds (plus up to a quarter more at random, so
+/// two devices do not keep calling each other at the same moment).
+#[derive(Default)]
+struct Redial {
+    due: HashMap<String, RedialState>,
+    /// Connections in a row that closed before the device was ready (e.g. it turned the link down).
+    /// Kept apart from `due`, which forgets a device while it is connected.
+    early_closes: HashMap<String, u32>,
+}
+
+#[derive(Clone, Copy)]
+struct RedialState {
+    tries: u32,
+    next: Instant,
+    /// A call is still under way until then (or until it fails on the LAN with no relay call).
+    busy_until: Option<Instant>,
+    relay: bool,
+}
+
+impl RedialState {
+    fn fresh(now: Instant) -> Self {
+        RedialState { tries: 0, next: now, busy_until: None, relay: false }
+    }
+}
+
+impl Redial {
+    /// Call this device at the next check and start its waits over.
+    fn kick(&mut self, device_id: &str) {
+        let now = Instant::now();
+        let state = self.due.entry(device_id.to_string()).or_insert(RedialState::fresh(now));
+        state.tries = 0;
+        state.next = now;
+    }
+
+    fn kick_all(&mut self) {
+        let now = Instant::now();
+        for state in self.due.values_mut() {
+            state.tries = 0;
+            state.next = now;
+        }
+    }
+
+    fn connected(&mut self, device_id: &str) {
+        self.due.remove(device_id);
+    }
+
+    /// A working link closed: call the device again at once, with the waits started over.
+    fn link_lost(&mut self, device_id: &str) {
+        self.early_closes.remove(device_id);
+        self.kick(device_id);
+    }
+
+    /// A connection closed before the device was ready. That counts as a failed call, so the next
+    /// one waits as usual instead of following at once, again and again.
+    fn closed_early(&mut self, device_id: &str, now: Instant, jitter: f64) {
+        let tries = self.early_closes.entry(device_id.to_string()).or_insert(0);
+        *tries = tries.saturating_add(1);
+        let tries = *tries;
+        self.due.insert(device_id.to_string(), RedialState { tries, next: now + redial_wait(tries, jitter), busy_until: None, relay: false });
+    }
+
+    /// The LAN call failed; unless the relay was asked too, the device may be called again on time.
+    fn dial_failed(&mut self, device_id: &str) {
+        if let Some(state) = self.due.get_mut(device_id).filter(|state| !state.relay) {
+            state.busy_until = None;
+        }
+    }
+
+    /// Records the call just started for `device_id`: how long it may take, and whether the relay was asked.
+    fn calling(&mut self, device_id: &str, now: Instant, lan_targets: usize, relay: bool) {
+        if let Some(state) = self.due.get_mut(device_id) {
+            let lan = DIAL_CONNECT_TIMEOUT * u32::try_from(lan_targets).unwrap_or(u32::MAX).min(8) + DIAL_TLS_TIMEOUT;
+            let took = if relay { lan.max(HANDSHAKE_TIMEOUT) } else { lan };
+            state.busy_until = Some(now + took);
+            state.relay = relay;
+        }
+    }
+
+    /// The devices to call now, out of `missing` (paired, not connected, not on hold). Each one
+    /// returned counts as tried: `.1` is how many times it was tried before.
+    fn take_due(&mut self, missing: &[String], now: Instant, jitter: impl Fn() -> f64) -> Vec<(String, u32)> {
+        self.due.retain(|id, _| missing.contains(id));
+        let mut out = Vec::new();
+        for id in missing {
+            let state = self.due.entry(id.clone()).or_insert(RedialState::fresh(now));
+            if now < state.next || state.busy_until.is_some_and(|until| now < until) {
+                continue;
+            }
+            out.push((id.clone(), state.tries));
+            state.tries = state.tries.saturating_add(1);
+            state.next = now + redial_wait(state.tries, jitter());
+        }
+        out
+    }
+}
+
+/// The wait after the `tries`-th call: 1, 2, 4 ... seconds, at most `REDIAL_MAX_WAIT`, plus `jitter`
+/// (0 to 1) times a quarter of it.
+fn redial_wait(tries: u32, jitter: f64) -> Duration {
+    let base = Duration::from_secs(1u64 << tries.saturating_sub(1).min(6)).min(REDIAL_MAX_WAIT);
+    base + base.mul_f64(jitter.clamp(0.0, 1.0) * 0.25)
+}
+
+/// Where to call a device: its saved addresses first, then what Nearby found, each address once.
+fn redial_targets(saved: Option<(Vec<String>, u16)>, nearby: Option<&Nearby>) -> Vec<(String, u16)> {
+    let mut out: Vec<(String, u16)> = Vec::new();
+    if let Some((hosts, port)) = saved {
+        for host in hosts {
+            if !out.contains(&(host.clone(), port)) {
+                out.push((host, port));
+            }
+        }
+    }
+    if let Some(item) = nearby {
+        for host in &item.hosts {
+            if !out.contains(&(host.clone(), item.port)) {
+                out.push((host.clone(), item.port));
+            }
+        }
+    }
+    out
+}
+
+/// The port and addresses a paired device put in its hello (older versions send neither).
+fn hello_address(frame: &Frame) -> Option<(u16, Vec<String>)> {
+    let Frame::Message(bytes) = frame else { return None };
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    if value.get("kind").and_then(Value::as_str) != Some("hello") {
+        return None;
+    }
+    let port = value.get("port").and_then(Value::as_u64).and_then(|port| u16::try_from(port).ok()).filter(|port| *port != 0)?;
+    let addrs = value
+        .get("addrs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|text| text.parse::<Ipv4Addr>().is_ok_and(|ip| !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()))
+                .take(crate::db::PEER_ADDRESS_LIMIT)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((port, addrs))
+}
+
+fn remember_address(db: &Arc<Mutex<Db>>, device_id: &str, hosts: &[String], port: u16) {
+    if let Ok(guard) = db.lock() {
+        let _ = guard.save_peer_address(device_id, hosts, port, now_ms());
+    }
+}
+
+/// Calls the paired devices whose turn it is: on the LAN at their saved addresses and where Nearby
+/// found them, and through the relay when there is no address or the last call did not connect.
+/// Removed devices not told yet are called on the LAN too, only to tell them (see `tell_removed`).
+async fn redial_due(
     db: &Arc<Mutex<Db>>,
     material: &IdentityMaterial,
     provider: &Arc<rustls::crypto::CryptoProvider>,
     events: &mpsc::UnboundedSender<NetEvent>,
     live: &Live,
     peers: &HashMap<String, PeerOut>,
+    redial: &mut Redial,
 ) {
-    let (saved, removed, allowed) = {
+    let (saved, removed, relay) = {
         let Ok(guard) = db.lock() else { return };
-        let (incognito, _) = switches(&guard);
+        if !network_open(&guard) {
+            redial.due.clear();
+            return;
+        }
         let saved: Vec<String> = guard
             .peers()
             .unwrap_or_default()
@@ -754,7 +980,6 @@ async fn dial_known(
             .filter(|peer| peer.trust != "verify" && !guard.is_blocked(&peer.device_id).unwrap_or(false))
             .map(|peer| peer.device_id)
             .collect();
-        // Removed devices not told yet are dialed too, only to tell them (see `tell_removed`).
         let removed: Vec<String> = guard
             .removals()
             .unwrap_or_default()
@@ -762,24 +987,39 @@ async fn dial_known(
             .map(|row| row.device_id)
             .filter(|id| !guard.is_blocked(id).unwrap_or(false))
             .collect();
-        (saved, removed, !incognito)
+        (saved, removed, relay_ready(&guard))
     };
-    if !allowed {
+    let paused = live.inner.lock().map(|guard| guard.on_hold()).unwrap_or_default();
+    let mut missing = redial_ids(saved.clone(), |id| peers.contains_key(id), &paused);
+    for id in removed {
+        if !peers.contains_key(&id) && !missing.contains(&id) {
+            missing.push(id);
+        }
+    }
+    if missing.is_empty() {
+        redial.due.clear();
         return;
     }
-    let paused = live.inner.lock().map(|guard| guard.on_hold()).unwrap_or_default();
-    let mut missing = redial_ids(saved, |id| peers.contains_key(id), &paused);
-    missing.extend(removed.into_iter().filter(|id| !peers.contains_key(id)));
-    if missing.is_empty() {
+    let now = Instant::now();
+    let due = redial.take_due(&missing, now, rand::random::<f64>);
+    if due.is_empty() {
         return;
     }
     let nearby = live.inner.lock().map(|guard| guard.nearby.clone()).unwrap_or_default();
-    for device_id in &missing {
-        if let Some(target) = nearby.iter().find(|item| &item.device_id == device_id) {
-            if !dial_gate(device_id) {
-                continue;
-            }
-            dial_peer(db, material, provider, events, target.hosts.clone(), target.port, Some(device_id.clone()), &material.device_id).await;
+    for (device_id, tries) in due {
+        let address = db.lock().ok().and_then(|guard| guard.peer_address(&device_id).ok().flatten());
+        let targets = redial_targets(address, nearby.iter().find(|item| item.device_id == device_id));
+        let lan = targets.len();
+        // The relay only carries data between paired devices; pairing itself stays on the LAN.
+        let via_relay = relay && saved.contains(&device_id) && (lan == 0 || tries > 0);
+        redial.calling(&device_id, now, lan, via_relay);
+        let short: String = device_id.chars().take(8).collect();
+        eprintln!("calling {short} again (try {}): {lan} address(es){}", tries + 1, if via_relay { " and the relay" } else { "" });
+        if lan > 0 {
+            dial_targets(db, material, provider, events, targets, Some(device_id.clone()), &material.device_id).await;
+        }
+        if via_relay {
+            maybe_relay_fallback(db, material, provider, events, &device_id).await;
         }
     }
 }
@@ -794,18 +1034,6 @@ fn unpaired_lately(device_id: &str, mark: bool) -> bool {
         map.insert(device_id.to_string(), now);
     }
     map.contains_key(device_id)
-}
-
-/// Lets automatic reconnects dial one device at most every 6 seconds.
-fn dial_gate(device_id: &str) -> bool {
-    static GATE: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
-    let Ok(mut map) = GATE.get_or_init(Default::default).lock() else { return true };
-    let now = Instant::now();
-    if map.get(device_id).is_some_and(|last| now.duration_since(*last) < Duration::from_secs(6)) {
-        return false;
-    }
-    map.insert(device_id.to_string(), now);
-    true
 }
 
 /// (incognito, discovery). Incognito is the only thing that stops sharing: otherwise every paired,
@@ -857,6 +1085,7 @@ async fn restart_listener(
     if let Ok(mut live) = live.inner.lock() {
         live.listen_port = *actual_port;
     }
+    LISTEN_PORT.store(*actual_port, std::sync::atomic::Ordering::Relaxed);
     let Some(tcp) = bind else { return };
     if *actual_port == 0 {
         return;
@@ -894,6 +1123,9 @@ async fn restart_listener(
     }));
 }
 
+/// The port this device listens on now, sent in hellos.
+static LISTEN_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
 /// The path of a connection that goes through the relay.
 const RELAY_PATH: &str = "relay";
 
@@ -917,8 +1149,11 @@ fn relay_forbids(frame: &Frame) -> bool {
 const MAX_HANDSHAKES: usize = 16;
 /// Time allowed for TCP, relay and TLS setup before a connection is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Both sides send a keepalive every 45 seconds; a connection that stays silent longer is gone.
-const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(150);
+/// How often each side sends a keepalive on an idle connection.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+/// A connection silent this long is gone. Older versions send a keepalive every 45 seconds, so this
+/// stays above that.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Unconfirmed devices that may wait for an answer at the same time.
 const MAX_UNCONFIRMED: usize = 8;
 
@@ -929,6 +1164,8 @@ async fn accept_lan(
     provider: Arc<rustls::crypto::CryptoProvider>,
     events: mpsc::UnboundedSender<NetEvent>,
 ) -> AppResult<()> {
+    // Where it came from; the port it listens on comes in its hello.
+    let remote = stream.peer_addr().ok().map(|addr| addr.to_string());
     // Any device key gets through TLS; `finish_handshake` decides from the device id.
     let verifier = Arc::new(tls::IdentityVerifier::peer(provider.clone(), None));
     let config = tls::server_config(provider, &material.cert_der, &material.cert_key, verifier)
@@ -937,7 +1174,7 @@ async fn accept_lan(
     let tls = acceptor.accept(stream).await.map_err(|err| crate::error::AppError::Message(err.to_string()))?;
     let certs = tls.get_ref().1.peer_certificates().map(|certs| certs.to_vec()).unwrap_or_default();
     let dialed_by = material.device_id.clone();
-    finish_handshake(tls, certs, db, material, events, "lan".into(), dialed_by, true, None).await
+    finish_handshake(tls, certs, db, material, events, "lan".into(), dialed_by, true, remote).await
 }
 
 async fn dial_peer(
@@ -950,22 +1187,36 @@ async fn dial_peer(
     expected_device: Option<String>,
     dialed_by: &str,
 ) {
+    let targets = hosts.into_iter().map(|host| (host, port)).collect();
+    dial_targets(db, material, provider, events, targets, expected_device, dialed_by).await;
+}
+
+/// Connects to the first of `targets` (address, port) that answers.
+async fn dial_targets(
+    db: &Arc<Mutex<Db>>,
+    material: &IdentityMaterial,
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+    events: &mpsc::UnboundedSender<NetEvent>,
+    targets: Vec<(String, u16)>,
+    expected_device: Option<String>,
+    dialed_by: &str,
+) {
     let events = events.clone();
     let db = db.clone();
     let parts = material.clone_parts();
     let provider = provider.clone();
     let dialed_by = dialed_by.to_string();
     tokio::task::spawn_local(async move {
-        let mut target = format!("{}:{port}", hosts.first().cloned().unwrap_or_default());
+        let mut target = targets.first().map(|(host, port)| format!("{host}:{port}")).unwrap_or_default();
         let failed = |events: &mpsc::UnboundedSender<NetEvent>, target: &str| {
             let _ = events.send(NetEvent::DialFailed { device_id: expected_device.clone(), target: Some(target.to_string()) });
         };
         // The device may be reachable on only one of its addresses, so try them in order.
         let mut connected = None;
-        for host in &hosts {
+        for (host, port) in &targets {
             target = format!("{host}:{port}");
-            let connect = TcpStream::connect((host.as_str(), port));
-            if let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_millis(2500), connect).await {
+            let connect = TcpStream::connect((host.as_str(), *port));
+            if let Ok(Ok(stream)) = tokio::time::timeout(DIAL_CONNECT_TIMEOUT, connect).await {
                 connected = Some(stream);
                 break;
             }
@@ -980,7 +1231,7 @@ async fn dial_peer(
         };
         let connector = TlsConnector::from(Arc::new(config));
         let name = rustls::pki_types::ServerName::try_from(crate::identity::TLS_DNS_NAME).expect("name");
-        let Ok(Ok(tls)) = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, stream)).await else {
+        let Ok(Ok(tls)) = tokio::time::timeout(DIAL_TLS_TIMEOUT, connector.connect(name, stream)).await else {
             return failed(&events);
         };
         let certs = tls.get_ref().1.peer_certificates().map(|certs| certs.to_vec()).unwrap_or_default();
@@ -1083,7 +1334,7 @@ where
     });
     tokio::task::spawn_local(async move {
         let _writer_done = writer_done;
-        let mut interval = tokio::time::interval(Duration::from_secs(45));
+        let mut interval = tokio::time::interval(KEEPALIVE_INTERVAL);
         loop {
             tokio::select! {
                 biased;
@@ -3876,7 +4127,10 @@ fn send_json(peer: &PeerOut, body: &Value) {
 fn say_hello(db: &Arc<Mutex<Db>>, peers: &HashMap<String, PeerOut>, device_id: &str) {
     let Some(peer) = peers.get(device_id).filter(|peer| peer.confirmed) else { return };
     let name = db.lock().ok().and_then(|guard| guard.setting_string("displayName").ok()).unwrap_or_default();
-    send_json(peer, &json!({"kind": "hello", "name": name}));
+    // Where this device can be called back, so the other side redials it without discovery.
+    let port = LISTEN_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    let addrs: Vec<String> = lan_ipv4().into_iter().map(|ip| ip.to_string()).collect();
+    send_json(peer, &json!({"kind": "hello", "name": name, "port": port, "addrs": addrs}));
 }
 
 /// The paired device said hello, so it has confirmed this one. The first hello on a connection is
@@ -4498,6 +4752,126 @@ mod disconnect_tests {
         assert_eq!(redial_ids(saved.clone(), |id| id == "a", &paused), vec!["c".to_string()]);
         // After Connect the hold is lifted and the device is dialed again.
         assert_eq!(redial_ids(saved, |id| id == "a", &HashSet::new()), vec!["b".to_string(), "c".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod redial_tests {
+    use super::{hello_address, redial_targets, redial_wait, Nearby, Redial, REDIAL_MAX_WAIT};
+    use crate::frames::Frame;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn waits_grow_from_one_second_to_a_minute_with_at_most_a_quarter_more() {
+        let waits: Vec<u64> = (1..=9).map(|tries| redial_wait(tries, 0.0).as_secs()).collect();
+        assert_eq!(waits, vec![1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(redial_wait(1, 1.0), Duration::from_millis(1250));
+        assert_eq!(redial_wait(40, 1.0), REDIAL_MAX_WAIT + REDIAL_MAX_WAIT / 4);
+        assert_eq!(redial_wait(3, 7.0), redial_wait(3, 1.0));
+    }
+
+    #[test]
+    fn a_missing_device_is_called_at_once_then_after_its_wait() {
+        let mut redial = Redial::default();
+        let missing = vec!["phone".to_string()];
+        let start = Instant::now();
+        assert_eq!(redial.take_due(&missing, start, || 0.0), vec![("phone".to_string(), 0)]);
+        assert!(redial.take_due(&missing, start + Duration::from_millis(500), || 0.0).is_empty());
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(1), || 0.0), vec![("phone".to_string(), 1)]);
+        // Waits 2 seconds now.
+        assert!(redial.take_due(&missing, start + Duration::from_millis(2500), || 0.0).is_empty());
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(3), || 0.0).len(), 1);
+    }
+
+    #[test]
+    fn a_call_under_way_is_not_repeated_until_it_fails() {
+        let mut redial = Redial::default();
+        let missing = vec!["phone".to_string()];
+        let start = Instant::now();
+        assert_eq!(redial.take_due(&missing, start, || 0.0).len(), 1);
+        redial.calling("phone", start, 2, false);
+        assert!(redial.take_due(&missing, start + Duration::from_secs(2), || 0.0).is_empty());
+        redial.dial_failed("phone");
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(2), || 0.0).len(), 1);
+        // A relay request is waited out even when the LAN part fails.
+        redial.calling("phone", start + Duration::from_secs(2), 1, true);
+        redial.dial_failed("phone");
+        assert!(redial.take_due(&missing, start + Duration::from_secs(10), || 0.0).is_empty());
+    }
+
+    #[test]
+    fn a_connection_that_closes_before_it_is_ready_is_not_called_again_at_once() {
+        let mut redial = Redial::default();
+        let missing = vec!["phone".to_string()];
+        let start = Instant::now();
+        redial.connected("phone");
+        redial.closed_early("phone", start, 0.0);
+        assert!(redial.take_due(&missing, start, || 0.0).is_empty());
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(1), || 0.0), vec![("phone".to_string(), 1)]);
+        // Each early close in a row waits longer.
+        redial.connected("phone");
+        redial.closed_early("phone", start, 0.0);
+        assert!(redial.take_due(&missing, start + Duration::from_secs(1), || 0.0).is_empty());
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(2), || 0.0).len(), 1);
+        // Once a link worked, losing it calls again at once and starts the waits over.
+        redial.connected("phone");
+        redial.link_lost("phone");
+        assert_eq!(redial.take_due(&missing, start + Duration::from_secs(2), || 0.0), vec![("phone".to_string(), 0)]);
+        assert!(!redial.early_closes.contains_key("phone"));
+    }
+
+    #[test]
+    fn a_kick_calls_again_at_once_and_starts_the_waits_over() {
+        let mut redial = Redial::default();
+        let missing = vec!["phone".to_string(), "laptop".to_string()];
+        let start = Instant::now();
+        for _ in 0..5 {
+            redial.take_due(&missing, Instant::now(), || 0.0);
+        }
+        let _ = start;
+        redial.kick("phone");
+        let due = redial.take_due(&missing, Instant::now(), || 0.0);
+        assert_eq!(due, vec![("phone".to_string(), 0)]);
+        redial.kick_all();
+        let due = redial.take_due(&missing, Instant::now(), || 0.0);
+        assert_eq!(due.len(), 2);
+        // A connected device leaves the schedule; one that is no longer missing is dropped too.
+        redial.connected("phone");
+        redial.take_due(&["laptop".to_string()], Instant::now(), || 0.0);
+        assert!(!redial.due.contains_key("phone"));
+    }
+
+    #[test]
+    fn saved_addresses_come_before_nearby_ones_each_once() {
+        let nearby = Nearby {
+            device_id: "phone".into(),
+            name: "Phone".into(),
+            host: "192.168.1.20".into(),
+            hosts: vec!["192.168.1.20".into(), "10.0.0.5".into()],
+            port: 5000,
+        };
+        let saved = Some((vec!["192.168.1.30".to_string(), "192.168.1.20".to_string()], 5000));
+        assert_eq!(
+            redial_targets(saved, Some(&nearby)),
+            vec![("192.168.1.30".to_string(), 5000), ("192.168.1.20".to_string(), 5000), ("10.0.0.5".to_string(), 5000)]
+        );
+        // The device moved to another port: the old port is still tried first, then the new one.
+        let old = Some((vec!["192.168.1.20".to_string()], 4000));
+        assert_eq!(redial_targets(old, Some(&nearby)).len(), 3);
+        assert!(redial_targets(None, None).is_empty());
+    }
+
+    #[test]
+    fn a_hello_carries_the_port_and_usable_addresses() {
+        let frame = Frame::Message(serde_json::to_vec(&json!({"kind": "hello", "name": "PC", "port": 51000, "addrs": ["192.168.1.5", "127.0.0.1", "nonsense", "224.0.0.1"]})).unwrap());
+        assert_eq!(hello_address(&frame), Some((51000, vec!["192.168.1.5".to_string()])));
+        // Older versions send no port: nothing to remember.
+        let old = Frame::Message(serde_json::to_vec(&json!({"kind": "hello", "name": "PC"})).unwrap());
+        assert_eq!(hello_address(&old), None);
+        let other = Frame::Message(serde_json::to_vec(&json!({"kind": "holdings", "port": 1})).unwrap());
+        assert_eq!(hello_address(&other), None);
+        assert_eq!(hello_address(&Frame::Keepalive), None);
     }
 }
 

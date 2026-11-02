@@ -3,9 +3,10 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, pickFolder, type Feature, type Grant } from "../api";
 import { useApp } from "../app/model";
-import { CommitInput, Revise, Row, Segmented, Select, Switch } from "../components/controls";
+import { CommitInput, Row, Segmented, Select, Switch } from "../components/controls";
 import { SyncButton } from "../components/SyncButton";
 import { problemGroups } from "../lib/library";
+import { isAndroid } from "../lib/platform";
 import { Icons } from "../ui/icons";
 
 const SOURCE_URL = "https://github.com/zhebuilds/TunePeerly";
@@ -91,24 +92,29 @@ export function SettingsPage() {
             ]}
           />
         </Row>
-        <Row title={t("settings.miniPlayer")} help={t("settings.miniPlayerHelp")}>
-          <Switch label={t("settings.miniPlayer")} checked={Boolean(settings.miniPlayer)} onChange={(value) => set("miniPlayer", value)} />
-        </Row>
-        <Row title={t("settings.miniTray")} help={t("settings.miniTrayHelp")}>
-          <Switch label={t("settings.miniTray")} checked={settings.miniTray !== false} onChange={(value) => set("miniTray", value)} />
-        </Row>
-        <Row title={t("settings.closeWindow")} help={t("settings.closeWindowHelp")}>
-          <Segmented
-            label={t("settings.closeWindow")}
-            value={settings.closeAction === "tray" || settings.closeAction === "quit" ? String(settings.closeAction) : "ask"}
-            onChange={(value) => set("closeAction", value === "ask" ? "" : value)}
-            options={[
-              { value: "ask", label: t("settings.closeAsk") },
-              { value: "tray", label: t("settings.closeTray") },
-              { value: "quit", label: t("settings.closeQuit") },
-            ]}
-          />
-        </Row>
+        {/* Mini player and close-to-tray are desktop window behaviours. */}
+        {!isAndroid && (
+          <>
+            <Row title={t("settings.miniPlayer")} help={t("settings.miniPlayerHelp")}>
+              <Switch label={t("settings.miniPlayer")} checked={Boolean(settings.miniPlayer)} onChange={(value) => set("miniPlayer", value)} />
+            </Row>
+            <Row title={t("settings.miniTray")} help={t("settings.miniTrayHelp")}>
+              <Switch label={t("settings.miniTray")} checked={settings.miniTray !== false} onChange={(value) => set("miniTray", value)} />
+            </Row>
+            <Row title={t("settings.closeWindow")} help={t("settings.closeWindowHelp")}>
+              <Segmented
+                label={t("settings.closeWindow")}
+                value={settings.closeAction === "tray" || settings.closeAction === "quit" ? String(settings.closeAction) : "ask"}
+                onChange={(value) => set("closeAction", value === "ask" ? "" : value)}
+                options={[
+                  { value: "ask", label: t("settings.closeAsk") },
+                  { value: "tray", label: t("settings.closeTray") },
+                  { value: "quit", label: t("settings.closeQuit") },
+                ]}
+              />
+            </Row>
+          </>
+        )}
         <Row title={t("settings.language")}>
           <Segmented
             label={t("settings.language")}
@@ -152,7 +158,8 @@ export function SettingsPage() {
           </button>
         </Row>
         <Row title={t("settings.downloadFolder")} help={settings.downloadFolder ? <span className="mono">{settings.downloadFolder}</span> : t("settings.downloadFolderNone")}>
-          <button
+          {/* Android keeps downloads in the app's own folder; there is no other folder to choose. */}
+          {!isAndroid && <button
             type="button"
             className="btn soft"
             onClick={() =>
@@ -164,12 +171,12 @@ export function SettingsPage() {
             }
           >
             <Icons.folder /> {t("common.choose")}
-          </button>
+          </button>}
         </Row>
       </section>
 
       <section className="panel" ref={(node) => { refs.current.sync = node; }}>
-        <h2>{t("settings.sync")}<Revise /></h2>
+        <h2>{t("settings.sync")}</h2>
         <p className="setting-help">{t("settings.syncHelp")}</p>
         <p className="setting-help">{t("settings.overwritePolicyHelp")}</p>
         {FEATURES.map((feature) => {

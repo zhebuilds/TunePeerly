@@ -1,8 +1,8 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
 //! The random key the library database is encrypted with, kept in `db.key` next to the database.
 //! On Windows the file holds the key sealed with DPAPI for the signed-in user, so it opens only under
-//! that account. Elsewhere it holds the bare key in a file only the owner can read; Android moves the
-//! key into the Keystore in a later stage.
+//! that account. On Android it holds the key wrapped by an AES-GCM key kept in the Android Keystore.
+//! Elsewhere it holds the bare key in a file only the owner can read.
 use std::path::Path;
 
 use rand::TryRngCore;
@@ -89,7 +89,20 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "android")]
+mod platform {
+    use crate::error::AppResult;
+
+    pub fn seal(plain: &[u8]) -> AppResult<Vec<u8>> {
+        crate::android::seal(plain)
+    }
+
+    pub fn unseal(sealed: &[u8]) -> AppResult<Vec<u8>> {
+        crate::android::unseal(sealed)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "android")))]
 mod platform {
     use crate::error::AppResult;
 

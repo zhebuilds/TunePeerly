@@ -174,6 +174,8 @@ export const api = {
   updateSetting: (key: string, value: unknown) => invoke("update_setting", { key, value }),
   network: (action: string, payload: unknown = null) => invoke("network_command", { action, payload }),
   remoteUrl: (contentId: string, exclude: string[]) => invoke<{ url: string; deviceId: string }>("remote_url", { contentId, exclude }),
+  /** Android: the start of the stream URLs that pick a connected device on every request; add a content id. */
+  streamBase: () => invoke<string>("stream_base"),
   moveMembership: (previous: string, next: string, accept: boolean) => invoke("move_membership", { previous, next, accept }),
   showInFolder: (localFileId: string) => invoke("show_in_folder", { localFileId }),
   revealPath: (path: string) => invoke("reveal_path", { path }),
@@ -184,6 +186,8 @@ export const api = {
   hideToTray: () => invoke("hide_to_tray"),
   setTrayMenu: (show: string, quit: string, name: string) => invoke("set_tray_menu", { show, quit, name }),
   fileUrl: (path: string) => convertFileSrc(path),
+  /** Android: the system picker copies the chosen songs or folder into the app, which then imports them. */
+  androidImport: (folder: boolean) => invoke<ImportSummary[]>("android_import", { folder }),
 };
 
 export async function pickFolder(): Promise<string | null> {

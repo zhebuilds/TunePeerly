@@ -167,6 +167,20 @@ impl Db {
         Ok(())
     }
 
+    /// Uses `name` (the phone's own name on Android) when this device has no real name yet: none, or
+    /// the "localhost" an Android phone reports as its host name. A name the user chose stays.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn adopt_device_name(&self, name: &str) -> AppResult<bool> {
+        let name = name.trim();
+        let saved = self.setting_string("displayName")?;
+        let placeholder = saved.trim().is_empty() || saved.trim().eq_ignore_ascii_case("localhost");
+        if name.is_empty() || !placeholder || name.eq_ignore_ascii_case("localhost") {
+            return Ok(false);
+        }
+        self.set_device_setting("displayName", json!(name))?;
+        Ok(true)
+    }
+
     /// Whether the corner bar shows when the window is minimized, and when it is hidden in the tray.
     pub fn mini_flags(&self) -> (bool, bool) {
         (
@@ -1050,6 +1064,48 @@ impl Db {
         Ok(())
     }
 
+    /// Where a paired device last accepted connections: its IPv4 addresses, best first, and its port.
+    pub fn peer_address(&self, device_id: &str) -> AppResult<Option<(Vec<String>, u16)>> {
+        let row: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT hosts, port FROM peer_addresses WHERE device_id = ?1",
+                params![device_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(hosts, port)| {
+            let hosts: Vec<String> = hosts.split(',').filter(|host| !host.is_empty()).map(str::to_string).collect();
+            let port = u16::try_from(port).ok().filter(|port| *port != 0)?;
+            (!hosts.is_empty()).then_some((hosts, port))
+        }))
+    }
+
+    /// Remembers where a paired device can be reached, so it is called there again without discovery.
+    /// `hosts` come first; addresses saved before follow, up to `PEER_ADDRESS_LIMIT` in all.
+    pub fn save_peer_address(&self, device_id: &str, hosts: &[String], port: u16, at_ms: i64) -> AppResult<()> {
+        if port == 0 || hosts.is_empty() {
+            return Ok(());
+        }
+        let saved = self.peer_address(device_id)?.map(|(hosts, _)| hosts).unwrap_or_default();
+        let mut merged: Vec<String> = Vec::new();
+        for host in hosts.iter().chain(saved.iter()) {
+            if host.parse::<std::net::Ipv4Addr>().is_ok() && !merged.contains(host) {
+                merged.push(host.clone());
+            }
+        }
+        merged.truncate(PEER_ADDRESS_LIMIT);
+        if merged.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO peer_addresses(device_id, hosts, port, seen_at) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(device_id) DO UPDATE SET hosts = excluded.hosts, port = excluded.port, seen_at = excluded.seen_at",
+            params![device_id, merged.join(","), i64::from(port), at_ms],
+        )?;
+        Ok(())
+    }
+
     pub fn rename_peer(&self, device_id: &str, name: &str) -> AppResult<bool> {
         let changed = self.conn.execute(
             "UPDATE peers SET display_name = ?2 WHERE device_id = ?1 AND display_name <> ?2",
@@ -1060,6 +1116,8 @@ impl Db {
 
     pub fn remove_peer(&self, device_id: &str) -> AppResult<()> {
         self.delete_peer_holdings(device_id)?;
+        self.conn
+            .execute("DELETE FROM peer_addresses WHERE device_id = ?1", params![device_id])?;
         self.conn
             .execute("DELETE FROM peers WHERE device_id = ?1", params![device_id])?;
         Ok(())
@@ -1233,6 +1291,9 @@ impl Db {
         Ok(())
     }
 }
+
+/// Saved addresses kept per paired device.
+pub const PEER_ADDRESS_LIMIT: usize = 6;
 
 #[derive(Debug, Clone)]
 pub struct PeerRow {
@@ -1452,6 +1513,12 @@ CREATE TABLE IF NOT EXISTS peers (
     display_name TEXT NOT NULL,
     trust TEXT NOT NULL DEFAULT 'full'
 );
+CREATE TABLE IF NOT EXISTS peer_addresses (
+    device_id TEXT PRIMARY KEY,
+    hosts TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    seen_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS removed_devices (
     device_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -1535,6 +1602,40 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir.join("library.db"), dir.clone(), dir.join("cache")).unwrap();
         (db, dir)
+    }
+
+    #[test]
+    fn peer_addresses_are_saved_merged_and_dropped_with_the_device() {
+        let (db, dir) = open_db("addresses");
+        assert_eq!(db.peer_address("phone").unwrap(), None);
+        db.save_peer_address("phone", &["192.168.1.20".into()], 5000, 1).unwrap();
+        db.save_peer_address("phone", &["10.0.0.5".into(), "not-an-ip".into(), "192.168.1.20".into()], 5001, 2).unwrap();
+        assert_eq!(db.peer_address("phone").unwrap(), Some((vec!["10.0.0.5".to_string(), "192.168.1.20".to_string()], 5001)));
+        // Nothing usable changes nothing.
+        db.save_peer_address("phone", &[], 6000, 3).unwrap();
+        db.save_peer_address("phone", &["10.0.0.9".into()], 0, 3).unwrap();
+        assert_eq!(db.peer_address("phone").unwrap().map(|(_, port)| port), Some(5001));
+        let many: Vec<String> = (1..=10).map(|n| format!("10.1.0.{n}")).collect();
+        db.save_peer_address("phone", &many, 5001, 4).unwrap();
+        assert_eq!(db.peer_address("phone").unwrap().unwrap().0.len(), PEER_ADDRESS_LIMIT);
+        db.remove_peer("phone").unwrap();
+        assert_eq!(db.peer_address("phone").unwrap(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_phone_named_localhost_takes_its_own_name_but_a_chosen_name_stays() {
+        let (db, dir) = open_db("devname");
+        db.set_device_setting("displayName", json!("localhost")).unwrap();
+        assert!(db.adopt_device_name("Pixel 9").unwrap());
+        assert_eq!(db.setting_string("displayName").unwrap(), "Pixel 9");
+        assert!(!db.adopt_device_name("Other").unwrap());
+        assert_eq!(db.setting_string("displayName").unwrap(), "Pixel 9");
+        db.set_device_setting("displayName", json!("")).unwrap();
+        assert!(!db.adopt_device_name("localhost").unwrap());
+        assert!(db.adopt_device_name("  Kuang's phone ").unwrap());
+        assert_eq!(db.setting_string("displayName").unwrap(), "Kuang's phone");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn put_marker(db: &Db, value: &str) {

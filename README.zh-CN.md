@@ -21,7 +21,6 @@
 - 手动发送或覆盖喜欢的歌曲和外观，不会自动同步。
 - 无痕模式会暂停发现、同步和播放记录。也可以拉黑一台设备。
 - 浅色和深色主题、中英文、滚动歌词、托盘图标、迷你播放器，以及 Windows 任务栏缩略图上的播放按钮。
-- 有些设置标着**待修改**、**不要使用**或**待完善且未测试**。标签不说明具体问题。[使用手册](docs/guide.zh-CN.md)列出了每个标签对应哪些设置。中继标着不要使用，还标着待完善且未测试。
 
 ## 安全和隐私
 
@@ -55,6 +54,8 @@ Get-FileHash -Algorithm SHA256 .\TunePeerly-0.6.0-alpha.1-x64-Setup.exe
 音乐库数据库用 SQLCipher 加密。构建时会为它编译一份自带的 OpenSSL，这一步需要 Perl，第一次要几分钟。
 - Windows：安装 [Strawberry Perl](https://strawberryperl.com/)，并确认终端里的 `perl` 是 Strawberry Perl，而不是 Git for Windows 自带的 Perl。`nmake` 随 Rust 本来就需要的 Visual Studio C++ 生成工具一起安装。[NASM](https://www.nasm.us/) 可选：PATH 里有 `nasm` 时，OpenSSL 会带上更快的汇编代码；没有时，OpenSSL 不用汇编编译。
 - Linux 和 macOS：一般已经装好了 `perl` 和 `make`。
+
+以上是桌面版的要求。构建 Android 版见 [Android：从源码构建](docs/android.zh-CN.md#从源码构建)。Windows 上的 Android 版要在 WSL2 里构建。
 
 ```powershell
 npm install

@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { api, type Feature } from "../api";
 import { useApp } from "../app/model";
 import { Icons } from "../ui/icons";
+import { useBackClose } from "../lib/back";
 
 type Menu = "pull" | "push";
 
@@ -15,6 +16,7 @@ export function SyncButton({ feature, compact, quiet }: { feature: Feature; comp
   const boot = app.boot;
   const settings = app.settings;
   const [open, setOpen] = useState<Menu | null>(null);
+  useBackClose(open !== null, () => setOpen(null));
   const [pos, setPos] = useState<{ left: number; top: number }>({ left: 0, top: 0 });
   const root = useRef<HTMLDivElement>(null);
   const online = (boot?.links ?? []).filter((link) => link.state === "online" && link.deviceId !== boot?.deviceId);

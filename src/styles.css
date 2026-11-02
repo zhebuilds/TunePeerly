@@ -2776,10 +2776,6 @@ body.resizing * {
 }
 
 /* ---------- Search ---------- */
-.search-page .chip-row {
-  margin: 4px 0 20px;
-}
-
 .search-top {
   display: grid;
   grid-template-columns: minmax(280px, 2fr) 3fr;
@@ -3477,30 +3473,6 @@ body.resizing * {
 .setting-title {
   font-weight: 600;
   font-size: 14.5px;
-}
-
-.setting-title-line {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.setting-mark {
-  padding: 1px 8px;
-  border-radius: 999px;
-  background: var(--elev);
-  border: 1px solid var(--line-strong);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 650;
-  line-height: 1.6;
-  white-space: nowrap;
-}
-
-.setting-mark.danger {
-  background: var(--bad-soft);
-  border-color: transparent;
-  color: var(--bad);
 }
 
 .setting-help {
@@ -4803,3 +4775,348 @@ button.device-name:hover {
   transform: translate(-50%, -100%);
 }
 
+
+/* ---------- Android phone layout ----------
+   Everything here is scoped to html.android, which only the Android build sets, so the desktop layout is untouched. */
+html.android {
+  --player-h: 64px;
+  --nav-h: 58px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html.android,
+html.android body {
+  overscroll-behavior: none;
+}
+
+html.android .app {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto var(--nav-h);
+  height: 100dvh;
+}
+
+html.android .main-card {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+html.android .main-card::before {
+  height: 56px;
+}
+
+html.android .main-scroll {
+  padding-top: 56px;
+  scroll-padding-top: 90px;
+}
+
+html.android .main-scroll::-webkit-scrollbar-track {
+  margin-top: 56px;
+}
+
+html.android .page {
+  padding: 4px 14px 28px;
+}
+
+html.android .topbar {
+  right: 0;
+  gap: 8px;
+  height: 56px;
+  padding: 8px 10px 0;
+}
+
+html.android .topbar .nav-arrows {
+  gap: 4px;
+}
+
+html.android .topbar .search-box {
+  min-width: 0;
+  width: auto;
+  flex: 1 1 0;
+}
+
+/* The library list is a sheet over the page, opened from the tab bar. */
+html.android .sidebar {
+  display: none;
+}
+
+html.android .app.library-open .sidebar {
+  display: flex;
+  grid-column: 1;
+  grid-row: 1;
+  width: 100% !important;
+  z-index: 30;
+  border-right: none;
+  padding-top: 6px;
+}
+
+html.android .app.library-open .main-card {
+  visibility: hidden;
+}
+
+html.android .sidebar .resize-handle {
+  display: none;
+}
+
+/* The queue and notices cover the page instead of sitting beside it. */
+html.android .app.queue-open .queue-panel,
+html.android .app.notices-open .queue-panel {
+  position: fixed;
+  inset: 0 0 calc(var(--player-h) + var(--nav-h)) 0;
+  width: auto;
+  z-index: 40;
+  border-left: none;
+  box-shadow: none;
+}
+
+/* Mini player: cover, title, like, play and next, with a thin progress line on top. */
+html.android .player-bar {
+  grid-column: 1;
+  grid-row: 2;
+  position: relative;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  height: var(--player-h);
+  padding: 0 6px 0 8px;
+}
+
+html.android .mini-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -1px;
+  height: 2px;
+  background: var(--line);
+  pointer-events: none;
+}
+
+html.android .mini-progress span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+html.android .player-left {
+  gap: 10px;
+}
+
+html.android .player-cover {
+  width: 46px;
+  height: 46px;
+}
+
+html.android .player-bar .player-controls {
+  gap: 2px;
+}
+
+html.android .player-bar:not(.expanded) .player-controls > :first-child,
+html.android .player-bar:not(.expanded) .player-controls > :nth-child(2),
+html.android .player-bar:not(.expanded) .player-controls > :last-child,
+html.android .player-bar:not(.expanded) .seek,
+html.android .player-bar:not(.expanded) .player-right {
+  display: none;
+}
+
+/* On the now-playing page the bar grows into the full controls with a seek bar. */
+html.android .player-bar.expanded {
+  height: auto;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  padding: 8px 12px 6px;
+}
+
+html.android .player-bar.expanded .mini-progress,
+html.android .player-bar.expanded .player-cover,
+html.android .player-bar.expanded .volume {
+  display: none;
+}
+
+html.android .player-bar.expanded .player-controls {
+  gap: 18px;
+}
+
+html.android .player-bar.expanded .play-btn {
+  width: 56px;
+  height: 56px;
+}
+
+html.android .player-bar.expanded .play-btn svg {
+  width: 26px;
+  height: 26px;
+}
+
+html.android .player-bar.expanded .player-right {
+  justify-content: center;
+  gap: 24px;
+}
+
+/* Touch sizes: at least 44px for anything tapped. */
+html.android .icon-btn {
+  width: 44px;
+  height: 44px;
+}
+
+html.android .play-btn {
+  width: 44px;
+  height: 44px;
+}
+
+html.android .round-btn {
+  min-width: 40px;
+  min-height: 40px;
+}
+
+/* No hover on a phone: keep row controls visible. */
+html.android .track-row .more-btn {
+  opacity: 1;
+}
+
+/* Tab bar. */
+html.android .mobile-nav {
+  grid-column: 1;
+  grid-row: 3;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  height: var(--nav-h);
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+
+.mobile-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.mobile-tab.active {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.mobile-tab-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
+.mobile-tab-icon svg {
+  width: 24px;
+  height: 24px;
+}
+
+.mobile-tab-icon .nav-badge {
+  position: absolute;
+  top: -4px;
+  right: -10px;
+}
+
+.mobile-tab-label {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  padding: 0 2px;
+}
+
+/* Now playing stacks the cover above the lyrics. */
+html.android .now-page {
+  --now-cover: min(64vw, 300px);
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 16px;
+  height: auto;
+  min-height: calc(100dvh - var(--nav-h) - 200px);
+  padding: 72px 16px 16px;
+  overflow: visible;
+}
+
+html.android .now-art {
+  justify-items: center;
+}
+
+html.android .modal {
+  padding: 18px;
+}
+
+html.android .menu {
+  max-width: calc(100vw - 16px);
+}
+
+/* The sheet only needs the library list; the tab bar already has the other links. Back and forward are the system back gesture. */
+html.android .app.library-open .sidebar .side-nav,
+html.android .app.library-open .sidebar .side-foot,
+html.android .topbar .nav-arrows {
+  display: none;
+}
+
+html.android .app.library-open .sidebar .side-library {
+  flex: 1;
+}
+
+/* The Devices tab carries the pairing badge, and incognito shows on the menu button. */
+html.android .topbar .top-status {
+  display: none;
+}
+
+/* Phones use overlay scrollbars; keep a desktop-style gutter from eating the right edge. */
+html.android .main-scroll {
+  scrollbar-width: none;
+}
+
+/* Device rows: name and status on their own line, the controls wrap under it. */
+html.android .device-item .device-text {
+  flex: 1 0 calc(100% - 30px);
+}
+
+/* Phone top bar: refresh and incognito sit in a small menu next to downloads. */
+.top-more {
+  position: relative;
+}
+
+.top-more-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 59;
+}
+
+.top-more-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 60;
+  min-width: 200px;
+}
+
+.top-more-check {
+  margin-left: auto;
+}
+
+/* Phone track list: the title and artist get the width. The header, number, duration and extra columns
+   are dropped; sorting stays in the sort menu above the list, and the playing song is shown in the accent colour. */
+html.android .track-head,
+html.android .track-row .cell.num,
+html.android .track-row .c-time,
+html.android .track-row .c-source,
+html.android .track-row .c-album,
+html.android .track-row .c-folder,
+html.android .track-row .c-added {
+  display: none;
+}
+
+html.android .track-row {
+  gap: 8px;
+  padding: 0 2px 0 4px;
+}
+
+html.android .track-row .c-like {
+  width: 40px;
+}
+
+html.android .track-row .c-more {
+  width: 40px;
+  justify-content: center;
+}

@@ -1,4 +1,6 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
+#[cfg(target_os = "android")]
+mod android;
 mod desktop;
 mod catalog;
 mod media;
@@ -422,6 +424,7 @@ fn network_command(state: State<'_, AppState>, action: String, payload: Value) -
             buffer_enough: payload.get("bufferEnough").and_then(|v| v.as_bool()).unwrap_or(false),
         },
         "close-route" => net::Cmd::CloseRoutes,
+        "network-changed" => net::Cmd::NetworkChanged,
         _ => net::Cmd::Apply,
     };
     state.net.tx.send(cmd).map_err(|_| AppError::Message("network stopped".into()))?;
@@ -441,20 +444,52 @@ fn remote_url(state: State<'_, AppState>, content_id: String, exclude: Option<Ve
             sync_logic::FailureClass::Transport => {}
         }
     }
-    let mut holders: Vec<String> = {
-        let db = state.db.lock().unwrap_or_else(PoisonError::into_inner);
+    let exclude = exclude.unwrap_or_default();
+    let online = state.net.live.inner.lock().unwrap_or_else(PoisonError::into_inner).links.clone();
+    let device_id = online_holder(&state.db, &online, &content_id, &exclude)?
+        .ok_or_else(|| AppError::Message(if exclude.is_empty() { "notice.offlineTrack" } else { "playback.allSourcesFailed" }.into()))?;
+    Ok(json!({"url": state.net.bus.open_route(&content_id, &device_id), "deviceId": device_id}))
+}
+
+/// The first connected device that holds `content_id`, leaving out `exclude`.
+fn online_holder(db: &Mutex<Db>, online: &[net::LinkStatus], content_id: &str, exclude: &[String]) -> AppResult<Option<String>> {
+    let holders: Vec<String> = {
+        let db = db.lock().unwrap_or_else(PoisonError::into_inner);
         let mut stmt = db.conn.prepare("SELECT DISTINCT device_id FROM holdings WHERE content_id = ?1 ORDER BY device_id")?;
         let rows = stmt.query_map(rusqlite::params![content_id], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    let exclude = exclude.unwrap_or_default();
-    holders.retain(|holder| !exclude.contains(holder));
-    let online = state.net.live.inner.lock().unwrap_or_else(PoisonError::into_inner).links.clone();
-    let device_id = holders
+    Ok(holders
         .into_iter()
-        .find(|holder| online.iter().any(|link| &link.device_id == holder && link.state == "online"))
-        .ok_or_else(|| AppError::Message(if exclude.is_empty() { "notice.offlineTrack" } else { "playback.allSourcesFailed" }.into()))?;
-    Ok(json!({"url": state.net.bus.open_route(&content_id, &device_id), "deviceId": device_id}))
+        .filter(|holder| !exclude.contains(holder))
+        .find(|holder| online.iter().any(|link| &link.device_id == holder && link.state == "online")))
+}
+
+/// Lets stream URLs (`AudioBus::stream_base`) pick a device on every request, with the same rules as `remote_url`.
+fn install_holder_picker(db: Arc<Mutex<Db>>, net: &net::Network) {
+    let live = net.live.clone();
+    net.bus.set_picker(Arc::new(move |content_id: &str, skip: &[String]| {
+        {
+            let guard = db.lock().unwrap_or_else(PoisonError::into_inner);
+            if guard.setting_bool("incognito").unwrap_or(true) {
+                return None;
+            }
+            if let Ok(Some(reason)) = guard.unplayable_reason(content_id) {
+                if !matches!(sync_logic::failure_class(&reason), sync_logic::FailureClass::Transport) {
+                    return None;
+                }
+            }
+        }
+        let online = live.inner.lock().unwrap_or_else(PoisonError::into_inner).links.clone();
+        online_holder(&db, &online, content_id, skip).ok().flatten()
+    }));
+}
+
+/// The start of every song's stream URL; the content id follows. Android's player uses it to reach any
+/// song in the queue by itself.
+#[tauri::command]
+fn stream_base(state: State<'_, AppState>) -> String {
+    state.net.bus.stream_base()
 }
 
 #[tauri::command(async)]
@@ -517,21 +552,79 @@ fn set_tray_menu(app: AppHandle, show: String, quit: String, name: String) {
     desktop::set_tray_tooltip(&app, &name);
 }
 
+/// Covers sit in the app's internal cache, outside the `$APPCACHE` the config allows, and downloads go
+/// to the app's own music folder because Android has no folder a picker could hand back as a path.
+#[cfg(target_os = "android")]
+fn android_folders(app: &AppHandle, db: &Db, cache: &Path, app_dir: &Path) {
+    let _ = app.asset_protocol_scope().allow_directory(cache.join("covers"), true);
+    let downloads = config::android_downloads_dir(app_dir);
+    if std::fs::create_dir_all(&downloads).is_ok() {
+        let _ = db.set_device_setting("downloadFolder", json!(downloads.to_string_lossy()));
+    }
+}
+
+/// Opens the system picker, copies the chosen songs into the app's music folder and imports that folder.
+#[cfg(target_os = "android")]
+#[tauri::command(async)]
+fn android_import(app: AppHandle, state: State<'_, AppState>, folder: bool) -> AppResult<Value> {
+    let dir = config::android_imported_dir(&state.db.lock().unwrap_or_else(PoisonError::into_inner).app_dir);
+    if android::pick(folder, &dir)? == 0 {
+        return Ok(json!([]));
+    }
+    import_paths(app, state, vec![dir.to_string_lossy().into_owned()], "directory".into())
+}
+
+/// Android plays songs with a native player; the page sends it its commands here, one at a time.
+#[cfg(target_os = "android")]
+#[tauri::command(async)]
+fn android_audio(args: Value) -> AppResult<()> {
+    android::audio(&args)
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+fn android_audio(args: Value) -> AppResult<()> {
+    let _ = args;
+    Err(AppError::Message("android only".into()))
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+fn android_import(folder: bool) -> AppResult<Value> {
+    let _ = folder;
+    Err(AppError::Message("android only".into()))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            desktop::show_main(app);
-        }))
+    let builder = tauri::Builder::default();
+    // A second launch on desktop brings the running window forward. Android starts one copy by itself.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        desktop::show_main(app);
+    }));
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android::init());
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data = app.path().data_dir().unwrap_or_else(|err| fatal(&format!("data folder: {err}")));
+            #[cfg(not(target_os = "android"))]
             let cache = config::cache_dir();
+            #[cfg(target_os = "android")]
+            let cache = config::android_cache_dir(&data);
             let app_dir = config::app_dir(&data);
             let database = config::database_path(&app_dir);
             let db = Db::open(&database, app_dir.clone(), cache.clone())
                 .unwrap_or_else(|err| fatal(&format!("database {}: {err}", database.display())));
+            #[cfg(target_os = "android")]
+            android_folders(app.handle(), &db, &cache, &app_dir);
+            // An Android phone's host name is "localhost": use the name from its settings instead.
+            #[cfg(target_os = "android")]
+            if let Some(name) = android::device_name() {
+                let _ = db.adopt_device_name(&name);
+            }
             for grant in db.grants().unwrap_or_default() {
                 if Path::new(&grant.path).exists() {
                     allow_grant(app.handle(), &grant.kind, &grant.path);
@@ -542,6 +635,18 @@ pub fn run() {
             let net = net::spawn(app.handle().clone(), db.clone(), material.clone())
                 .unwrap_or_else(|err| fatal(&format!("network: {err}")));
             let _ = net.tx.send(net::Cmd::Apply);
+            // Android tells Rust itself when the network changes, so links are called again at once
+            // even with the screen off.
+            #[cfg(target_os = "android")]
+            {
+                let tx = net.tx.clone();
+                if let Err(err) = android::watch_network(move || {
+                    let _ = tx.send(net::Cmd::NetworkChanged);
+                }) {
+                    eprintln!("network watch: {err}");
+                }
+            }
+            install_holder_picker(db.clone(), &net);
             let (on_minimize, in_tray) = db.lock().unwrap_or_else(PoisonError::into_inner).mini_flags();
             let worker = BackgroundWork {
                 app: app.handle().clone(),
@@ -589,7 +694,10 @@ pub fn run() {
             desktop_command,
             quit_app,
             hide_to_tray,
-            set_tray_menu
+            set_tray_menu,
+            android_import,
+            android_audio,
+            stream_base
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| fatal(&format!("{err}")));
