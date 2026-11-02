@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -17,6 +18,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.DocumentsContract
+import android.provider.Settings
 import android.provider.OpenableColumns
 import android.util.Base64
 import android.util.Log
@@ -28,6 +30,7 @@ import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
+import app.tauri.plugin.Channel
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
@@ -44,6 +47,11 @@ class BlobArgs {
 class PickArgs {
   var folder: Boolean = false
   var dest: String = ""
+}
+
+@InvokeArg
+class NetworkWatchArgs {
+  lateinit var onEvent: Channel
 }
 
 @InvokeArg
@@ -76,7 +84,6 @@ class TrackArgs {
 class TunePlugin(private val activity: Activity) : Plugin(activity) {
   private var webView: WebView? = null
   private var multicast: WifiManager.MulticastLock? = null
-  private var network: ConnectivityManager.NetworkCallback? = null
   private val main = Handler(Looper.getMainLooper())
   private val worker = Executors.newSingleThreadExecutor()
   private var pickDest: File? = null
@@ -108,8 +115,6 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
 
   override fun onDestroy(activity: AppCompatActivity) {
     instance = null
-    network?.let { runCatching { connectivity().unregisterNetworkCallback(it) } }
-    network = null
     multicast?.let { if (it.isHeld) it.release() }
     multicast = null
     worker.shutdown()
@@ -143,30 +148,71 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
 
   private fun connectivity() = activity.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
+  /**
+   * Network changes go to Rust, which calls paired devices again at once (`Cmd::NetworkChanged`).
+   * Registered once per process, so it keeps working while the window is gone and the music plays on.
+   */
   private fun watchNetwork() {
+    if (watching) return
+    watching = true
     var first = true
-    val debounce = Runnable { networkChanged() }
+    // What the last reports said. Signal strength alone changes the capabilities every few seconds;
+    // only a change in how the phone is connected, or in its addresses, calls the links again.
+    var lastCaps: String? = null
+    var lastAddresses: String? = null
+    val debounce = Runnable { networkChanged("changed") }
     val callback = object : ConnectivityManager.NetworkCallback() {
-      private fun changed() {
+      override fun onAvailable(net: Network) {
+        // A new network's first capabilities and addresses come right after; they are not a change.
+        lastCaps = null
+        lastAddresses = null
+        // The first call only reports the network the app started on.
+        if (first) { first = false; return }
+        main.removeCallbacks(debounce)
+        main.post {
+          networkChanged("available")
+          NativeAudio.networkBack()
+        }
+      }
+      override fun onLost(net: Network) {
+        main.removeCallbacks(debounce)
+        main.post { networkChanged("lost") }
+      }
+      override fun onCapabilitiesChanged(net: Network, caps: NetworkCapabilities) {
+        val key = listOf(
+          NetworkCapabilities.TRANSPORT_WIFI, NetworkCapabilities.TRANSPORT_CELLULAR,
+          NetworkCapabilities.TRANSPORT_ETHERNET, NetworkCapabilities.TRANSPORT_VPN,
+        ).joinToString("") { if (caps.hasTransport(it)) "1" else "0" } +
+          (if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) "v" else "-")
+        val before = lastCaps
+        lastCaps = key
+        if (first || before == null || before == key) return
         main.removeCallbacks(debounce)
         main.postDelayed(debounce, 1500)
       }
-      override fun onAvailable(net: Network) {
-        // The first call only reports the network the app started on.
-        if (first) { first = false; return }
-        changed()
-      }
-      override fun onLost(net: Network) = changed()
-      override fun onCapabilitiesChanged(net: Network, caps: NetworkCapabilities) {
-        if (!first) changed()
+      override fun onLinkPropertiesChanged(net: Network, props: LinkProperties) {
+        val key = props.linkAddresses.map { it.address.hostAddress.orEmpty() }.sorted().joinToString(",")
+        val before = lastAddresses
+        lastAddresses = key
+        if (first || before == null || before == key) return
+        main.removeCallbacks(debounce)
+        main.postDelayed(debounce, 1500)
       }
     }
     runCatching { connectivity().registerDefaultNetworkCallback(callback) }
-      .onSuccess { network = callback }
-      .onFailure { Log.w(TAG, "network callback: ${it.message}") }
+      .onFailure {
+        watching = false
+        Log.w(TAG, "network callback: ${it.message}")
+      }
   }
 
-  private fun networkChanged() = invokeRust("network_command", JSONObject().put("action", "network-changed").put("payload", JSONObject.NULL))
+  /** Straight to Rust when it asked for these (`networkWatch`), so a held-back page does not delay it. */
+  private fun networkChanged(why: String = "resumed") {
+    Log.i(TAG, "network $why: links are called again")
+    val channel = rustNetwork
+    if (channel != null && runCatching { channel.send(JSObject().put("reason", why)) }.isSuccess) return
+    (instance ?: this).invokeRust("network_command", JSONObject().put("action", "network-changed").put("payload", JSONObject.NULL))
+  }
 
   private fun invokeRust(command: String, args: JSONObject) {
     val script = "window.__TAURI_INTERNALS__&&window.__TAURI_INTERNALS__.invoke(${JSONObject.quote(command)},$args).catch(function(){})"
@@ -193,6 +239,24 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
   fun audioEvent(json: String) {
     val script = "window.__tpAudio&&window.__tpAudio($json)"
     main.post { webView?.evaluateJavascript(script, null) }
+  }
+
+  /** Rust asks to hear about network changes directly (see `android::watch_network`). */
+  @Command
+  fun networkWatch(invoke: Invoke) {
+    val args = invoke.parseArgs(NetworkWatchArgs::class.java)
+    rustNetwork = args.onEvent
+    invoke.resolve(JSObject())
+  }
+
+  /** The name the user gave the phone in its settings, else its model; never "localhost". */
+  @Command
+  fun deviceName(invoke: Invoke) {
+    val set = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1) {
+      runCatching { Settings.Global.getString(activity.contentResolver, Settings.Global.DEVICE_NAME) }.getOrNull()
+    } else null
+    val name = set?.trim().orEmpty().ifEmpty { Build.MODEL?.trim().orEmpty() }
+    invoke.resolve(JSObject().put("name", name))
   }
 
   /** A command from the page for the phone's player. Applied in order on the main thread. */
@@ -308,6 +372,9 @@ class TunePlugin(private val activity: Activity) : Plugin(activity) {
   companion object {
     private const val TAG = "TunePlugin"
     @Volatile var instance: TunePlugin? = null
+    /** Rust's listener for network changes; kept for the whole process, like the callback that feeds it. */
+    @Volatile private var rustNetwork: Channel? = null
+    @Volatile private var watching = false
   }
 }
 

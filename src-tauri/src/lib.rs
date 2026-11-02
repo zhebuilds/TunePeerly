@@ -620,6 +620,11 @@ pub fn run() {
                 .unwrap_or_else(|err| fatal(&format!("database {}: {err}", database.display())));
             #[cfg(target_os = "android")]
             android_folders(app.handle(), &db, &cache, &app_dir);
+            // An Android phone's host name is "localhost": use the name from its settings instead.
+            #[cfg(target_os = "android")]
+            if let Some(name) = android::device_name() {
+                let _ = db.adopt_device_name(&name);
+            }
             for grant in db.grants().unwrap_or_default() {
                 if Path::new(&grant.path).exists() {
                     allow_grant(app.handle(), &grant.kind, &grant.path);
@@ -630,6 +635,17 @@ pub fn run() {
             let net = net::spawn(app.handle().clone(), db.clone(), material.clone())
                 .unwrap_or_else(|err| fatal(&format!("network: {err}")));
             let _ = net.tx.send(net::Cmd::Apply);
+            // Android tells Rust itself when the network changes, so links are called again at once
+            // even with the screen off.
+            #[cfg(target_os = "android")]
+            {
+                let tx = net.tx.clone();
+                if let Err(err) = android::watch_network(move || {
+                    let _ = tx.send(net::Cmd::NetworkChanged);
+                }) {
+                    eprintln!("network watch: {err}");
+                }
+            }
             install_holder_picker(db.clone(), &net);
             let (on_minimize, in_tray) = db.lock().unwrap_or_else(PoisonError::into_inner).mini_flags();
             let worker = BackgroundWork {

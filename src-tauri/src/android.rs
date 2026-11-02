@@ -1,6 +1,7 @@
 // Original work © 2026 zhebuilds. AGPLv3 plus ADDITIONAL_TERMS.md.
 //! The bridge to the Kotlin side (`TunePlugin.kt`): the Keystore that wraps the database key, the
-//! system file picker, and the media session the notification, lock screen and widget read.
+//! system file picker, the media session the notification, lock screen and widget read, the phone's
+//! name, and network changes.
 //! Calls block until Kotlin answers, so they are made from command or setup threads, never the UI thread.
 use std::path::Path;
 use std::sync::OnceLock;
@@ -82,4 +83,32 @@ pub fn playback(track: &DesktopTrack) {
 /// A command for the phone's own player (`NativeAudio.kt`), which plays the songs on Android.
 pub fn audio(args: &serde_json::Value) -> AppResult<()> {
     call::<Ignored>("audio", args).map(|_| ())
+}
+
+#[derive(Deserialize)]
+struct Named {
+    name: String,
+}
+
+/// The name the user gave the phone (Settings, About phone), else its model. None when Kotlin has none.
+pub fn device_name() -> Option<String> {
+    let named: Named = call("deviceName", serde_json::json!({})).ok()?;
+    let name = named.name.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkWatch {
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+}
+
+/// Calls `on_change` whenever Android reports the network came, went or changed. Kotlin calls into
+/// Rust directly, so this works while the page's script is held back with the screen off.
+pub fn watch_network(on_change: impl Fn() + Send + Sync + 'static) -> AppResult<()> {
+    let channel = tauri::ipc::Channel::new(move |_body| {
+        on_change();
+        Ok(())
+    });
+    call::<serde_json::Value>("networkWatch", NetworkWatch { on_event: channel }).map(|_| ())
 }

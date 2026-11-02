@@ -15,13 +15,22 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.CacheWriter
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.Executors
 
 /** A song the phone's player may start by itself. `url` is set for songs on the phone; others stream by content id. */
 data class Song(
@@ -47,8 +56,11 @@ data class Song(
  * with the same rules as `src/player/advance.ts` and started at once, so the music never waits for the
  * page. Every change is reported back (`queue` events) and the page takes it over when it runs again.
  *
- * Remote songs play from the app's stream URLs, which pick a connected device on every request, so a
- * dropped link is retried here a few times before the song counts as failed.
+ * Remote songs play from the app's stream URLs, which pick a connected device on every request. A short
+ * drop does not stop the music: the whole current song is loaded into memory ahead of time, the next
+ * remote song is copied into a small cache on disk while this one plays, a load that fails is retried
+ * in the background, and a song that cannot load at all is retried for a few minutes (the link is
+ * called again meanwhile, see `Redial` in net.rs) before it counts as failed.
  *
  * Everything here runs on the main thread. Every stop, pause, skip, retry and error is logged with the
  * tag `NativeAudio`.
@@ -56,8 +68,15 @@ data class Song(
 @OptIn(UnstableApi::class)
 object NativeAudio {
   private const val TAG = "NativeAudio"
-  private const val MAX_RETRIES = 6
+  /** How long a remote song that cannot load is tried again before it counts as failed. */
+  private const val RETRY_WINDOW_MS = 5 * 60_000L
+  private const val RETRY_MAX_WAIT_MS = 10_000L
   private const val MAX_FAILED_IN_ROW = 3
+  /** Remote songs copied ahead of time, least recently used dropped first. */
+  private const val CACHE_BYTES = 200L * 1024 * 1024
+  /** The current song is loaded this far ahead into memory (a whole song, as a rule). */
+  private const val BUFFER_MS = 15 * 60_000
+  private const val BUFFER_BYTES = 48 * 1024 * 1024
   private val main = Handler(Looper.getMainLooper())
   private var context: Context? = null
   private var player: ExoPlayer? = null
@@ -82,6 +101,15 @@ object NativeAudio {
   private var rev = 0L
 
   private var retries = 0
+  /** When the current song first failed to load since it last played (elapsed realtime); 0 when it did not. */
+  private var failingSince = 0L
+  private var cache: SimpleCache? = null
+  private var cacheFactory: CacheDataSource.Factory? = null
+  private val prefetcher = Executors.newSingleThreadExecutor()
+  private var prefetchKey: String? = null
+  private var prefetchWriter: CacheWriter? = null
+  /** When a copy ahead last failed; the next try waits a little (elapsed realtime). */
+  private var prefetchFailedAt = 0L
   /** A song on the phone that could not be read is tried once from a linked device. */
   private var triedStream = false
   private var failedInRow = 0
@@ -128,8 +156,23 @@ object NativeAudio {
       .setConnectTimeoutMs(20_000)
       .setReadTimeoutMs(35_000)
       .setAllowCrossProtocolRedirects(false)
+    // Stream URLs go through the cache, so a song copied ahead of time plays from disk. Files on the
+    // phone are read directly (DefaultDataSource only hands http to the cache).
+    val cached = openCache(ctx, http)
+    // A load that fails is tried again in the background for a few minutes while what is loaded plays.
+    val retryLoads = object : DefaultLoadErrorHandlingPolicy() {
+      override fun getMinimumLoadableRetryCount(dataType: Int) = 60
+    }
+    val loadControl = DefaultLoadControl.Builder()
+      .setBufferDurationsMs(BUFFER_MS, BUFFER_MS, 2_500, 5_000)
+      .setTargetBufferBytes(BUFFER_BYTES)
+      .setPrioritizeTimeOverSizeThresholds(false)
+      .build()
     val made = ExoPlayer.Builder(ctx)
-      .setMediaSourceFactory(DefaultMediaSourceFactory(DefaultDataSource.Factory(ctx, http)))
+      .setMediaSourceFactory(
+        DefaultMediaSourceFactory(DefaultDataSource.Factory(ctx, cached ?: http)).setLoadErrorHandlingPolicy(retryLoads)
+      )
+      .setLoadControl(loadControl)
       .setAudioAttributes(
         AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(),
         true,
@@ -148,6 +191,7 @@ object NativeAudio {
         changed()
         if (isPlaying) {
           retries = 0
+          failingSince = 0L
           failedInRow = 0
           lastTick = SystemClock.elapsedRealtime()
           main.removeCallbacks(ticker)
@@ -166,6 +210,85 @@ object NativeAudio {
     })
     player = made
     return made
+  }
+
+  /** The disk cache for remote songs, opened once per process. Null when it cannot be opened. */
+  private fun openCache(ctx: Context, http: DefaultHttpDataSource.Factory): CacheDataSource.Factory? {
+    cacheFactory?.let { return it }
+    val opened = cache ?: runCatching {
+      SimpleCache(File(ctx.cacheDir, "stream-cache"), LeastRecentlyUsedCacheEvictor(CACHE_BYTES), StandaloneDatabaseProvider(ctx))
+    }.onFailure { Log.w(TAG, "stream cache: ${it.message}") }.getOrNull()
+    cache = opened ?: return null
+    val factory = CacheDataSource.Factory()
+      .setCache(opened)
+      .setUpstreamDataSourceFactory(http)
+      .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+    cacheFactory = factory
+    return factory
+  }
+
+  /** Songs are content-addressed, so the cache key is the content id, whatever the URL's secret is. */
+  private fun cacheKey(contentId: String) = "c:$contentId"
+
+  private fun mediaItem(id: Long, url: String, key: String?): MediaItem {
+    // The song being copied ahead starts now: the player takes over from what was copied so far.
+    if (key != null && key == prefetchKey && prefetchWriter != null) cancelPrefetch()
+    val builder = MediaItem.Builder().setMediaId(id.toString()).setUri(uriOf(url))
+    val song = key?.let { catalog[it] }
+    if (url.startsWith("http://127.0.0.1") && song?.contentId != null) builder.setCustomCacheKey(cacheKey(song.contentId))
+    return builder.build()
+  }
+
+  /**
+   * Copies the next remote song into the disk cache once the current one is loaded, so it starts at
+   * once and plays through a short drop. One copy at a time; a copy that failed is tried again later.
+   */
+  private fun prefetchNext() {
+    val factory = cacheFactory ?: return
+    if (streamBase.isEmpty()) return
+    val key = queue.future.firstOrNull { playable(it) } ?: return
+    val song = catalog[key] ?: return
+    val contentId = song.contentId
+    if (song.url != null || contentId == null) return
+    if (prefetchKey == key) return
+    if (prefetchFailedAt != 0L && SystemClock.elapsedRealtime() - prefetchFailedAt < 15_000) return
+    cancelPrefetch()
+    val spec = DataSpec.Builder().setUri(Uri.parse(streamBase + contentId)).setKey(cacheKey(contentId)).build()
+    val writer = CacheWriter(factory.createDataSource(), spec, null, null)
+    prefetchKey = key
+    prefetchWriter = writer
+    Log.i(TAG, "copy the next song ($key) ahead of time")
+    prefetcher.execute {
+      val ok = runCatching { writer.cache() }
+        .onFailure { Log.i(TAG, "copy ahead of $key stopped: ${it.message}") }
+        .isSuccess
+      main.post {
+        if (prefetchWriter !== writer) return@post
+        prefetchWriter = null
+        if (ok) {
+          prefetchFailedAt = 0L
+          Log.i(TAG, "next song ($key) copied ahead")
+        } else {
+          prefetchFailedAt = SystemClock.elapsedRealtime()
+          prefetchKey = null
+        }
+      }
+    }
+  }
+
+  private fun cancelPrefetch() {
+    prefetchWriter?.cancel()
+    prefetchWriter = null
+    prefetchKey = null
+  }
+
+  /** The phone is on a network again: a song waiting to be retried is tried now. */
+  fun networkBack() {
+    prefetchFailedAt = 0L
+    val pending = retry ?: return
+    Log.i(TAG, "network back: retry song $current now")
+    main.removeCallbacks(pending)
+    pending.run()
   }
 
   private fun stateName(state: Int) = when (state) {
@@ -209,7 +332,7 @@ object NativeAudio {
     val sent = args.optLong("seq", 0L)
     if (sent > seq) seq = sent
     when (op) {
-      "load" -> load(args.getLong("id"), args.getString("url"), args.optString("key").ifEmpty { null })
+      "load" -> load(args.getLong("id"), args.getString("url"), args.text("key"))
       "play" -> if (args.optLong("id") == current) setPlaying(true)
       "pause" -> if (args.optLong("id") == current) setPlaying(false)
       "seek" -> if (args.optLong("id") == current) seek(args.optDouble("sec", 0.0))
@@ -234,20 +357,23 @@ object NativeAudio {
   }
 
   private fun setCatalog(args: JSONObject) {
-    args.optString("base").takeIf { it.isNotEmpty() }?.let { streamBase = it }
+    args.text("base")?.let { streamBase = it }
     val songs = args.optJSONArray("songs") ?: return
+    // The song playing now stays known even if the new list leaves it out.
+    val playing = currentKey?.let { catalog[it] }
     catalog.clear()
+    playing?.let { catalog[it.key] = it }
     for (i in 0 until songs.length()) {
       val row = songs.optJSONObject(i) ?: continue
-      val key = row.optString("k").ifEmpty { null } ?: continue
+      val key = row.text("k") ?: continue
       catalog[key] = Song(
         key = key,
-        url = row.optString("u").ifEmpty { null },
-        contentId = row.optString("c").ifEmpty { null },
-        title = row.optString("t"),
-        artist = row.optString("a"),
-        album = row.optString("l"),
-        coverPath = row.optString("p").ifEmpty { null },
+        url = row.text("u"),
+        contentId = row.text("c"),
+        title = row.text("t") ?: "",
+        artist = row.text("a") ?: "",
+        album = row.text("l") ?: "",
+        coverPath = row.text("p"),
         favorite = row.optBoolean("f"),
         duration = row.optDouble("d", 0.0),
       )
@@ -258,7 +384,7 @@ object NativeAudio {
   private fun keys(array: JSONArray?): ArrayList<String> {
     val out = ArrayList<String>()
     if (array == null) return out
-    for (i in 0 until array.length()) array.optString(i).takeIf { it.isNotEmpty() }?.let { out.add(it) }
+    for (i in 0 until array.length()) (if (array.isNull(i)) null else array.optString(i).ifEmpty { null })?.let { out.add(it) }
     return out
   }
 
@@ -266,17 +392,19 @@ object NativeAudio {
     val seen = args.optLong("rev", -1L)
     if (seen != rev) {
       // The page had not seen the latest move made here yet. It gets that report and sends its queue again.
-      Log.i(TAG, "queue from the page skipped: it saw change $seen, now at $rev")
+      Log.i(TAG, "queue from the page skipped: it saw change $seen, now at $rev; asking for it again")
+      emitQueue("stale")
       return
     }
     queue.past = keys(args.optJSONArray("past"))
-    queue.current = args.optString("current").ifEmpty { null } ?: currentKey
+    queue.current = args.text("current") ?: currentKey
     queue.future = keys(args.optJSONArray("future"))
     queue.repeat = args.optString("repeat", "off")
     queue.order = args.optString("order", "manual")
     queue.contextId = args.optString("contextId", "library")
     if (args.has("pool")) queue.pool = keys(args.optJSONArray("pool"))
     if (args.has("library")) queue.library = keys(args.optJSONArray("library"))
+    if (prefetchKey != null && prefetchKey != queue.future.firstOrNull { playable(it) }) cancelPrefetch()
   }
 
   private fun load(id: Long, url: String, key: String?) {
@@ -289,11 +417,12 @@ object NativeAudio {
     ended = false
     errored = false
     retries = 0
+    failingSince = 0L
     triedStream = false
     heardMs = 0
     heardSent = false
     exo.playWhenReady = false
-    exo.setMediaItem(MediaItem.Builder().setMediaId(id.toString()).setUri(uriOf(url)).build())
+    exo.setMediaItem(mediaItem(id, url, key))
     exo.prepare()
     Log.i(TAG, "load song $id ($key) from the page")
   }
@@ -305,6 +434,7 @@ object NativeAudio {
     if (play && (errored || exo.playbackState == Player.STATE_IDLE)) {
       errored = false
       retries = 0
+      failingSince = 0L
       cancelRetry()
       exo.prepare()
     }
@@ -342,6 +472,7 @@ object NativeAudio {
 
   fun release() {
     Log.i(TAG, "release: the player is closed")
+    cancelPrefetch()
     stop()
     player?.release()
     player = null
@@ -405,10 +536,11 @@ object NativeAudio {
     ended = false
     errored = false
     retries = 0
+    failingSince = 0L
     triedStream = false
     heardMs = 0
     heardSent = false
-    exo.setMediaItem(MediaItem.Builder().setMediaId(current.toString()).setUri(uriOf(url)).build())
+    exo.setMediaItem(mediaItem(current, url, key))
     exo.prepare()
     exo.playWhenReady = true
     Log.i(TAG, "start song $current ($key, ${if (song.url != null) "on the phone" else "remote"}): $reason")
@@ -467,11 +599,15 @@ object NativeAudio {
     val remote = currentUrl?.startsWith("http://127.0.0.1") == true
     val transient = remote && error.errorCode in 1000..2999
     Log.w(TAG, "error on song $id ($currentKey): ${error.errorCodeName} ${error.message} (cause ${error.cause?.message})")
-    if (transient && retries < MAX_RETRIES && id != 0L) {
+    val now = SystemClock.elapsedRealtime()
+    if (transient && failingSince == 0L) failingSince = now
+    // No device has the song right now (503) or the link dropped: the link is being called again, so
+    // keep trying for a few minutes. The music counts as playing meanwhile, which keeps the locks.
+    if (transient && id != 0L && now - failingSince < RETRY_WINDOW_MS) {
       retries++
-      val wait = (1000L shl (retries - 1)).coerceAtMost(15_000L)
+      val wait = (1000L shl (retries - 1).coerceAtMost(4)).coerceAtMost(RETRY_MAX_WAIT_MS)
       val at = exo.currentPosition.coerceAtLeast(0L)
-      Log.i(TAG, "retry $retries/$MAX_RETRIES for song $id at ${at / 1000.0}s in ${wait}ms")
+      Log.i(TAG, "retry $retries for song $id at ${at / 1000.0}s in ${wait}ms (failing for ${(now - failingSince) / 1000}s)")
       cancelRetry()
       val again = Runnable {
         retry = null
@@ -492,7 +628,7 @@ object NativeAudio {
       val at = exo.currentPosition.coerceAtLeast(0L)
       Log.i(TAG, "song $id: the file on the phone failed, trying a linked device")
       currentUrl = url
-      exo.setMediaItem(MediaItem.Builder().setMediaId(id.toString()).setUri(uriOf(url)).build(), at)
+      exo.setMediaItem(mediaItem(id, url, currentKey), at)
       exo.prepare()
       return
     }
@@ -568,6 +704,8 @@ object NativeAudio {
     val exo = player ?: return
     if (current == 0L) return
     val buffered = exo.bufferedPosition.coerceAtLeast(0L) / 1000.0
+    // The current song is loaded to its end: copy the next one ahead now.
+    if (exo.isPlaying && duration > 0 && buffered >= duration - 1.0 && prefetchWriter == null) prefetchNext()
     emit(
       JSONObject()
         .put("t", "state")
@@ -587,3 +725,11 @@ object NativeAudio {
     TunePlugin.instance?.audioEvent(event.toString())
   }
 }
+
+/**
+ * A string field, or null when it is missing, empty or JSON null. `optString` turns a JSON null
+ * into the text "null", which made every remote song (sent with `u: null`) look like a file on the
+ * phone, so the next song never started.
+ */
+internal fun JSONObject.text(name: String): String? =
+  if (isNull(name)) null else optString(name).ifEmpty { null }

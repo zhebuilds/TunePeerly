@@ -52,9 +52,16 @@ class PlaybackService : MediaSessionService() {
       .setCallback(Callback())
       .setMediaButtonPreferences(likeButtons(NowPlaying.snapshot))
       .build()
+    // Stays in the foreground for a while after a pause, like the locks below, so the app is not
+    // frozen or killed while the queue waits.
+    setForegroundServiceTimeoutMs(HOLD_AFTER_PAUSE_MS)
     setMediaNotificationProvider(
       DefaultMediaNotificationProvider.Builder(this).build().apply { setSmallIcon(R.drawable.ic_stat_note) }
     )
+    // Nothing binds to this service (the page talks to NativeAudio, not to a MediaController), so
+    // the session is added here. Without this Media3 never shows the notification and never moves
+    // the service to the foreground, and Android stops it a minute after the app leaves the screen.
+    addSession(session!!)
     NowPlaying.listeners.add(listener)
     locks(NowPlaying.snapshot.playing)
   }
@@ -78,17 +85,20 @@ class PlaybackService : MediaSessionService() {
   }
 
   /**
-   * The audio element streams songs from linked devices, so the CPU and the Wi-Fi radio stay up
-   * while it plays, including the gap while the next song loads.
+   * Songs stream from linked devices, so the CPU and the Wi-Fi radio stay up while the music plays,
+   * while a song waits for its device to come back, and for 10 minutes after a pause, so the links
+   * (kept by Rust, see `Redial` in net.rs) are still up when play is pressed on the lock screen.
    */
   private val release = Runnable { locks(false, now = true) }
 
   private fun locks(playing: Boolean, now: Boolean = false) {
     if (!playing && !now) {
-      // A pause or the gap between two songs: keep the CPU and Wi-Fi up a little longer, so the next
-      // song can still connect with the screen off.
-      handler.removeCallbacks(release)
-      handler.postDelayed(release, 20_000)
+      // A pause or the gap between two songs: keep the CPU and Wi-Fi up for a while, so the queue
+      // goes on at once and the links stay up with the screen off.
+      if (wake?.isHeld == true) {
+        handler.removeCallbacks(release)
+        handler.postDelayed(release, HOLD_AFTER_PAUSE_MS)
+      }
       return
     }
     handler.removeCallbacks(release)
@@ -162,14 +172,24 @@ class PlaybackService : MediaSessionService() {
   companion object {
     private const val TAG = "PlaybackService"
     const val LIKE = "com.zhebuilds.tunepeerly.LIKE"
+    /** How long the service and the locks stay after the music paused. */
+    const val HOLD_AFTER_PAUSE_MS = 10 * 60_000L
     @Volatile private var running = false
 
     /** Started while the app is on screen, before the first song plays, so Media3 may promote it later. */
     fun ensure(context: Context) {
       if (running) return
       runCatching { context.startService(Intent(context, PlaybackService::class.java)) }
-        .onFailure { Log.w(TAG, "start: ${it.message}") }
+        .onSuccess { refused = false }
+        .onFailure {
+          // Android refuses while the app is in the background; it is asked again on every update,
+          // so this is said once until a start works.
+          if (!refused) Log.w(TAG, "start: ${it.message}")
+          refused = true
+        }
     }
+
+    @Volatile private var refused = false
 
     fun stop(context: Context) {
       runCatching { context.stopService(Intent(context, PlaybackService::class.java)) }
