@@ -39,6 +39,8 @@ TunePeerly plays the music already on this computer and shares it with paired de
 
 ## Install
 
+### Windows
+
 GitHub releases are packed with [Inno Setup](installer/TunePeerly.iss). The installer asks whether to install for all users or only for the current user. The default is the current user, at `C:\Users\<name>\AppData\Local\Programs\TunePeerly`, and it does not need administrator rights. Installing for all users uses `C:\Program Files\TunePeerly` and needs administrator rights.
 
 The database and the cache do not follow that choice, and they cannot be changed on their own. The database is always `%APPDATA%\TunePeerly`. Covers and the window cache are always in `%LOCALAPPDATA%\TunePeerly`.
@@ -48,6 +50,12 @@ The downloaded installer is `TunePeerly-0.8.0-alpha.1-x64-Setup.exe`. In that fi
 ```powershell
 Get-FileHash -Algorithm SHA256 .\TunePeerly-0.8.0-alpha.1-x64-Setup.exe
 ```
+
+### Android
+
+Download `TunePeerly-0.8.0-alpha.1-arm64-v8a.apk` from the release page. It runs on Android 7.0 and later, on 64-bit ARM phones, which covers nearly all current phones. Open the APK on the phone and allow installs from that app when Android asks. See [Android: Install](docs/android.md#install).
+
+To check that the APK is the official one, compare its signing certificate with the fingerprint in [Verifying official APKs](docs/android.md#verifying-official-apks).
 
 ## Develop
 

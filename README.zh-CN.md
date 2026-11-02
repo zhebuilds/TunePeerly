@@ -39,6 +39,8 @@
 
 ## 安装
 
+### Windows
+
 GitHub 上发布的版本用 [Inno Setup](installer/TunePeerly.iss) 打包。安装程序会询问为所有用户安装，还是只为当前用户安装。默认是当前用户，目录为 `C:\Users\<用户名>\AppData\Local\Programs\TunePeerly`，不需要管理员权限。为所有用户安装时，目录为 `C:\Program Files\TunePeerly`，需要管理员权限。
 
 数据库和缓存不跟着这个选择走，也不能单独修改。数据库始终在 `%APPDATA%\TunePeerly`。封面和界面缓存始终在 `%LOCALAPPDATA%\TunePeerly`。
@@ -48,6 +50,12 @@ GitHub 上发布的版本用 [Inno Setup](installer/TunePeerly.iss) 打包。安
 ```powershell
 Get-FileHash -Algorithm SHA256 .\TunePeerly-0.8.0-alpha.1-x64-Setup.exe
 ```
+
+### Android
+
+在发布页下载 `TunePeerly-0.8.0-alpha.1-arm64-v8a.apk`。它支持 Android 7.0 及以上的 64 位 ARM 手机，现在的手机基本都是。在手机上打开 APK，系统询问时允许从该来源安装。详见 [Android：安装](docs/android.zh-CN.md#安装)。
+
+要确认 APK 是官方发布的，可以把它的签名证书和 [验证官方 APK](docs/android.zh-CN.md#验证官方-apk) 里的指纹对照。
 
 ## 开发
 

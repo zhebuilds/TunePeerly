@@ -23,11 +23,11 @@ The copies live in the app's own storage, so they are removed when you uninstall
 
 Pairing happens only on the local network, the same as between two computers.
 
-1. Put the phone and the computer on the same Wi-Fi.
+1. Put the phone and the computer on the same Wi-Fi. You can also turn on the phone's hotspot and connect the computer to it.
 2. On both, turn on **Devices → Discover nearby devices**.
 3. Tap **Pair** next to the computer. The computer shows a 6-digit code; type it on the phone. Pairing from the computer works the same way the other way round.
 
-Some routers block devices from seeing each other (often called AP or client isolation, or a guest network). If the computer never shows up under Nearby, check that first.
+Some routers block devices from seeing each other (often called AP or client isolation, or a guest network). If the computer never shows up under Nearby, check that first, or pair over the phone's hotspot instead.
 
 ## Away from home
 
