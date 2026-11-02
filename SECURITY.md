@@ -43,7 +43,6 @@ Please give the maintainer time to confirm and ship a fix before any public disc
 ## Out of scope
 
 - What discovery announces on the local network: the device ID, the device name, the TCP port, and the LAN IPv4 addresses. It never announces song names. Discovery is off until the user turns it on.
-- A device on the local network that asks to pair. The request shows a code on screen and does nothing until that code is typed on the device that asked.
 - A person who already confirmed the pairing on both computers.
 - The Windows Firewall prompt. The app does not create that rule.
 - Vulnerabilities in dependencies that do not affect TunePeerly.
@@ -93,7 +92,6 @@ Please give the maintainer time to confirm and ship a fix before any public disc
 ### 范围外
 
 - 发现在局域网上宣布的内容：设备标识、设备名、TCP 端口和局域网 IPv4 地址。它不会宣布歌名。用户打开之前，发现是关闭的。
-- 局域网里发起配对的设备。这个请求会在屏幕上显示一个配对码，在发起的那台设备上输入这个配对码之前，什么都不会发生。
 - 已经在两台电脑上确认过配对的人。
 - Windows 防火墙的询问框。程序不创建那条规则。
 - 不影响 TunePeerly 的依赖漏洞。

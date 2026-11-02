@@ -57,7 +57,7 @@ Android 不允许应用直接读取你的音乐文件夹。请在 **设置 → �
 
 ## 从源码构建
 
-Android 版在 Linux 或 macOS 上构建。Windows 上请在 WSL2（Ubuntu）里构建：音乐库数据库用 SQLCipher，构建时要编译 OpenSSL，而 OpenSSL 的构建需要类 Unix 的 Perl 和 `make`。Strawberry Perl 和 Git for Windows 自带的 Perl 都无法为 Android 配置 OpenSSL，所以在原生 Windows 上构建 Android 版会失败。[README](../README.zh-CN.md#开发) 里的 Windows 桌面版构建不受影响。
+Android 版在 Linux 上构建。Windows 上请在 WSL2（Ubuntu）里构建：音乐库数据库用 SQLCipher，构建时要编译 OpenSSL，而 OpenSSL 的构建需要类 Unix 的 Perl 和 `make`。Strawberry Perl 和 Git for Windows 自带的 Perl 都无法为 Android 配置 OpenSSL，所以在原生 Windows 上构建 Android 版会失败。[README](../README.zh-CN.md#开发) 里的 Windows 桌面版构建不受影响。
 
 需要 Node.js、带 Android 目标的 Rust、JDK 17、带 platform 36 和 build tools 36.0.0 的 Android SDK，以及 NDK 30.0.16248370。另见 [Tauri 的 Android 环境要求](https://v2.tauri.app/start/prerequisites/#android)。
 
@@ -125,10 +125,6 @@ Windows 上先装好 WSL2 和 Ubuntu：用管理员身份打开 PowerShell，执
    APK 在 `src-tauri/gen/android/app/build/outputs/apk/universal/debug/`。
 
 第一次构建要编译 OpenSSL，需要几分钟。
-
-### macOS
-
-用 `xcode-select --install` 安装 Xcode 命令行工具，它带有 `perl` 和 `make`。安装 JDK 17，再用 Android Studio 或 macOS 版命令行工具安装 Android SDK 和 NDK，组件和上面 `sdkmanager` 装的一样。设置好 `JAVA_HOME`、`ANDROID_HOME` 和 `NDK_HOME`，然后执行第 2、3、5、6 步。
 
 ### 发布版 APK
 
