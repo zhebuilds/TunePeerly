@@ -57,7 +57,7 @@ Some phones stop background apps aggressively to save battery. If playback stops
 
 ## Build from source
 
-Android builds run on Linux or macOS. On Windows, build in WSL2 (Ubuntu). The library database uses SQLCipher, and its build compiles OpenSSL, which needs a Unix-style Perl and `make`. Strawberry Perl and the Perl that comes with Git for Windows cannot configure OpenSSL for Android, so a native Windows Android build fails. The Windows desktop build in the [README](../README.md#develop) is not affected.
+Android builds run on Linux. On Windows, build in WSL2 (Ubuntu). The library database uses SQLCipher, and its build compiles OpenSSL, which needs a Unix-style Perl and `make`. Strawberry Perl and the Perl that comes with Git for Windows cannot configure OpenSSL for Android, so a native Windows Android build fails. The Windows desktop build in the [README](../README.md#develop) is not affected.
 
 You need Node.js, Rust with the Android targets, JDK 17, the Android SDK with platform 36 and build tools 36.0.0, and NDK 30.0.16248370. See also the [Tauri Android prerequisites](https://v2.tauri.app/start/prerequisites/#android).
 
@@ -125,10 +125,6 @@ On Windows, install WSL2 with Ubuntu first by running `wsl --install -d Ubuntu` 
    The APK is in `src-tauri/gen/android/app/build/outputs/apk/universal/debug/`.
 
 The first build compiles OpenSSL and takes a few minutes.
-
-### macOS
-
-Install the Xcode command line tools with `xcode-select --install`, which provide `perl` and `make`. Install JDK 17, and install the Android SDK and NDK with Android Studio or the macOS command-line tools, using the same `sdkmanager` packages as above. Set `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME`, then run steps 2, 3, 5, and 6.
 
 ### Release APK
 

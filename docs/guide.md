@@ -86,7 +86,7 @@ Recently played is kept on each computer and is not synced. When a paired device
 
 ## Notifications
 
-The bell opens the notification list. You can mark items read when they scroll into view, when the panel opens, or only when you open one. Clearing can ask every time, delete everything except pinned items, or delete everything.
+Notifications record what happens between your devices, such as pairing, connecting and disconnecting, removing or blocking a device, and the results of Send and Override. The bell opens the notification list. You can mark items read when they scroll into view, when the panel opens, or only when you open one. Clearing can ask every time, delete everything except pinned items, or delete everything.
 
 ## Where your data stays
 

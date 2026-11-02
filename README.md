@@ -11,17 +11,18 @@
 
 TunePeerly plays the music already on this computer and shares it with paired devices. There is no account. Paired devices on the same local network find each other directly. A relay you run yourself can be used for connections outside that network. Pairing happens only on the local network; the relay only carries data between devices that are already paired, and never pairs.
 
-> **Note:** The current release is an alpha test. The program is not guaranteed to match the [user guide](docs/guide.md).
+> **Note:** The current release is an alpha test. The program is not guaranteed to match the documentation.
 
 ## Features
 
 - Play local files, stream any song from a paired device, or download the original file.
 - Find devices on the LAN. To pair, one device shows a 6-digit code and you type it on the other. Before pairing, **Discover nearby devices** on the Devices page (Nearby) must be turned on, on both devices, or they cannot be found.
-- Recently played records a song after 10 seconds, or after half of it when the song is shorter than 20 seconds. It stays on each device. You can view a connected device's list without saving or merging it.
-- Send or override liked songs and appearance by hand. Nothing syncs on its own.
-- Incognito cuts every device connection and the relay, stops discovery and sync, and stops recording history. You can also block a device.
+- If devices cannot find each other on the LAN, turn on a hotspot and connect the devices to that same hotspot.
+- Recently played records a song after 10 seconds, or after half of it when the song is shorter than 20 seconds. It stays on each device. You can view a connected device's list.
+- Send or override liked songs and appearance by hand.
+- Incognito cuts every device connection and the relay, stops discovery and sync, and stops recording history.
 - Light and dark themes, English and Chinese, scrolling lyrics, a tray icon, a mini player, and playback buttons on the Windows taskbar thumbnail.
-- An Android app plays the same library with the screen locked, with controls in the notification, on the lock screen, and in a home screen widget. See [Android](docs/android.md).
+- An Android app plays with the screen locked, with controls in the notification, on the lock screen, and in a home screen widget. See [Android](docs/android.md).
 
 ## Security and privacy
 
@@ -56,7 +57,7 @@ The library database is encrypted with SQLCipher. The build compiles its own cop
 - Windows: install [Strawberry Perl](https://strawberryperl.com/) and make sure `perl` in your terminal is Strawberry Perl, not the Perl that comes with Git for Windows. `nmake` comes with the Visual Studio C++ build tools that Rust already needs. [NASM](https://www.nasm.us/) is optional: with `nasm` on PATH OpenSSL is built with its faster assembly code, without it OpenSSL is built without assembly.
 - Linux and macOS: `perl` and `make` are usually already installed.
 
-This is for the desktop app. To build the Android app, see [Android: Build from source](docs/android.md#build-from-source). On Windows, Android builds run in WSL2.
+This is for the desktop app. To build the Android app, see [Android: Build from source](docs/android.md#build-from-source). To build Android on Windows, use WSL2.
 
 ```powershell
 npm install
