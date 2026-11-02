@@ -6,7 +6,7 @@ The relay only carries data between devices that are already paired. Pairing hap
 
 ## 1. Server address
 
-This finds the server's public IPv4 address. If your devices should reach the relay by a domain name instead, replace the value with that name, for example `RELAY_HOST=relay.example.com`.
+This finds the server's public IPv4 address.
 
 ```sh
 RELAY_HOST=$(curl -4 -fsS https://api.ipify.org)

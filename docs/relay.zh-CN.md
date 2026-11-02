@@ -6,7 +6,7 @@
 
 ## 1. 服务器地址
 
-这一步自动查出服务器的公网 IPv4 地址。如果你想让设备用域名连中继，就把值换成域名，例如 `RELAY_HOST=relay.example.com`。
+这条命令会查出服务器的公网 IPv4 地址。
 
 ```sh
 RELAY_HOST=$(curl -4 -fsS https://api.ipify.org)
